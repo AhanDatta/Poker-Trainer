@@ -148,6 +148,32 @@ impl Storage {
         matches!(self, Storage::Compressed { .. })
     }
 
+    /// Copies all values from a storage of the same shape (tests).
+    #[cfg(test)]
+    pub(crate) fn copy_from(&self, other: &Storage) {
+        fn copy<T: Copy + Default + Send + Sync>(dst: &SharedBuf<T>, src: &SharedBuf<T>) {
+            assert_eq!(dst.len(), src.len());
+            // SAFETY: no other access is live during the copy.
+            unsafe { dst.get_mut(0, dst.len()).copy_from_slice(src.get(0, src.len())) }
+        }
+        match (self, other) {
+            (Storage::F32 { regrets, strat }, Storage::F32 { regrets: r2, strat: s2 }) => {
+                copy(regrets, r2);
+                copy(strat, s2);
+            }
+            (
+                Storage::Compressed { regrets, strat, regret_scale, strat_scale },
+                Storage::Compressed { regrets: r2, strat: s2, regret_scale: rs2, strat_scale: ss2 },
+            ) => {
+                copy(regrets, r2);
+                copy(strat, s2);
+                copy(regret_scale, rs2);
+                copy(strat_scale, ss2);
+            }
+            _ => panic!("storage modes differ"),
+        }
+    }
+
     pub fn bytes(&self) -> u64 {
         match self {
             Storage::F32 { regrets, .. } => regrets.len() as u64 * 8,
