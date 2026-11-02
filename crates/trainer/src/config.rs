@@ -60,6 +60,13 @@ pub struct SolverSettings {
     pub flop_future_menu: PostflopMenu,
     /// Worker threads for the solver (0 = all cores).
     pub threads: usize,
+    /// Three-way pots: sampled turn and river cards for flop solves.
+    pub multiway_turn_samples: usize,
+    pub multiway_river_samples: usize,
+    /// Three-way pots: stop at this average best-response gain (% pot).
+    pub multiway_target_pct: f64,
+    /// Three-way pots: sizes on later streets (kept small: no raises).
+    pub multiway_future_menu: PostflopMenu,
 }
 
 impl Default for SolverSettings {
@@ -88,6 +95,15 @@ impl Default for SolverSettings {
             hero_hand_floor: 0.02,
             flop_future_menu: future,
             threads: 0,
+            multiway_turn_samples: 8,
+            multiway_river_samples: 4,
+            multiway_target_pct: 1.5,
+            multiway_future_menu: PostflopMenu {
+                turn: StreetSizes::new(&["66%"], &["3x"]),
+                river: StreetSizes::new(&["75%"], &["3x"]),
+                max_raises: 1,
+                ..PostflopMenu::default()
+            },
         }
     }
 }

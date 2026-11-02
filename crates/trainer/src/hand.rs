@@ -264,12 +264,10 @@ impl LiveHand {
         }
         // Start the solver review (heads-up pots only).
         if let Some(settings) = self.review_settings.clone() {
-            if settings.enabled && live.len() == 2 && live.contains(&self.hero) {
-                let villain = *live.iter().find(|&&s| s != self.hero).unwrap();
+            if settings.enabled && live.len() >= 2 && live.contains(&self.hero) {
                 let setup = ReviewSetup {
                     hero: self.hero,
-                    villain,
-                    villain_profile: self.profiles[villain].clone().unwrap_or_default(),
+                    profiles: self.profiles.clone(),
                     charts: Arc::clone(&self.charts),
                     menu: self.menu.clone(),
                     settings,

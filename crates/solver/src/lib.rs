@@ -26,6 +26,7 @@ mod cfr;
 mod eval;
 mod hands;
 mod iso;
+pub mod multi;
 mod river;
 mod sampling;
 mod scratch;

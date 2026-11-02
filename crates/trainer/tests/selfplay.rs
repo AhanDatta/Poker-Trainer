@@ -10,6 +10,7 @@ fn quick_config(seed: u64) -> TrainerConfig {
     let mut cfg = TrainerConfig::default();
     cfg.seed = Some(seed);
     cfg.opponent = "Calling Station".into();
+    cfg.solver.flop_mode = trainer::FlopMode::Fast;
     cfg.solver.flop_turn_samples = 4;
     cfg.solver.flop_river_samples = 3;
     cfg.solver.max_iterations = 60;
@@ -103,9 +104,13 @@ fn multiway_tables_play_and_review() {
         cfg.opponent = "random".into();
         cfg.solver.villain_range = VillainRange::Gto;
         cfg.solver.flop_mode = trainer::FlopMode::Fast;
+        cfg.solver.multiway_turn_samples = 3;
+        cfg.solver.multiway_river_samples = 2;
+        cfg.solver.multiway_target_pct = 5.0;
         let mut session = Session::new(cfg).unwrap();
         let mut reviewed = 0;
-        for _ in 0..60 {
+        let mut three_way = 0;
+        for _ in 0..150 {
             let mut hand = session.new_hand();
             loop {
                 match hand.run_until_hero() {
@@ -123,20 +128,32 @@ fn multiway_tables_play_and_review() {
             if let Some(review) = hand.review() {
                 let start = Instant::now();
                 while !review.is_finished() {
-                    assert!(start.elapsed() < Duration::from_secs(300), "review timed out");
+                    assert!(
+                        start.elapsed() < Duration::from_secs(300),
+                        "review timed out: {}",
+                        review.status().stage
+                    );
                     std::thread::sleep(Duration::from_millis(50));
                 }
                 let st = review.status();
                 assert!(st.error.is_none(), "{:?} {:?}", st.error, st.notes);
-                if !st.decisions.is_empty() {
+                for d in &st.decisions {
+                    let mix: f32 = d.hero_strategy.iter().sum();
+                    assert!((mix - 1.0).abs() < 1e-3);
+                    assert!(d.ev_loss >= 0.0 && d.chosen < d.actions.len());
+                }
+                if st.decisions.iter().any(|d| d.notes.iter().any(|n| n.starts_with("3-way"))) {
+                    three_way += 1;
+                } else if !st.decisions.is_empty() {
                     reviewed += 1;
                 }
             }
             session.finish_hand(hand);
-            if reviewed >= 1 {
+            if reviewed >= 1 && three_way >= 1 {
                 break;
             }
         }
         assert!(reviewed >= 1, "{players}-max: no heads-up pot was reviewed");
+        assert!(three_way >= 1, "{players}-max: no 3-way pot was reviewed");
     }
 }

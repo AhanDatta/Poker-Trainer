@@ -19,9 +19,11 @@ use crate::profiles::Profile;
 use holdem::combo::{combo_index, COMBO_CLASS, NUM_CLASSES};
 use holdem::game::Phase;
 use holdem::{Action, BetMenu, Card, HandState, Street};
+use solver::multi::{MultiConfig, MultiSolver, MultiState};
 use solver::{
     BettingState, ChanceMode, NodeInfo, Progress, SolveConfig, SolveOptions, Solver, SolverError, Step,
 };
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -150,8 +152,8 @@ pub struct ReviewStatus {
 #[derive(Clone)]
 pub struct ReviewSetup {
     pub hero: usize,
-    pub villain: usize,
-    pub villain_profile: Profile,
+    /// Style of every seat (`None` for the hero).
+    pub profiles: Vec<Option<Profile>>,
     pub charts: Arc<ChartSet>,
     pub menu: BetMenu,
     pub settings: SolverSettings,
@@ -339,47 +341,42 @@ impl<'a> Worker<'a> {
             self.shared.set_stage("No flop: nothing to review".into());
             return Ok(());
         }
-        if snap.state.players_in_hand().len() != 2 {
-            self.shared.note("Multiway postflop pots can't be solved yet.".into());
-            return Ok(());
-        }
+        let hero = setup.hero;
         let st0 = &snap.state;
-        let (hero, villain) = (setup.hero, setup.villain);
-        // Solver player 0 is out of position: whoever acts first postflop
-        // (closest to the left of the button).
-        let seats = postflop_order(st0, hero, villain);
-        let hero_p = if seats[0] == hero { 0 } else { 1 };
         let hero_combo = combo_index(st0.hole[hero][0], st0.hole[hero][1]);
         let variants = self.variants();
+        // Seats that saw the flop.
+        let flop_seats: Vec<usize> = in_hand_at(st0, Street::Flop);
 
-        let mut ranges: Vec<[Vec<f32>; 2]> = Vec::new();
+        // Preflop ranges of everyone who saw the flop, per variant.
+        let mut ranges: Vec<HashMap<usize, Vec<f32>>> = Vec::new();
         for &v in &variants {
-            let mut pr: [Vec<f32>; 2] = Default::default();
-            for x in 0..2 {
-                let seat = seats[x];
-                let (r, uncovered) = if seat == villain && v == Variant::Actual {
-                    line_range(&snap.preflop, seat, |d| {
-                        profile_policy(&setup.charts, &setup.villain_profile, d)
-                    })
-                } else {
-                    line_range(&snap.preflop, seat, |d| chart_policy(&setup.charts, d))
+            let mut map = HashMap::new();
+            for &seat in &flop_seats {
+                let villain_profile = setup.profiles.get(seat).cloned().flatten();
+                let (r, uncovered) = match (&villain_profile, v) {
+                    (Some(prof), Variant::Actual) => {
+                        line_range(&snap.preflop, seat, |d| profile_policy(&setup.charts, prof, d))
+                    }
+                    _ => line_range(&snap.preflop, seat, |d| chart_policy(&setup.charts, d)),
                 };
                 for idx in uncovered {
                     let d = &snap.preflop[idx];
-                    let who = if seat == hero { "You" } else { "Villain" };
+                    let who =
+                        if seat == hero { "You".to_string() } else { st0.position_name(seat).to_string() };
                     let msg = format!(
                         "{who} chose to {} preflop ({}), which the charts never do there; that range was approximated by the hands the charts continue with.",
                         describe(d.action, &d.avail),
-                        snap.state.position_name(seat)
+                        st0.position_name(seat)
                     );
                     let dup = self.shared.status.lock().unwrap().notes.contains(&msg);
                     if !dup {
                         self.shared.note(msg);
                     }
                 }
-                pr[x] = r.into_weights();
+                map.insert(seat, r.into_weights());
             }
-            ranges.push(pr);
+            ranges.push(map);
         }
 
         for street in [Street::Flop, Street::Turn, Street::River] {
@@ -389,134 +386,326 @@ impl<'a> Worker<'a> {
             if snap.state.board.len() < need {
                 break;
             }
-            let board: Vec<Card> = snap.state.board[..need].to_vec();
-            let (pot, by_seat) = street_start(&snap.state, street);
-            let stacks = [by_seat[seats[0]], by_seat[seats[1]]];
-            if stacks[0] == 0 || stacks[1] == 0 {
+            let active = in_hand_at(&snap.state, street);
+            if !active.contains(&hero) {
                 break;
             }
-            let root = BettingState::street_start(street, pot, stacks, BB);
-
-            let mut solved: Vec<Option<(Solver, f64)>> = Vec::new();
-            for (vi, &v) in variants.iter().enumerate() {
-                let label = format!("{street} ({})", v.label());
-                let cfg = self.make_config(street, &board, &ranges[vi], root, hero_combo, hero_p);
-                match self.solve(cfg, &label) {
-                    Ok(x) => solved.push(Some(x)),
-                    Err(e) if e == CANCELLED => return Err(e),
-                    Err(e) => {
-                        self.shared.note(format!("{label}: {e}"));
-                        solved.push(None);
-                    }
+            let (_, by_seat) = street_start(&snap.state, street);
+            if active.iter().filter(|&&s| by_seat[s] > 0).count() < 2 {
+                break; // all-in: no more decisions
+            }
+            match active.len() {
+                2 => {
+                    let seats = postflop_order(&snap.state, active[0], active[1]);
+                    self.heads_up_street(street, seats, hero_combo, &variants, &mut ranges)?;
+                }
+                3 => {
+                    let seats = postflop_order_n(&snap.state, &active);
+                    self.three_way_street(
+                        street,
+                        [seats[0], seats[1], seats[2]],
+                        hero_combo,
+                        &variants,
+                        &mut ranges,
+                    )?;
+                }
+                k => {
+                    self.shared.note(format!(
+                        "{street}: {k} players saw this street; pots with 4+ players aren't analyzed (yet)."
+                    ));
+                    let _ = self
+                        .shared
+                        .wait_for(|s| s.state.street > street || s.state.phase == Phase::Finished)?;
                 }
             }
+            let snap = self.shared.snap.lock().unwrap().clone();
+            if snap.state.phase == Phase::Finished && snap.state.board.len() == need {
+                break;
+            }
+        }
+        Ok(())
+    }
 
-            self.shared.set_stage(format!("{street} solved; waiting for the street to finish"));
-            let snap =
-                self.shared.wait_for(|s| s.state.street > street || s.state.phase == Phase::Finished)?;
-            let state = &snap.state;
-            let actions: Vec<(usize, Action)> =
-                state.history.iter().filter(|r| r.street == street).map(|r| (r.player, r.action)).collect();
-            // Betting state before each action.
-            let mut states = vec![root];
-            for &(_, a) in &actions {
-                match states.last().unwrap().after(a) {
-                    Some(s) => states.push(s),
-                    None => break,
+    /// Solves and grades one street of a heads-up pot (`seats` = [OOP, IP]).
+    fn heads_up_street(
+        &self,
+        street: Street,
+        seats: [usize; 2],
+        hero_combo: usize,
+        variants: &[Variant],
+        ranges: &mut [HashMap<usize, Vec<f32>>],
+    ) -> Result<(), String> {
+        let setup = self.setup;
+        let hero = setup.hero;
+        let hero_p = if seats[0] == hero { 0 } else { 1 };
+        let need = street.board_len();
+        let snap = self.shared.snap.lock().unwrap().clone();
+        let board: Vec<Card> = snap.state.board[..need].to_vec();
+        let (pot, by_seat) = street_start(&snap.state, street);
+        let stacks = [by_seat[seats[0]], by_seat[seats[1]]];
+        let root = BettingState::street_start(street, pot, stacks, BB);
+
+        let mut solved: Vec<Option<(Solver, f64)>> = Vec::new();
+        for (vi, &v) in variants.iter().enumerate() {
+            let label = format!("{street} ({})", v.label());
+            let pair = [ranges[vi][&seats[0]].clone(), ranges[vi][&seats[1]].clone()];
+            let cfg = self.make_config(street, &board, &pair, root, hero_combo, hero_p);
+            match self.solve(cfg, &label) {
+                Ok(x) => solved.push(Some(x)),
+                Err(e) if e == CANCELLED => return Err(e),
+                Err(e) => {
+                    self.shared.note(format!("{label}: {e}"));
+                    solved.push(None);
                 }
             }
-            let pos = |seat: usize| state.position_name(seat);
+        }
 
-            for (vi, &v) in variants.iter().enumerate() {
-                let Some((base, base_expl)) = &solved[vi] else { continue };
-                let mut owned: Option<(Solver, f64)> = None;
-                let mut offset = 0;
-                for k in 0..actions.len() {
-                    let (seat, a) = actions[k];
-                    if seat != hero || k >= states.len() {
-                        continue;
-                    }
-                    let (cur, cur_expl) = match &owned {
-                        Some((s, e)) => (s, *e),
-                        None => (base, *base_expl),
+        self.shared.set_stage(format!("{street} solved; waiting for the street to finish"));
+        let snap = self.shared.wait_for(|s| s.state.street > street || s.state.phase == Phase::Finished)?;
+        let state = &snap.state;
+        let actions: Vec<(usize, Action)> =
+            state.history.iter().filter(|r| r.street == street).map(|r| (r.player, r.action)).collect();
+        // Betting state before each action.
+        let mut states = vec![root];
+        for &(_, a) in &actions {
+            match states.last().unwrap().after(a) {
+                Some(s) => states.push(s),
+                None => break,
+            }
+        }
+        let pos = |seat: usize| state.position_name(seat);
+
+        for (vi, &v) in variants.iter().enumerate() {
+            let Some((base, base_expl)) = &solved[vi] else { continue };
+            let mut owned: Option<(Solver, f64)> = None;
+            let mut offset = 0;
+            for k in 0..actions.len() {
+                let (seat, a) = actions[k];
+                if seat != hero || k >= states.len() {
+                    continue;
+                }
+                let (cur, cur_expl) = match &owned {
+                    Some((s, e)) => (s, *e),
+                    None => (base, *base_expl),
+                };
+                let path: Vec<Step> = actions[offset..k].iter().map(|&(_, a)| Step::Action(a)).collect();
+                let mut info = cur.query(&path).map_err(|e| e.to_string())?;
+                let mut notes = Vec::new();
+                let mut expl = cur_expl;
+                let off = info.reach_fraction.iter().any(|&f| f < setup.settings.off_equilibrium_threshold);
+                if off && k > offset {
+                    let who = if info.reach_fraction[1 - hero_p] < setup.settings.off_equilibrium_threshold {
+                        "Villain"
+                    } else {
+                        "You"
                     };
-                    let path: Vec<Step> = actions[offset..k].iter().map(|&(_, a)| Step::Action(a)).collect();
-                    let mut info = cur.query(&path).map_err(|e| e.to_string())?;
-                    let mut notes = Vec::new();
-                    let mut expl = cur_expl;
-                    let off =
-                        info.reach_fraction.iter().any(|&f| f < setup.settings.off_equilibrium_threshold);
-                    if off && k > offset {
-                        let who =
-                            if info.reach_fraction[1 - hero_p] < setup.settings.off_equilibrium_threshold {
-                                "Villain"
-                            } else {
-                                "You"
-                            };
-                        let root_ranges = cur.ranges_after(&[]).map_err(|e| e.to_string())?;
-                        let mut r = cur.ranges_after(&path).map_err(|e| e.to_string())?;
+                    let root_ranges = cur.ranges_after(&[]).map_err(|e| e.to_string())?;
+                    let mut r = cur.ranges_after(&path).map_err(|e| e.to_string())?;
+                    floor_ranges(
+                        &mut r,
+                        &root_ranges,
+                        &info.reach_fraction,
+                        setup.settings.off_equilibrium_threshold,
+                    );
+                    let label = format!("{street} re-solve ({})", v.label());
+                    let cfg = self.make_config(street, &board, &r, states[k], hero_combo, hero_p);
+                    match self.solve(cfg, &label) {
+                        Ok((s, e)) => {
+                            owned = Some((s, e));
+                            offset = k;
+                            info = owned.as_ref().unwrap().0.query(&[]).map_err(|e| e.to_string())?;
+                            expl = e;
+                            notes.push(format!(
+                                "{who} took a line the solver almost never takes here, so this spot was re-solved from this point."
+                            ));
+                        }
+                        Err(e) if e == CANCELLED => return Err(e),
+                        Err(e) => notes.push(format!("Re-solve failed: {e}")),
+                    }
+                }
+                let history = (0..k)
+                    .map(|j| {
+                        format!("{} {}", pos(actions[j].0), action_label(actions[j].1, &context(&states[j])))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if street == Street::Flop && setup.settings.flop_mode == FlopMode::Fast {
+                    notes.push("Flop solved with sampled river cards (fast mode): approximate.".into());
+                }
+                let review = grade(
+                    &info,
+                    &context(&states[k]),
+                    states[k].pot,
+                    hero_combo,
+                    a,
+                    v,
+                    street,
+                    &board,
+                    history,
+                    expl,
+                    notes,
+                )?;
+                self.shared.with_status(|st| st.decisions.push(review));
+            }
+
+            if street != Street::River && state.board.len() > need {
+                let (cur, _) = match &owned {
+                    Some((s, e)) => (s, *e),
+                    None => (base, *base_expl),
+                };
+                let path: Vec<Step> = actions[offset..].iter().map(|&(_, a)| Step::Action(a)).collect();
+                if let Ok(mut next) = cur.ranges_after(&path) {
+                    let root_ranges = cur.ranges_after(&[]).map_err(|e| e.to_string())?;
+                    let frac = [fraction(&next[0], &root_ranges[0]), fraction(&next[1], &root_ranges[1])];
+                    if frac.iter().any(|&f| f < setup.settings.off_equilibrium_threshold) {
                         floor_ranges(
-                            &mut r,
+                            &mut next,
                             &root_ranges,
-                            &info.reach_fraction,
+                            &frac,
                             setup.settings.off_equilibrium_threshold,
                         );
-                        let label = format!("{street} re-solve ({})", v.label());
-                        let cfg = self.make_config(street, &board, &r, states[k], hero_combo, hero_p);
-                        match self.solve(cfg, &label) {
-                            Ok((s, e)) => {
-                                owned = Some((s, e));
-                                offset = k;
-                                info = owned.as_ref().unwrap().0.query(&[]).map_err(|e| e.to_string())?;
-                                expl = e;
-                                notes.push(format!(
-                                    "{who} took a line the solver almost never takes here, so this spot was re-solved from this point."
-                                ));
-                            }
-                            Err(e) if e == CANCELLED => return Err(e),
-                            Err(e) => notes.push(format!("Re-solve failed: {e}")),
-                        }
                     }
-                    let history = (0..k)
-                        .map(|j| {
-                            let ctx = context(&states[j]);
-                            format!("{} {}", pos(actions[j].0), action_label(actions[j].1, &ctx))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · ");
-                    if street == Street::Flop && setup.settings.flop_mode == FlopMode::Fast {
-                        notes.push(
-                            "Flop solved with sampled turn/river cards (fast mode): approximate.".into(),
-                        );
-                    }
-                    let review =
-                        grade(&info, &states[k], hero_combo, a, v, street, &board, history, expl, notes)?;
-                    self.shared.with_status(|st| st.decisions.push(review));
-                }
-
-                if street != Street::River && state.board.len() > need {
-                    let (cur, _) = match &owned {
-                        Some((s, e)) => (s, *e),
-                        None => (base, *base_expl),
-                    };
-                    let path: Vec<Step> = actions[offset..].iter().map(|&(_, a)| Step::Action(a)).collect();
-                    if let Ok(mut next) = cur.ranges_after(&path) {
-                        let root_ranges = cur.ranges_after(&[]).map_err(|e| e.to_string())?;
-                        let frac = [fraction(&next[0], &root_ranges[0]), fraction(&next[1], &root_ranges[1])];
-                        if frac.iter().any(|&f| f < setup.settings.off_equilibrium_threshold) {
-                            floor_ranges(
-                                &mut next,
-                                &root_ranges,
-                                &frac,
-                                setup.settings.off_equilibrium_threshold,
-                            );
-                        }
-                        ranges[vi] = next;
-                    }
+                    let [r0, r1] = next;
+                    ranges[vi].insert(seats[0], r0);
+                    ranges[vi].insert(seats[1], r1);
                 }
             }
-            if state.phase == Phase::Finished && state.board.len() == need {
-                break;
+        }
+        Ok(())
+    }
+
+    /// Solves (approximately) and grades one street of a three-way pot.
+    fn three_way_street(
+        &self,
+        street: Street,
+        seats: [usize; 3],
+        hero_combo: usize,
+        variants: &[Variant],
+        ranges: &mut [HashMap<usize, Vec<f32>>],
+    ) -> Result<(), String> {
+        let setup = self.setup;
+        let s = &setup.settings;
+        let hero = setup.hero;
+        let hero_p = seats.iter().position(|&x| x == hero).unwrap();
+        let need = street.board_len();
+        let snap = self.shared.snap.lock().unwrap().clone();
+        let board: Vec<Card> = snap.state.board[..need].to_vec();
+        let (pot, by_seat) = street_start(&snap.state, street);
+        let root = MultiState::street_start(street, pot, seats.map(|x| by_seat[x]), [false; 3], BB);
+
+        let mut solved: Vec<Option<(MultiSolver, f64)>> = Vec::new();
+        for (vi, &v) in variants.iter().enumerate() {
+            let label = format!("{street} 3-way ({})", v.label());
+            let mut rs: [Vec<f32>; 3] = seats.map(|x| ranges[vi][&x].clone());
+            let orbit = solver::iso_orbit(&board, hero_combo);
+            let max_w = rs[hero_p].iter().copied().fold(0f32, f32::max);
+            let floor = if max_w > 0.0 { s.hero_hand_floor * max_w } else { 1.0 };
+            for &c in &orbit {
+                rs[hero_p][c] = rs[hero_p][c].max(floor);
+            }
+            let mut keep: [Vec<usize>; 3] = Default::default();
+            keep[hero_p] = orbit;
+            let seed = board.iter().fold(23u64, |h, c| h.wrapping_mul(31).wrapping_add(c.index() as u64));
+            let cfg = MultiConfig {
+                board: board.clone(),
+                ranges: rs,
+                root,
+                menu: setup.menu.postflop.clone(),
+                future_menu: Some(s.multiway_future_menu.clone()),
+                big_blind: BB,
+                chance: match street {
+                    Street::Flop => ChanceMode::Sampled {
+                        turn: s.multiway_turn_samples,
+                        river: s.multiway_river_samples,
+                        seed,
+                    },
+                    Street::Turn => {
+                        ChanceMode::Sampled { turn: 0, river: s.multiway_river_samples * 2, seed }
+                    }
+                    _ => ChanceMode::Exact,
+                },
+                prune: s.prune.max(0.002),
+                keep,
+                max_memory_bytes: (s.max_memory_gb * 1e9) as u64,
+                rake_rate: setup.rake_rate,
+                rake_cap: setup.rake_cap as f64,
+            };
+            match self.solve_multi(cfg, &label) {
+                Ok(x) => solved.push(Some(x)),
+                Err(e) if e == CANCELLED => return Err(e),
+                Err(e) => {
+                    self.shared.note(format!("{label}: {e}"));
+                    solved.push(None);
+                }
+            }
+        }
+
+        self.shared.set_stage(format!("{street} solved; waiting for the street to finish"));
+        let snap = self.shared.wait_for(|s| s.state.street > street || s.state.phase == Phase::Finished)?;
+        let state = &snap.state;
+        let actions: Vec<(usize, Action)> =
+            state.history.iter().filter(|r| r.street == street).map(|r| (r.player, r.action)).collect();
+        let mut states = vec![root];
+        for &(seat, a) in &actions {
+            debug_assert_eq!(seats[states.last().unwrap().to_act], seat, "3-way state out of sync");
+            match states.last().unwrap().after(a) {
+                Some(st) => states.push(st),
+                None => break,
+            }
+        }
+        let pos = |seat: usize| state.position_name(seat);
+        for (vi, &v) in variants.iter().enumerate() {
+            let Some((solver, conv)) = &solved[vi] else { continue };
+            for k in 0..actions.len() {
+                let (seat, a) = actions[k];
+                if seat != hero || k >= states.len() {
+                    continue;
+                }
+                let path: Vec<Step> = actions[..k].iter().map(|&(_, a)| Step::Action(a)).collect();
+                let info = match solver.query(&path) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        self.shared.note(format!("{street}: this line isn't in the 3-way tree ({e})."));
+                        break;
+                    }
+                };
+                let history = (0..k)
+                    .map(|j| {
+                        format!(
+                            "{} {}",
+                            pos(actions[j].0),
+                            action_label(actions[j].1, &context_multi(&states[j]))
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                let notes = vec![
+                    "3-way pot: approximate solve (no equilibrium guarantee for 3 players; opponents treated as independent; sampled runouts; simplified later streets).".to_string(),
+                ];
+                let review = grade(
+                    &info,
+                    &context_multi(&states[k]),
+                    states[k].pot,
+                    hero_combo,
+                    a,
+                    v,
+                    street,
+                    &board,
+                    history,
+                    *conv,
+                    notes,
+                )?;
+                self.shared.with_status(|st| st.decisions.push(review));
+            }
+            if street != Street::River && state.board.len() > need {
+                let path: Vec<Step> = actions.iter().map(|&(_, a)| Step::Action(a)).collect();
+                if let Ok(next) = solver.ranges_after(&path) {
+                    for (i, r) in next.into_iter().enumerate() {
+                        if r.iter().any(|&w| w > 0.0) {
+                            ranges[vi].insert(seats[i], r);
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -612,6 +801,70 @@ impl<'a> Worker<'a> {
     }
 }
 
+impl Worker<'_> {
+    fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, f64), String> {
+        let shared = self.shared;
+        shared.set_stage(format!("{label}: waiting for the solver"));
+        let _guard = SOLVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
+        shared.set_stage(format!("{label}: building the game tree"));
+        let mut solver = MultiSolver::new(cfg).map_err(|e| e.to_string())?;
+        shared.set_stage(format!("{label}: solving (approximate)"));
+        let s = &self.setup.settings;
+        let opts = SolveOptions {
+            max_iterations: s.max_iterations,
+            target_exploitability_pct: s.multiway_target_pct,
+            check_every: 20,
+        };
+        let mut run = || {
+            solver.solve(&opts, |p| {
+                shared.with_status(|st| st.progress = Some(*p));
+                !shared.cancel.load(Ordering::Relaxed)
+            })
+        };
+        let progress = match &self.pool {
+            Some(pool) => pool.install(run),
+            None => run(),
+        };
+        if shared.cancel.load(Ordering::Relaxed) {
+            return Err(CANCELLED.into());
+        }
+        Ok((solver, progress.exploitability_pct))
+    }
+}
+
+/// Seats still in the hand at the start of `street`.
+pub fn in_hand_at(state: &HandState, street: Street) -> Vec<usize> {
+    let mut folded = vec![false; state.num_players()];
+    for r in &state.history {
+        if r.street < street && r.action == Action::Fold {
+            folded[r.player] = true;
+        }
+    }
+    (0..state.num_players()).filter(|&p| !folded[p]).collect()
+}
+
+/// Seats sorted by postflop acting order (first to act first).
+pub fn postflop_order_n(state: &HandState, seats: &[usize]) -> Vec<usize> {
+    let n = state.num_players();
+    let mut v = seats.to_vec();
+    v.sort_by_key(|&s| (s + n - state.button - 1) % n);
+    v
+}
+
+fn context_multi(st: &MultiState) -> ActionContext {
+    let sit = st.situation(BB);
+    ActionContext {
+        to_call: sit.to_call,
+        pot: st.pot,
+        all_in_to: st.commit[st.to_act] + st.stack[st.to_act],
+        facing_bet: st.current_bet > 0,
+        preflop: false,
+    }
+}
+
 fn fraction(now: &[f32], root: &[f32]) -> f64 {
     let r: f64 = root.iter().map(|&w| w as f64).sum();
     let n: f64 = now.iter().map(|&w| w as f64).sum();
@@ -648,7 +901,8 @@ fn context(st: &BettingState) -> ActionContext {
 #[allow(clippy::too_many_arguments)]
 fn grade(
     info: &NodeInfo,
-    state: &BettingState,
+    ctx: &ActionContext,
+    pot: holdem::Chips,
     hero_combo: usize,
     chosen: Action,
     variant: Variant,
@@ -672,10 +926,9 @@ fn grade(
     let loss = (ev[best] - ev[chosen_idx]).max(0.0);
     debug_assert!((strat.iter().sum::<f32>() - 1.0).abs() < 1e-3, "solver mix doesn't sum to 1");
     debug_assert!(ev.iter().all(|v| v.is_finite()), "non-finite EVs");
-    let pot = state.pot.max(1) as f32;
-    let loss_pct = 100.0 * loss / pot;
-    let ctx = context(state);
-    let labels = info.actions.iter().map(|&a| action_label(a, &ctx)).collect();
+    let pot_f = pot.max(1) as f32;
+    let loss_pct = 100.0 * loss / pot_f;
+    let labels = info.actions.iter().map(|&a| action_label(a, ctx)).collect();
 
     let n = info.num_hands();
     let na = info.actions.len();
@@ -707,7 +960,7 @@ fn grade(
         street,
         board: board.to_vec(),
         history,
-        pot: state.pot,
+        pot,
         to_call: ctx.to_call,
         hero_combo,
         actions: info.actions.clone(),

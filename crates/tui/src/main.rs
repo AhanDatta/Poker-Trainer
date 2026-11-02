@@ -180,6 +180,7 @@ mod tests {
         cfg.seed = Some(3);
         cfg.ai_delay_ms = 0;
         cfg.opponent = "Calling Station".into();
+        cfg.solver.flop_mode = trainer::FlopMode::Fast;
         cfg.solver.flop_turn_samples = 3;
         cfg.solver.flop_river_samples = 2;
         cfg.solver.max_iterations = 30;
