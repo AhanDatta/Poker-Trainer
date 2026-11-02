@@ -128,7 +128,7 @@ impl FromStr for Card {
 /// Parses a list of cards such as `"AhKd7c"` or `"Ah Kd 7c"`.
 pub fn parse_cards(s: &str) -> Result<Vec<Card>, ParseError> {
     let compact: String = s.chars().filter(|c| !c.is_whitespace() && *c != ',').collect();
-    if compact.len() % 2 != 0 {
+    if !compact.len().is_multiple_of(2) {
         return Err(ParseError(format!("invalid card list: {s:?}")));
     }
     let chars: Vec<char> = compact.chars().collect();

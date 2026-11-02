@@ -155,6 +155,9 @@ pub struct ReviewSetup {
     pub charts: Arc<ChartSet>,
     pub menu: BetMenu,
     pub settings: SolverSettings,
+    /// Rake fraction and cap (chips), as at the table.
+    pub rake_rate: f64,
+    pub rake_cap: holdem::Chips,
 }
 
 /// The hand as seen by the review thread.
@@ -520,29 +523,29 @@ impl<'a> Worker<'a> {
         let mut ranges = ranges.clone();
         let max_w = ranges[hero_p].iter().copied().fold(0f32, f32::max);
         let floor = if max_w > 0.0 { s.hero_hand_floor * max_w } else { 1.0 };
-        let w = &mut ranges[hero_p][hero_combo];
-        *w = w.max(floor);
+        // Floor the hero's hand and its suit-isomorphic images alike, so the
+        // ranges stay symmetric and the solver can merge mirrored runouts.
+        let orbit = solver::iso_orbit(board, hero_combo);
+        for &c in &orbit {
+            let w = &mut ranges[hero_p][c];
+            *w = w.max(floor);
+        }
         let flop = street == Street::Flop;
         let seed = board.iter().fold(17u64, |h, c| h.wrapping_mul(31).wrapping_add(c.index() as u64));
-        let chance = if flop && s.flop_mode == FlopMode::Fast {
+        let mut cfg = SolveConfig::new(board.to_vec(), ranges, root, self.setup.menu.postflop.clone());
+        cfg.chance = if flop && s.flop_mode == FlopMode::Fast {
             ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed }
         } else {
             ChanceMode::Exact
         };
-        let mut keep = [Vec::new(), Vec::new()];
-        keep[hero_p].push(hero_combo);
-        SolveConfig {
-            board: board.to_vec(),
-            ranges,
-            root,
-            menu: self.setup.menu.postflop.clone(),
-            future_menu: if flop { Some(s.flop_future_menu.clone()) } else { None },
-            big_blind: BB,
-            chance,
-            prune: s.prune,
-            keep,
-            max_memory_bytes: (s.max_memory_gb * 1e9) as u64,
-        }
+        cfg.future_menu = if flop { Some(s.flop_future_menu.clone()) } else { None };
+        cfg.big_blind = BB;
+        cfg.prune = s.prune;
+        cfg.keep[hero_p] = orbit;
+        cfg.max_memory_bytes = (s.max_memory_gb * 1e9) as u64;
+        cfg.rake_rate = self.setup.rake_rate;
+        cfg.rake_cap = self.setup.rake_cap as f64;
+        cfg
     }
 
     fn solve(&self, mut cfg: SolveConfig, label: &str) -> Result<(Solver, f64), String> {
@@ -573,10 +576,12 @@ impl<'a> Worker<'a> {
             solver.hands().len(0),
             solver.hands().len(1)
         ));
+        // Exploitability checks cost about one iteration; check big trees less often.
+        let big = solver.stats().total_nodes() > 200_000;
         let opts = SolveOptions {
             max_iterations: s.max_iterations,
             target_exploitability_pct: s.target_exploitability_pct,
-            check_every: 10,
+            check_every: if big { 20 } else { 10 },
         };
         let mut run = || {
             solver.solve(&opts, |p| {
@@ -653,6 +658,8 @@ fn grade(
         .max_by(|&x, &y| ev[x].partial_cmp(&ev[y]).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(0);
     let loss = (ev[best] - ev[chosen_idx]).max(0.0);
+    debug_assert!((strat.iter().sum::<f32>() - 1.0).abs() < 1e-3, "solver mix doesn't sum to 1");
+    debug_assert!(ev.iter().all(|v| v.is_finite()), "non-finite EVs");
     let pot = state.pot.max(1) as f32;
     let loss_pct = 100.0 * loss / pot;
     let ctx = context(state);

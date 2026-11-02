@@ -142,10 +142,180 @@ pub(crate) fn eval_showdown(
         }
     }
 
-    if tie == 0.0 {
-        return;
+    if tie != 0.0 {
+        add_ties(hs, table, p, opp_reach, tie, out);
     }
-    // Pass 3: opponent hands of exactly equal strength.
+}
+
+/// Number of terminals evaluated together by the batched evaluators.
+pub(crate) const LANES: usize = 4;
+type V = [f64; LANES];
+
+#[inline(always)]
+fn vadd(a: &mut V, b: &V) {
+    for i in 0..LANES {
+        a[i] += b[i];
+    }
+}
+
+#[inline(always)]
+fn nonzero(w: &V) -> bool {
+    w.iter().any(|&x| x != 0.0)
+}
+
+thread_local! {
+    static BATCH: std::cell::RefCell<(Vec<V>, Vec<V>)> = const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Fold terminals evaluated together: `outs[t][h] = payoffs[t] * compat(h)`
+/// under `reaches[t]` (at most [`LANES`] terminals).
+pub(crate) fn fold_batch(
+    hs: &HandSet,
+    p: usize,
+    reaches: &[&[f32]],
+    payoffs: &[f64],
+    outs: &mut [&mut [f32]],
+) {
+    let k = reaches.len();
+    debug_assert!(k <= LANES && payoffs.len() == k && outs.len() == k);
+    let o = p ^ 1;
+    let mut total: V = [0.0; LANES];
+    let mut minus = [[0f64; LANES]; 52];
+    for (j, &(a, b)) in hs.cards[o].iter().enumerate() {
+        let mut w: V = [0.0; LANES];
+        for t in 0..k {
+            w[t] = reaches[t][j] as f64;
+        }
+        if !nonzero(&w) {
+            continue;
+        }
+        vadd(&mut total, &w);
+        vadd(&mut minus[a as usize], &w);
+        vadd(&mut minus[b as usize], &w);
+    }
+    let same = &hs.same[p];
+    for (h, &(a, b)) in hs.cards[p].iter().enumerate() {
+        let (ma, mb) = (&minus[a as usize], &minus[b as usize]);
+        let s = same[h];
+        for t in 0..k {
+            let sw = if s == NONE { 0.0 } else { reaches[t][s as usize] as f64 };
+            outs[t][h] = (payoffs[t] * (total[t] - ma[t] - mb[t] + sw)) as f32;
+        }
+    }
+}
+
+/// Showdown terminals on the same board evaluated together (at most
+/// [`LANES`]). `outs` must be zero-initialized.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn showdown_batch(
+    hs: &HandSet,
+    table: &StrengthTable,
+    p: usize,
+    reaches: &[&[f32]],
+    win: &[f64],
+    lose: &[f64],
+    tie: &[f64],
+    outs: &mut [&mut [f32]],
+) {
+    let k = reaches.len();
+    debug_assert!(k <= LANES && win.len() == k && lose.len() == k && tie.len() == k && outs.len() == k);
+    let o = p ^ 1;
+    let mine: &[Entry] = &table.lists[p];
+    let theirs: &[Entry] = &table.lists[o];
+    let mut wv: V = [0.0; LANES];
+    let mut lv: V = [0.0; LANES];
+    wv[..k].copy_from_slice(win);
+    lv[..k].copy_from_slice(lose);
+    BATCH.with(|cell| {
+        let (inter, res) = &mut *cell.borrow_mut();
+        // Opponent reach gathered in strength order, so both sweeps read
+        // memory sequentially.
+        inter.clear();
+        inter.extend(theirs.iter().map(|e| {
+            let mut w: V = [0.0; LANES];
+            for t in 0..k {
+                w[t] = reaches[t][e.idx as usize] as f64;
+            }
+            w
+        }));
+        res.clear();
+        res.resize(mine.len(), [0.0; LANES]);
+
+        // Pass 1 (ascending): opponent hands strictly weaker than ours.
+        let mut sum: V = [0.0; LANES];
+        let mut minus = [[0f64; LANES]; 52];
+        let (mut i, mut j) = (0, 0);
+        while i < mine.len() {
+            let s = mine[i].strength;
+            while j < theirs.len() && theirs[j].strength < s {
+                let w = &inter[j];
+                if nonzero(w) {
+                    let e = &theirs[j];
+                    vadd(&mut sum, w);
+                    vadd(&mut minus[e.c1 as usize], w);
+                    vadd(&mut minus[e.c2 as usize], w);
+                }
+                j += 1;
+            }
+            while i < mine.len() && mine[i].strength == s {
+                let e = &mine[i];
+                let (ma, mb) = (&minus[e.c1 as usize], &minus[e.c2 as usize]);
+                let r = &mut res[i];
+                for t in 0..LANES {
+                    r[t] = wv[t] * (sum[t] - ma[t] - mb[t]);
+                }
+                i += 1;
+            }
+        }
+
+        // Pass 2 (descending): opponent hands strictly stronger than ours.
+        let mut sum: V = [0.0; LANES];
+        let mut minus = [[0f64; LANES]; 52];
+        let (mut i, mut j) = (mine.len(), theirs.len());
+        while i > 0 {
+            let s = mine[i - 1].strength;
+            while j > 0 && theirs[j - 1].strength > s {
+                let w = &inter[j - 1];
+                if nonzero(w) {
+                    let e = &theirs[j - 1];
+                    vadd(&mut sum, w);
+                    vadd(&mut minus[e.c1 as usize], w);
+                    vadd(&mut minus[e.c2 as usize], w);
+                }
+                j -= 1;
+            }
+            while i > 0 && mine[i - 1].strength == s {
+                let e = &mine[i - 1];
+                let (ma, mb) = (&minus[e.c1 as usize], &minus[e.c2 as usize]);
+                let r = &mut res[i - 1];
+                for t in 0..LANES {
+                    r[t] += lv[t] * (sum[t] - ma[t] - mb[t]);
+                }
+                i -= 1;
+            }
+        }
+
+        for (e, r) in mine.iter().zip(res.iter()) {
+            for t in 0..k {
+                outs[t][e.idx as usize] = r[t] as f32;
+            }
+        }
+    });
+
+    // Ties only pay something when commitments since the root differ
+    // (mid-street roots) or with rake: rare, so reuse the scalar code.
+    for t in 0..k {
+        if tie[t] != 0.0 {
+            add_ties(hs, table, p, reaches[t], tie[t], outs[t]);
+        }
+    }
+}
+
+/// Adds `tie * (reach of equal-strength opponent hands)` to `out`.
+fn add_ties(hs: &HandSet, table: &StrengthTable, p: usize, opp_reach: &[f32], tie: f64, out: &mut [f32]) {
+    let o = p ^ 1;
+    let mine = &table.lists[p];
+    let theirs = &table.lists[o];
     let same = &hs.same[p];
     let mut j = 0;
     let mut k = 0;
@@ -159,7 +329,7 @@ pub(crate) fn eval_showdown(
         let mut jj = j;
         while jj < theirs.len() && theirs[jj].strength == s {
             let e = &theirs[jj];
-            accumulate(e.c1, e.c2, reach(e), &mut eq_sum, &mut eq_minus);
+            accumulate(e.c1, e.c2, opp_reach[e.idx as usize], &mut eq_sum, &mut eq_minus);
             jj += 1;
         }
         while k < mine.len() && mine[k].strength == s {

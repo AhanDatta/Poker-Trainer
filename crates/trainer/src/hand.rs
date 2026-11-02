@@ -270,6 +270,8 @@ impl LiveHand {
                     charts: Arc::clone(&self.charts),
                     menu: self.menu.clone(),
                     settings,
+                    rake_rate: self.state.config.rake_rate,
+                    rake_cap: self.state.config.rake_cap,
                 };
                 self.review = Some(Review::start(setup, self.snapshot()));
             }

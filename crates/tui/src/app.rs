@@ -22,16 +22,21 @@ pub enum SetupItem {
     Opponent,
     Position,
     Stack,
+    Rake,
     FlopSolve,
     VillainRange,
     RevealStyle,
 }
 
-pub const SETUP_ITEMS: [SetupItem; 7] = [
+/// Rake presets: (percent, cap in big blinds).
+pub const RAKE_PRESETS: [(f64, f64); 5] = [(0.0, 3.0), (2.5, 1.0), (5.0, 1.0), (5.0, 3.0), (5.0, 5.0)];
+
+pub const SETUP_ITEMS: [SetupItem; 8] = [
     SetupItem::Table,
     SetupItem::Opponent,
     SetupItem::Position,
     SetupItem::Stack,
+    SetupItem::Rake,
     SetupItem::FlopSolve,
     SetupItem::VillainRange,
     SetupItem::RevealStyle,
@@ -95,7 +100,7 @@ impl App {
     }
 
     fn hand_finished(&self) -> bool {
-        self.hand.as_ref().map_or(true, |h| h.is_finished())
+        self.hand.as_ref().is_none_or(|h| h.is_finished())
     }
 
     pub fn flash(&mut self, msg: impl Into<String>) {
@@ -227,6 +232,15 @@ impl App {
                 if (cfg.stack_bb - 100.0).abs() > 1e-9 {
                     self.flash("Note: the built-in preflop charts assume 100bb stacks.");
                 }
+            }
+            SetupItem::Rake => {
+                let cur = RAKE_PRESETS
+                    .iter()
+                    .position(|&(p, c)| (p - cfg.rake_pct).abs() < 1e-9 && (c - cfg.rake_cap_bb).abs() < 1e-9)
+                    .unwrap_or(0);
+                let (p, c) = RAKE_PRESETS[cycle(cur, RAKE_PRESETS.len())];
+                cfg.rake_pct = p;
+                cfg.rake_cap_bb = c;
             }
             SetupItem::FlopSolve => {
                 cfg.solver.flop_mode = match cfg.solver.flop_mode {

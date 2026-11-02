@@ -85,11 +85,24 @@ pub struct TableConfig {
     pub small_blind: Chips,
     pub big_blind: Chips,
     pub ante: Chips,
+    /// Rake as a fraction of the pot ("no flop, no drop": only pots that
+    /// see a flop are raked; uncalled bets are never raked).
+    #[serde(default)]
+    pub rake_rate: f64,
+    /// Maximum rake per hand, in chips.
+    #[serde(default)]
+    pub rake_cap: Chips,
 }
 
 impl TableConfig {
     pub fn new(num_players: usize, small_blind: Chips, big_blind: Chips) -> TableConfig {
-        TableConfig { num_players, small_blind, big_blind, ante: 0 }
+        TableConfig { num_players, small_blind, big_blind, ante: 0, rake_rate: 0.0, rake_cap: 0 }
+    }
+
+    pub fn with_rake(mut self, rate: f64, cap: Chips) -> TableConfig {
+        self.rake_rate = rate;
+        self.rake_cap = cap;
+        self
     }
 }
 
@@ -152,6 +165,8 @@ pub struct Settlement {
     /// Hand values of players who reached showdown.
     pub hand_values: Vec<Option<HandValue>>,
     pub showdown: bool,
+    /// Rake taken from the pot.
+    pub rake: Chips,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -392,13 +407,13 @@ impl HandState {
         if self.players_in_hand().len() == 1 {
             self.phase = Phase::Finished;
             self.to_act = None;
-            return Ok(record);
+        } else {
+            match self.next_needing_action_from((p + 1) % self.num_players()) {
+                Some(q) => self.to_act = Some(q),
+                None => self.finish_round(),
+            }
         }
-        let next = self.next_needing_action_from((p + 1) % self.num_players());
-        match next {
-            Some(q) => self.to_act = Some(q),
-            None => self.finish_round(),
-        }
+        debug_assert_eq!(self.invariants(), Ok(()), "after {action:?}");
         Ok(record)
     }
 
@@ -450,6 +465,46 @@ impl HandState {
         }
         self.phase = Phase::Betting;
         self.to_act = self.next_needing_action_from((self.button + 1) % self.num_players());
+        debug_assert_eq!(self.invariants(), Ok(()), "after dealing {cards:?}");
+        Ok(())
+    }
+
+    /// Internal consistency checks. They run after every state change in
+    /// debug builds (and in the property tests).
+    pub fn invariants(&self) -> Result<(), String> {
+        let n = self.num_players();
+        let start: Chips = self.starting_stacks.iter().sum();
+        let now: Chips = self.stacks.iter().sum::<Chips>() + self.pot();
+        if start != now {
+            return Err(format!("chips not conserved: started with {start}, now {now}"));
+        }
+        for p in 0..n {
+            if self.stacks[p] < 0 || self.street_commit[p] < 0 {
+                return Err(format!("negative chips for seat {p}"));
+            }
+            if self.street_commit[p] > self.total_commit[p] {
+                return Err(format!("street commitment exceeds total for seat {p}"));
+            }
+            if self.street_commit[p] > self.current_bet {
+                return Err(format!("seat {p} committed more than the current bet"));
+            }
+        }
+        match (self.phase, self.to_act) {
+            (Phase::Betting, Some(p)) => {
+                if self.folded[p] || self.stacks[p] == 0 {
+                    return Err(format!("seat {p} can't act (folded or all-in)"));
+                }
+            }
+            (Phase::Betting, None) => return Err("betting with nobody to act".into()),
+            (_, Some(_)) => return Err("someone to act outside a betting round".into()),
+            _ => {}
+        }
+        if self.players_in_hand().is_empty() {
+            return Err("everyone folded".into());
+        }
+        if self.board.len() != self.street.board_len() {
+            return Err("board doesn't match the street".into());
+        }
         Ok(())
     }
 
@@ -468,26 +523,53 @@ impl HandState {
                 }
             })
             .collect();
-        let mut payouts = vec![0; n];
+        // Split the pot into layers by contribution level (side pots).
         let mut levels: Vec<Chips> = self.total_commit.clone();
         levels.sort_unstable();
         levels.dedup();
+        let mut pots: Vec<(Chips, usize, Vec<usize>)> = Vec::new(); // (amount, contributors, eligible)
         let mut prev = 0;
         for level in levels {
             if level <= prev {
                 continue;
             }
             let slice: Chips = self.total_commit.iter().map(|&c| c.min(level) - c.min(prev)).sum();
+            let contributors = self.total_commit.iter().filter(|&&c| c >= level).count();
             let eligible: Vec<usize> =
                 live.iter().copied().filter(|&p| self.total_commit[p] >= level).collect();
             prev = level;
+            if slice > 0 {
+                pots.push((slice, contributors, eligible));
+            }
+        }
+        // Rake: only pots that saw a flop, only matched chips (layers with
+        // at least two contributors), capped; taken from the main pot first.
+        let mut rake = 0;
+        if self.config.rake_rate > 0.0 && self.board.len() >= 3 {
+            let matched: Chips = pots.iter().filter(|(_, c, _)| *c >= 2).map(|(a, _, _)| *a).sum();
+            rake =
+                ((matched as f64 * self.config.rake_rate).floor() as Chips).min(self.config.rake_cap).max(0);
+            let mut left = rake;
+            for (amount, contributors, _) in pots.iter_mut() {
+                if left == 0 {
+                    break;
+                }
+                if *contributors >= 2 {
+                    let take = left.min(*amount);
+                    *amount -= take;
+                    left -= take;
+                }
+            }
+        }
+        let mut payouts = vec![0; n];
+        for (slice, _, eligible) in pots {
             if slice == 0 {
                 continue;
             }
             let winners: Vec<usize> = if eligible.len() <= 1 {
                 if eligible.is_empty() {
                     // Everyone eligible folded: give it to the remaining live
-                    // player(s) with the largest contribution.
+                    // player(s).
                     live.clone()
                 } else {
                     eligible
@@ -510,7 +592,7 @@ impl HandState {
             }
         }
         let net = (0..n).map(|p| payouts[p] - self.total_commit[p]).collect();
-        Settlement { payouts, net, hand_values, showdown }
+        Settlement { payouts, net, hand_values, showdown, rake }
     }
 }
 
@@ -642,6 +724,37 @@ mod tests {
         // Main pot 3000 to AA; side pot 4000 to KK.
         assert_eq!(st.payouts, vec![3000, 4000, 0]);
         assert_eq!(st.net.iter().sum::<Chips>(), 0);
+    }
+
+    #[test]
+    fn rake_no_flop_no_drop() {
+        let cfg = TableConfig::new(2, 50, 100).with_rake(0.05, 300);
+        // Preflop fold: no rake.
+        let mut s = HandState::new(cfg.clone(), 0, vec![10000, 10000], holes(2));
+        s.apply(Action::Raise(250)).unwrap();
+        s.apply(Action::Fold).unwrap();
+        assert_eq!(s.settle().rake, 0);
+        // Flop bet folded to: the matched 5bb pot is raked, the bet returned.
+        let mut s = HandState::new(cfg.clone(), 0, vec![10000, 10000], holes(2));
+        s.apply(Action::Raise(250)).unwrap();
+        s.apply(Action::Call).unwrap();
+        s.deal_board(&parse_cards("2c3c4d").unwrap()).unwrap();
+        s.apply(Action::Check).unwrap();
+        s.apply(Action::Raise(300)).unwrap();
+        s.apply(Action::Fold).unwrap();
+        let st = s.settle();
+        assert_eq!(st.rake, 25);
+        assert_eq!(st.net, vec![250 - 25, -250]);
+        // Big all-in: rake capped.
+        let mut s = HandState::new(cfg, 0, vec![10000, 10000], holes(2));
+        s.apply(Action::Raise(10000)).unwrap();
+        s.apply(Action::Call).unwrap();
+        for c in ["2c3c4d", "8d", "9c"] {
+            s.deal_board(&parse_cards(c).unwrap()).unwrap();
+        }
+        let st = s.settle();
+        assert_eq!(st.rake, 300);
+        assert_eq!(st.net.iter().sum::<Chips>(), -300);
     }
 
     #[test]

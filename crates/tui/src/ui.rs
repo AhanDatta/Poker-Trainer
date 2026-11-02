@@ -159,12 +159,24 @@ fn draw_setup(f: &mut Frame, app: &App) {
                 HeroPosition::Bb => "Always BB".into(),
             },
             SetupItem::Stack => format!("{}bb", cfg.stack_bb),
+            SetupItem::Rake => {
+                if cfg.rake_pct <= 0.0 {
+                    "None".into()
+                } else {
+                    format!(
+                        "{}% of the pot, capped at {}bb (no flop, no drop)",
+                        cfg.rake_pct, cfg.rake_cap_bb
+                    )
+                }
+            }
             SetupItem::FlopSolve => match cfg.solver.flop_mode {
                 FlopMode::Fast => format!(
                     "Fast — {} turn × {} river sampled cards (seconds, approximate)",
                     cfg.solver.flop_turn_samples, cfg.solver.flop_river_samples
                 ),
-                FlopMode::Exact => "Exact — every runout (GBs of RAM, minutes)".into(),
+                FlopMode::Exact => {
+                    format!("Exact — every runout (up to {} GB of RAM, minutes)", cfg.solver.max_memory_gb)
+                }
             },
             SetupItem::VillainRange => match cfg.solver.villain_range {
                 VillainRange::Gto => "GTO ranges (villain plays the charts)".into(),
@@ -181,6 +193,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
         SetupItem::Opponent => "Opponent style",
         SetupItem::Position => "Your position",
         SetupItem::Stack => "Stacks",
+        SetupItem::Rake => "Rake",
         SetupItem::FlopSolve => "Flop solving",
         SetupItem::VillainRange => "Villain range in review",
         SetupItem::RevealStyle => "Reveal style during hand",

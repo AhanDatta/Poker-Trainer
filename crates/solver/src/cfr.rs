@@ -1,27 +1,39 @@
 //! Discounted CFR over the vectorized (range-vs-range) game tree.
 //!
-//! Each recursive call receives the opponent's reach probabilities (one per
+//! [`traverse`] receives the opponent's reach probabilities (one per
 //! opponent hand) and writes the traversing player's counterfactual values
-//! (one per own hand) into `out`. Terminal values are normalized by the total
-//! weight of compatible hand pairs, so summing `weight * value` over a
-//! player's hands gives an expected payoff in chips.
+//! (one per own hand) into `out`. The same traversal implements a DCFR
+//! iteration, a best response, and an evaluation of the average strategies.
+//! Terminal values are normalized by the total weight of compatible hand
+//! pairs, so summing `weight * value` over a player's hands gives an
+//! expected payoff in chips.
 //!
-//! Payoffs are zero-sum: `u_i = (chips i ends with) - (chips i had at the
-//! root) - root_pot / 2`.
+//! Payoffs: `u_i = (chips i ends with) - (chips i had at the root) - pot/2`,
+//! which is zero-sum without rake.
 
 use crate::eval::{eval_fold, eval_showdown};
 use crate::hands::{HandSet, StrengthTable};
-use crate::tree::{Kind, Node};
+use crate::iso::Isomorphism;
+use crate::river;
+use crate::scratch::Buf;
+use crate::storage::Storage;
+use crate::tree::{Kind, Node, Tree};
+use holdem::Street;
 use rayon::prelude::*;
 
 pub(crate) struct Ctx<'a> {
+    pub tree: &'a Tree,
+    pub store: &'a Storage,
     pub hands: &'a HandSet,
     pub tables: &'a [StrengthTable],
+    pub iso: &'a Isomorphism,
     pub half_pot: f64,
     pub norm: f64,
+    /// Use the breadth-first batched evaluator for river subtrees.
+    pub batch_river: bool,
 }
 
-/// DCFR discount factors for one iteration (α = 1.5, β = 0, γ = 2).
+/// DCFR discount factors for one iteration.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Discount {
     pub pos: f32,
@@ -29,84 +41,287 @@ pub(crate) struct Discount {
     pub strat: f32,
 }
 
+/// DCFR hyper-parameters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DcfrParams {
+    pub alpha: f64,
+    /// Negative regrets are multiplied by `t^beta / (t^beta + 1)`; `None`
+    /// clips them to zero every iteration (DCFR+).
+    pub beta: Option<f64>,
+    pub gamma: f64,
+}
+
+impl Default for DcfrParams {
+    fn default() -> Self {
+        DcfrParams { alpha: 1.5, beta: Some(0.0), gamma: 2.0 }
+    }
+}
+
 impl Discount {
     /// Factors applied at (1-based) iteration `t` to the values accumulated
     /// over the previous iterations.
-    pub fn new(t: u32) -> Discount {
+    pub fn new(t: u32, params: &DcfrParams) -> Discount {
         let prev = (t.max(1) - 1) as f64;
-        let pa = prev.powf(1.5);
+        let pa = prev.powf(params.alpha);
         let tf = t.max(1) as f64;
-        Discount { pos: (pa / (pa + 1.0)) as f32, neg: 0.5, strat: ((tf - 1.0) / tf).powi(2) as f32 }
+        let neg = match params.beta {
+            Some(b) => {
+                let pb = prev.powf(b);
+                (pb / (pb + 1.0)) as f32
+            }
+            None => 0.0,
+        };
+        Discount { pos: (pa / (pa + 1.0)) as f32, neg, strat: ((tf - 1.0) / tf).powf(params.gamma) as f32 }
     }
 }
 
 /// Normalizes action-major values per hand (uniform when the column sums to 0).
 pub(crate) fn normalize_in_place(s: &mut [f32], num_actions: usize, n: usize) {
-    let mut denom = s[..n].to_vec();
-    for a in 1..num_actions {
-        for (d, &v) in denom.iter_mut().zip(&s[a * n..(a + 1) * n]) {
+    if n == 0 {
+        return;
+    }
+    let mut denom = Buf::from_slice(&s[..n]);
+    for row in s.chunks_exact(n).skip(1) {
+        for (d, &v) in denom.iter_mut().zip(row) {
             *d += v;
         }
     }
+    // One division per hand instead of one per (action, hand).
+    for d in denom.iter_mut() {
+        *d = if *d > 0.0 { 1.0 / *d } else { 0.0 };
+    }
     let uniform = 1.0 / num_actions as f32;
     for row in s.chunks_exact_mut(n) {
-        for (v, &d) in row.iter_mut().zip(&denom) {
-            *v = if d > 0.0 { *v / d } else { uniform };
+        for (v, &inv) in row.iter_mut().zip(denom.iter()) {
+            *v = if inv > 0.0 { *v * inv } else { uniform };
         }
     }
 }
 
-/// Regret matching: strategy proportional to positive regrets.
+/// Regret matching in place: strategy proportional to positive regrets.
+pub(crate) fn regret_match(s: &mut [f32], num_actions: usize, n: usize) {
+    for x in s.iter_mut() {
+        *x = x.max(0.0);
+    }
+    normalize_in_place(s, num_actions, n);
+    debug_assert!(is_distribution(s, num_actions, n), "regret matching produced an invalid strategy");
+}
+
+/// Debug sentinel: every hand's action probabilities are in [0, 1] and sum to 1.
+pub(crate) fn is_distribution(s: &[f32], num_actions: usize, n: usize) -> bool {
+    (0..n).all(|h| {
+        let mut sum = 0f32;
+        for a in 0..num_actions {
+            let x = s[a * n + h];
+            if !(-1e-6..=1.0 + 1e-5).contains(&x) {
+                return false;
+            }
+            sum += x;
+        }
+        (sum - 1.0).abs() < 1e-3
+    })
+}
+
+/// Normalized payoff of a fold terminal for player `p`.
 #[inline]
-fn regret_matching(regrets: &[f32], num_actions: usize, n: usize) -> Vec<f32> {
-    let mut s: Vec<f32> = regrets.iter().map(|&r| r.max(0.0)).collect();
-    normalize_in_place(&mut s, num_actions, n);
-    s
+pub(crate) fn fold_payoff(ctx: &Ctx, node: &Node, p: usize) -> f64 {
+    let Kind::Fold(f) = node.kind else { unreachable!() };
+    let f = f as usize;
+    let v = if f == p {
+        -(ctx.half_pot + node.invest[p] as f64)
+    } else {
+        ctx.half_pot + node.invest[f] as f64 - node.rake as f64
+    };
+    v * ctx.norm
 }
 
-pub(crate) fn average_strategy(node: &Node, n: usize) -> Vec<f32> {
-    let mut s = node.strat_sum.clone();
-    normalize_in_place(&mut s, node.num_actions(), n);
-    s
-}
-
-fn terminal_values(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], out: &mut [f32]) {
+/// Normalized `(win, lose, tie)` payoffs of a showdown for player `p`.
+#[inline]
+pub(crate) fn showdown_payoffs(ctx: &Ctx, node: &Node, p: usize) -> (f64, f64, f64) {
     let o = p ^ 1;
+    let rake = node.rake as f64;
+    let win = (ctx.half_pot + node.invest[o] as f64 - rake) * ctx.norm;
+    let lose = -(ctx.half_pot + node.invest[p] as f64) * ctx.norm;
+    let tie = 0.5 * ((node.invest[o] - node.invest[p]) as f64 - rake) * ctx.norm;
+    (win, lose, tie)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Mode {
+    /// One DCFR update for the traverser (and the opponent's strategy sums).
+    Cfr(Discount),
+    /// The traverser best-responds to the opponent's average strategy.
+    BestResponse,
+    /// Both players play their average strategies.
+    Average,
+}
+
+/// Values of player `p` at node `id` given the opponent's reach.
+pub(crate) fn traverse(ctx: &Ctx, id: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
+    traverse_inner(ctx, id, p, opp_reach, mode, out);
+    debug_assert!(out.iter().all(|v| v.is_finite()), "non-finite values at node {id}");
+}
+
+fn traverse_inner(ctx: &Ctx, id: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
+    debug_assert!(opp_reach.iter().all(|&r| r >= 0.0 && r.is_finite()), "invalid reach at node {id}");
+    let node = &ctx.tree.nodes[id];
     match node.kind {
-        Kind::Fold(f) => {
-            let f = f as usize;
-            let payoff = if f == p {
-                -(ctx.half_pot + node.invest[p] as f64)
-            } else {
-                ctx.half_pot + node.invest[f] as f64
-            };
-            eval_fold(ctx.hands, p, opp_reach, payoff * ctx.norm, out);
-        }
+        Kind::Fold(_) => eval_fold(ctx.hands, p, opp_reach, fold_payoff(ctx, node, p), out),
         Kind::Showdown => {
-            let win = (ctx.half_pot + node.invest[o] as f64) * ctx.norm;
-            let lose = -(ctx.half_pot + node.invest[p] as f64) * ctx.norm;
-            let tie = 0.5 * (node.invest[o] - node.invest[p]) as f64 * ctx.norm;
-            eval_showdown(ctx.hands, &ctx.tables[node.table as usize], p, opp_reach, win, lose, tie, out);
+            let (w, l, t) = showdown_payoffs(ctx, node, p);
+            eval_showdown(ctx.hands, &ctx.tables[node.offset as usize], p, opp_reach, w, l, t, out);
         }
-        _ => unreachable!(),
+        Kind::Chance => chance(ctx, node, p, opp_reach, mode, out),
+        Kind::Player(_) if ctx.batch_river && node.street == Street::River => {
+            river::subtree(ctx, id, p, opp_reach, mode, out)
+        }
+        Kind::Player(q) if q as usize == p => own_node(ctx, node, p, opp_reach, mode, out),
+        Kind::Player(_) => opponent_node(ctx, node, p, opp_reach, mode, out),
     }
 }
 
-/// Opponent reach after a chance card (hands containing it are impossible).
-fn chance_child_reach(ctx: &Ctx, p: usize, opp_reach: &[f32], factor: f32, card: usize) -> Vec<f32> {
-    let mut r: Vec<f32> = opp_reach.iter().map(|&w| w * factor).collect();
-    for &k in &ctx.hands.blocked[p ^ 1][card] {
-        r[k as usize] = 0.0;
+fn own_node(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
+    let na = node.num_actions();
+    let n = out.len();
+    let mut cfv = Buf::uninit(na * n);
+    for (row, c) in cfv.chunks_exact_mut(n.max(1)).zip(node.children()) {
+        traverse(ctx, c, p, opp_reach, mode, row);
     }
-    r
+    if n == 0 {
+        return;
+    }
+    own_node_combine(ctx, node, n, &cfv, mode, out);
 }
 
-/// Sums per-card value rows into `out` (in f64).
-fn sum_rows(rows: &[f32], n: usize, out: &mut [f32]) {
+/// Values of a traverser node from its children's values (`cfv`, action
+/// major), with the regret update in CFR mode. Regrets are decoded and
+/// encoded once.
+#[inline]
+pub(crate) fn own_node_combine(ctx: &Ctx, node: &Node, n: usize, cfv: &[f32], mode: Mode, out: &mut [f32]) {
+    let na = node.num_actions();
+    let b = node.block(n);
+    let combine = |s: &[f32], out: &mut [f32]| {
+        out.fill(0.0);
+        for (srow, crow) in s.chunks_exact(n).zip(cfv.chunks_exact(n)) {
+            for ((o, &x), &v) in out.iter_mut().zip(srow).zip(crow) {
+                *o += x * v;
+            }
+        }
+    };
+    match mode {
+        Mode::BestResponse => {
+            out.copy_from_slice(&cfv[..n]);
+            for row in cfv.chunks_exact(n).skip(1) {
+                for (o, &v) in out.iter_mut().zip(row) {
+                    *o = o.max(v);
+                }
+            }
+        }
+        Mode::Average => {
+            let mut s = Buf::uninit(na * n);
+            unsafe { ctx.store.load_strat(b, &mut s) };
+            normalize_in_place(&mut s, na, n);
+            combine(&s, out);
+        }
+        Mode::Cfr(d) => unsafe {
+            ctx.store.update_regrets(b, |r| {
+                let mut s = Buf::from_slice(r);
+                regret_match(&mut s, na, n);
+                combine(&s, out);
+                let out: &[f32] = out;
+                for (rrow, crow) in r.chunks_exact_mut(n).zip(cfv.chunks_exact(n)) {
+                    for ((x, &c), &o) in rrow.iter_mut().zip(crow).zip(out) {
+                        let disc = if *x > 0.0 { d.pos } else { d.neg };
+                        *x = *x * disc + c - o;
+                    }
+                }
+            });
+        },
+    }
+}
+
+fn opponent_node(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
+    let na = node.num_actions();
+    let nq = opp_reach.len();
+    let n = out.len();
+    let mut s = Buf::uninit(na * nq);
+    if nq > 0 {
+        let b = node.block(nq);
+        unsafe {
+            match mode {
+                Mode::Cfr(d) => {
+                    ctx.store.load_regrets(b, &mut s);
+                    regret_match(&mut s, na, nq);
+                    ctx.store.update_strat(b, |ss| {
+                        for (ss_row, s_row) in ss.chunks_exact_mut(nq).zip(s.chunks_exact(nq)) {
+                            for ((x, &y), &w) in ss_row.iter_mut().zip(s_row).zip(opp_reach) {
+                                *x = *x * d.strat + y * w;
+                            }
+                        }
+                    });
+                }
+                _ => {
+                    ctx.store.load_strat(b, &mut s);
+                    normalize_in_place(&mut s, na, nq);
+                }
+            }
+        }
+        for row in s.chunks_exact_mut(nq) {
+            for (x, &r) in row.iter_mut().zip(opp_reach) {
+                *x *= r;
+            }
+        }
+    }
+    out.fill(0.0);
+    let mut tmp = Buf::uninit(n);
+    for (a, c) in node.children().enumerate() {
+        let r_a = &s[a * nq..(a + 1) * nq];
+        if r_a.iter().all(|&w| w == 0.0) {
+            continue;
+        }
+        traverse(ctx, c, p, r_a, mode, &mut tmp);
+        for (o, &v) in out.iter_mut().zip(tmp.iter()) {
+            *o += v;
+        }
+    }
+}
+
+fn chance(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
+    let n = out.len();
+    if n == 0 || opp_reach.iter().all(|&w| w == 0.0) {
+        out.fill(0.0);
+        return;
+    }
+    let o = p ^ 1;
+    let factor = node.chance_factor;
+    let k = node.num_actions();
+    let mut rows = vec![0f32; k * n];
+    rows.par_chunks_mut(n).zip(node.children().into_par_iter()).for_each(|(row, c)| {
+        let card = ctx.tree.card(c).index();
+        let mut r = Buf::from_slice(opp_reach);
+        for x in r.iter_mut() {
+            *x *= factor;
+        }
+        for &h in &ctx.hands.blocked[o][card] {
+            r[h as usize] = 0.0;
+        }
+        traverse(ctx, c, p, &r, mode, row);
+        for &h in &ctx.hands.blocked[p][card] {
+            row[h as usize] = 0.0;
+        }
+    });
     let mut acc = vec![0f64; n];
     for row in rows.chunks_exact(n) {
         for (a, &v) in acc.iter_mut().zip(row) {
             *a += v as f64;
+        }
+    }
+    // Isomorphic cards: the canonical child's values with suits swapped.
+    for &(ci, pair) in &ctx.tree.chance[node.slot as usize].iso {
+        let row = &rows[ci as usize * n..(ci as usize + 1) * n];
+        let perm = &ctx.iso.perm[p][pair as usize];
+        for (a, &j) in acc.iter_mut().zip(perm) {
+            *a += row[j as usize] as f64;
         }
     }
     for (o, a) in out.iter_mut().zip(acc) {
@@ -114,170 +329,25 @@ fn sum_rows(rows: &[f32], n: usize, out: &mut [f32]) {
     }
 }
 
-/// Zeroes the values of `p`'s hands that contain `card`.
-fn zero_blocked(ctx: &Ctx, p: usize, card: usize, row: &mut [f32]) {
-    for &k in &ctx.hands.blocked[p][card] {
-        row[k as usize] = 0.0;
-    }
-}
-
-/// One DCFR traversal for player `p`. Updates `p`'s regrets and the
-/// opponent's average-strategy accumulators; writes `p`'s values to `out`.
-pub(crate) fn cfr(ctx: &Ctx, node: &mut Node, p: usize, opp_reach: &[f32], d: Discount, out: &mut [f32]) {
-    let n = out.len();
-    match node.kind {
-        Kind::Fold(_) | Kind::Showdown => terminal_values(ctx, node, p, opp_reach, out),
-        Kind::Chance => {
-            if opp_reach.iter().all(|&w| w == 0.0) {
-                out.fill(0.0);
-                return;
-            }
-            let factor = node.chance_factor;
-            let mut rows = vec![0f32; node.cards.len() * n];
-            node.children.par_iter_mut().zip(rows.par_chunks_mut(n)).zip(node.cards.par_iter()).for_each(
-                |((child, row), &card)| {
-                    let r = chance_child_reach(ctx, p, opp_reach, factor, card.index());
-                    cfr(ctx, child, p, &r, d, row);
-                    zero_blocked(ctx, p, card.index(), row);
-                },
-            );
-            sum_rows(&rows, n, out);
-        }
-        Kind::Player(q) if q as usize == p => {
-            let na = node.num_actions();
-            let strategy = regret_matching(&node.regrets, na, n);
-            let mut cfv = vec![0f32; na * n];
-            for (child, row) in node.children.iter_mut().zip(cfv.chunks_exact_mut(n)) {
-                cfr(ctx, child, p, opp_reach, d, row);
-            }
-            out.fill(0.0);
-            for (s, c) in strategy.chunks_exact(n).zip(cfv.chunks_exact(n)) {
-                for ((o, &s), &c) in out.iter_mut().zip(s).zip(c) {
-                    *o += s * c;
-                }
-            }
-            let (pos, neg) = (d.pos, d.neg);
-            for (r, c) in node.regrets.chunks_exact_mut(n).zip(cfv.chunks_exact(n)) {
-                for ((r, &c), &o) in r.iter_mut().zip(c).zip(out.iter()) {
-                    let disc = if *r > 0.0 { pos } else { neg };
-                    *r = *r * disc + c - o;
-                }
-            }
-        }
-        Kind::Player(q) => {
-            let q = q as usize;
-            let na = node.num_actions();
-            let nq = opp_reach.len();
-            let mut reach_a = regret_matching(&node.regrets, na, nq);
-            let g = d.strat;
-            for (ss, s) in node.strat_sum.chunks_exact_mut(nq).zip(reach_a.chunks_exact_mut(nq)) {
-                for ((ss, s), &r) in ss.iter_mut().zip(s.iter_mut()).zip(opp_reach) {
-                    *s *= r;
-                    *ss = *ss * g + *s;
-                }
-            }
-            debug_assert_eq!(nq, ctx.hands.len(q));
-            out.fill(0.0);
-            let mut tmp = vec![0f32; n];
-            for (child, r_a) in node.children.iter_mut().zip(reach_a.chunks_exact(nq)) {
-                if r_a.iter().all(|&w| w == 0.0) {
-                    continue;
-                }
-                cfr(ctx, child, p, r_a, d, &mut tmp);
-                for (o, &v) in out.iter_mut().zip(&tmp) {
-                    *o += v;
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Mode {
-    /// The traverser plays a best response.
-    BestResponse,
-    /// The traverser plays its average strategy.
-    Average,
-}
-
-/// Values of player `p` when the opponent plays its average strategy and `p`
-/// plays according to `mode`.
-pub(crate) fn evaluate(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
-    let n = out.len();
-    match node.kind {
-        Kind::Fold(_) | Kind::Showdown => terminal_values(ctx, node, p, opp_reach, out),
-        Kind::Chance => {
-            if opp_reach.iter().all(|&w| w == 0.0) {
-                out.fill(0.0);
-                return;
-            }
-            let factor = node.chance_factor;
-            let mut rows = vec![0f32; node.cards.len() * n];
-            node.children.par_iter().zip(rows.par_chunks_mut(n)).zip(node.cards.par_iter()).for_each(
-                |((child, row), &card)| {
-                    let r = chance_child_reach(ctx, p, opp_reach, factor, card.index());
-                    evaluate(ctx, child, p, &r, mode, row);
-                    zero_blocked(ctx, p, card.index(), row);
-                },
-            );
-            sum_rows(&rows, n, out);
-        }
-        Kind::Player(q) if q as usize == p => {
-            let na = node.num_actions();
-            let mut cfv = vec![0f32; na * n];
-            for (child, row) in node.children.iter().zip(cfv.chunks_exact_mut(n)) {
-                evaluate(ctx, child, p, opp_reach, mode, row);
-            }
-            match mode {
-                Mode::BestResponse => {
-                    out.copy_from_slice(&cfv[..n]);
-                    for row in cfv.chunks_exact(n).skip(1) {
-                        for (o, &v) in out.iter_mut().zip(row) {
-                            *o = o.max(v);
-                        }
-                    }
-                }
-                Mode::Average => {
-                    let s = average_strategy(node, n);
-                    out.fill(0.0);
-                    for (s, c) in s.chunks_exact(n).zip(cfv.chunks_exact(n)) {
-                        for ((o, &s), &c) in out.iter_mut().zip(s).zip(c) {
-                            *o += s * c;
-                        }
-                    }
-                }
-            }
-        }
-        Kind::Player(_) => {
-            let nq = opp_reach.len();
-            let mut reach_a = average_strategy(node, nq);
-            for s in reach_a.chunks_exact_mut(nq) {
-                for (s, &r) in s.iter_mut().zip(opp_reach) {
-                    *s *= r;
-                }
-            }
-            out.fill(0.0);
-            let mut tmp = vec![0f32; n];
-            for (child, r_a) in node.children.iter().zip(reach_a.chunks_exact(nq)) {
-                if r_a.iter().all(|&w| w == 0.0) {
-                    continue;
-                }
-                evaluate(ctx, child, p, r_a, mode, &mut tmp);
-                for (o, &v) in out.iter_mut().zip(&tmp) {
-                    *o += v;
-                }
-            }
-        }
-    }
-}
-
-/// Exploitability (in chips): average gain of the two best responses.
-pub(crate) fn exploitability(ctx: &Ctx, root: &Node) -> f64 {
-    let mut total = 0f64;
+/// Expected payoff (chips) of each player under `mode` at the root.
+pub(crate) fn root_values(ctx: &Ctx, mode: Mode) -> [f64; 2] {
+    let mut res = [0f64; 2];
     for p in 0..2 {
         let mut v = vec![0f32; ctx.hands.len(p)];
-        evaluate(ctx, root, p, &ctx.hands.weights[p ^ 1], Mode::BestResponse, &mut v);
-        total += v.iter().zip(&ctx.hands.weights[p]).map(|(&x, &w)| x as f64 * w as f64).sum::<f64>();
+        traverse(ctx, 0, p, &ctx.hands.weights[p ^ 1], mode, &mut v);
+        res[p] = v.iter().zip(&ctx.hands.weights[p]).map(|(&x, &w)| x as f64 * w as f64).sum();
     }
-    total / 2.0
+    res
+}
+
+/// Exploitability (chips): average gain of the two best responses over the
+/// average strategy profile.
+pub(crate) fn exploitability(ctx: &Ctx, raked: bool) -> f64 {
+    let br = root_values(ctx, Mode::BestResponse);
+    if raked {
+        let ev = root_values(ctx, Mode::Average);
+        ((br[0] - ev[0]) + (br[1] - ev[1])) / 2.0
+    } else {
+        (br[0] + br[1]) / 2.0
+    }
 }

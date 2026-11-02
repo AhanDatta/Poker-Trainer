@@ -1,11 +1,18 @@
 //! Heads-up postflop betting state and game-tree construction.
+//!
+//! The tree is stored as a flat arena of compact [`Node`]s; the children of
+//! a node occupy a contiguous index range. Regrets and strategy sums live in
+//! a separate [`crate::storage::Storage`].
 
+use crate::iso::{IsoRef, Isomorphism};
 use crate::sampling::sample_cards;
+use crate::storage::{Block, Storage};
 use holdem::menu::postflop_actions;
 use holdem::{Action, Card, CardSet, Chips, PostflopMenu, Situation, Street};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::collections::HashMap;
+use std::ops::Range;
 
 /// Betting state of a heads-up postflop street. Player 0 is out of position
 /// (acts first on every street), player 1 is in position.
@@ -126,82 +133,147 @@ pub(crate) enum Kind {
     Showdown,
 }
 
-/// A game-tree node. Storage vectors are laid out action-major:
-/// `regrets[a * num_hands + i]`.
-#[derive(Debug)]
+/// How a node was reached from its parent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Edge {
+    Root,
+    Action(Action),
+    Card(Card),
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Node {
     pub kind: Kind,
-    /// Player node: the actions; chance node: empty.
-    pub actions: Vec<Action>,
-    /// Chance node: the card dealt to reach each child.
-    pub cards: Vec<Card>,
-    pub children: Vec<Node>,
+    pub street: Street,
+    pub num_children: u16,
+    pub first_child: u32,
     /// Chips each player has invested since the root.
-    pub invest: [Chips; 2],
+    pub invest: [i32; 2],
+    /// Player node: storage offset. Showdown: strength-table index.
+    pub offset: u64,
+    /// Player node: storage slot (scales). Chance node: `chance` index.
+    pub slot: u32,
+    /// Terminal nodes: rake taken from the pot.
+    pub rake: f32,
     /// Chance node: reach multiplier for each child.
     pub chance_factor: f32,
-    /// Showdown node: strength table index.
-    pub table: u32,
-    pub regrets: Vec<f32>,
-    pub strat_sum: Vec<f32>,
+    pub edge: Edge,
 }
 
 impl Node {
-    fn new(kind: Kind, invest: [Chips; 2]) -> Node {
+    fn placeholder() -> Node {
         Node {
-            kind,
-            actions: Vec::new(),
-            cards: Vec::new(),
-            children: Vec::new(),
-            invest,
+            kind: Kind::Showdown,
+            street: Street::River,
+            num_children: 0,
+            first_child: 0,
+            invest: [0, 0],
+            offset: 0,
+            slot: 0,
+            rake: 0.0,
             chance_factor: 1.0,
-            table: 0,
-            regrets: Vec::new(),
-            strat_sum: Vec::new(),
+            edge: Edge::Root,
         }
     }
 
+    #[inline]
+    pub fn children(&self) -> Range<usize> {
+        let f = self.first_child as usize;
+        f..f + self.num_children as usize
+    }
+
+    #[inline]
     pub fn num_actions(&self) -> usize {
-        self.actions.len()
+        self.num_children as usize
+    }
+
+    /// Storage block of a player node with `num_hands` hands.
+    #[inline]
+    pub fn block(&self, num_hands: usize) -> Block {
+        Block { offset: self.offset as usize, len: self.num_actions() * num_hands, slot: self.slot as usize }
     }
 }
 
-/// Sizes of a tree (as computed by the counting pass).
+/// Isomorphic outcomes of a chance node.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ChanceInfo {
+    /// `(index of the canonical child, suit pair)` for each isomorphic card.
+    pub iso: Vec<(u16, u8)>,
+    /// The isomorphic cards themselves (parallel to `iso`).
+    pub iso_cards: Vec<Card>,
+}
+
+pub(crate) struct Tree {
+    pub nodes: Vec<Node>,
+    pub chance: Vec<ChanceInfo>,
+    /// Full board of every showdown strength table.
+    pub boards: Vec<Vec<Card>>,
+    pub storage_len: u64,
+    pub num_player_nodes: u32,
+}
+
+impl Tree {
+    /// Actions of a player node.
+    pub fn actions(&self, id: usize) -> Vec<Action> {
+        self.nodes[id]
+            .children()
+            .map(|c| match self.nodes[c].edge {
+                Edge::Action(a) => a,
+                _ => unreachable!("player-node child reached by a card"),
+            })
+            .collect()
+    }
+
+    /// Card of a chance child.
+    #[inline]
+    pub fn card(&self, id: usize) -> Card {
+        match self.nodes[id].edge {
+            Edge::Card(c) => c,
+            _ => unreachable!("chance child reached by an action"),
+        }
+    }
+}
+
+/// Sizes of a tree.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TreeStats {
     pub player_nodes: u64,
     pub chance_nodes: u64,
     pub terminal_nodes: u64,
-    /// Number of `f32` storage cells (regrets + strategy sums).
-    pub storage_floats: u64,
+    /// Number of `(action, hand)` storage cells.
+    pub storage_cells: u64,
+    /// Whether storage would be compressed.
+    pub compressed: bool,
 }
 
 impl TreeStats {
-    fn add_scaled(&mut self, other: &TreeStats, k: u64) {
-        self.player_nodes += other.player_nodes * k;
-        self.chance_nodes += other.chance_nodes * k;
-        self.terminal_nodes += other.terminal_nodes * k;
-        self.storage_floats += other.storage_floats * k;
-    }
-
     pub fn total_nodes(&self) -> u64 {
         self.player_nodes + self.chance_nodes + self.terminal_nodes
     }
 
-    /// Approximate memory in bytes.
+    /// Approximate memory use in bytes.
     pub fn memory_bytes(&self) -> u64 {
-        self.storage_floats * 4 + self.total_nodes() * std::mem::size_of::<Node>() as u64
+        self.storage_cells * Storage::bytes_per_value(self.compressed)
+            + self.total_nodes() * std::mem::size_of::<Node>() as u64
+    }
+
+    /// Memory if storage is uncompressed `f32`.
+    pub fn memory_bytes_f32(&self) -> u64 {
+        TreeStats { compressed: false, ..*self }.memory_bytes()
     }
 }
 
 pub(crate) struct TreeParams<'a> {
     pub root_street: Street,
+    pub root_board: &'a [Card],
     pub menu: &'a PostflopMenu,
     pub future_menu: &'a PostflopMenu,
     pub big_blind: Chips,
     pub chance: ChanceMode,
-    /// Number of hands per player (for storage sizing).
     pub num_hands: [usize; 2],
+    pub rake_rate: f64,
+    pub rake_cap: f64,
+    pub iso: &'a Isomorphism,
 }
 
 impl TreeParams<'_> {
@@ -224,136 +296,257 @@ impl TreeParams<'_> {
             (ChanceMode::Sampled { river, .. }, _) => Some(river),
         }
     }
+
+    fn rake(&self, pot: Chips) -> f32 {
+        (pot as f64 * self.rake_rate).min(self.rake_cap) as f32
+    }
+
+    /// Cards dealt at a chance node: canonical cards and isomorphic refs.
+    fn chance_cards(
+        &self,
+        dealt: &[Card],
+        all_in: bool,
+        next: Street,
+        rng: &mut StdRng,
+    ) -> (Vec<Card>, Vec<IsoRef>, usize) {
+        let mut board = self.root_board.to_vec();
+        board.extend_from_slice(dealt);
+        let used = CardSet::from_cards(&board);
+        let available: Vec<Card> = Card::all().filter(|c| !used.contains(*c)).collect();
+        let n_avail = available.len();
+        match (all_in, self.sample_size(next)) {
+            (false, Some(k)) if k < n_avail => (sample_cards(&available, k, rng), Vec::new(), n_avail),
+            _ => {
+                let (canon, refs) = self.iso.chance_cards(&board, &available);
+                (canon, refs, n_avail)
+            }
+        }
+    }
 }
 
 /// Counts nodes and storage without building the tree.
-pub(crate) fn count_tree(params: &TreeParams, root: &BettingState, board_len: usize) -> TreeStats {
-    count_player(params, root, board_len)
+pub(crate) fn count_tree(params: &TreeParams, root: &BettingState) -> TreeStats {
+    let mut rng = StdRng::seed_from_u64(0);
+    let mut stats = TreeStats::default();
+    count_player(params, root, &mut Vec::new(), &mut rng, &mut stats);
+    stats
 }
 
-fn count_player(params: &TreeParams, st: &BettingState, board_len: usize) -> TreeStats {
-    let mut stats = TreeStats { player_nodes: 1, ..Default::default() };
+fn count_player(
+    params: &TreeParams,
+    st: &BettingState,
+    dealt: &mut Vec<Card>,
+    rng: &mut StdRng,
+    stats: &mut TreeStats,
+) {
+    stats.player_nodes += 1;
     let actions = params.actions(st);
-    stats.storage_floats += 2 * (actions.len() * params.num_hands[st.to_act]) as u64;
+    stats.storage_cells += (actions.len() * params.num_hands[st.to_act]) as u64;
     for a in actions {
-        let (tr, _) = st.apply(a);
-        match tr {
-            Transition::Continue(s2) => stats.add_scaled(&count_player(params, &s2, board_len), 1),
+        match st.apply(a).0 {
+            Transition::Continue(s2) => count_player(params, &s2, dealt, rng, stats),
             Transition::Fold(_) => stats.terminal_nodes += 1,
-            Transition::StreetOver(s2) => stats.add_scaled(&count_after_street(params, &s2, board_len), 1),
+            Transition::StreetOver(s2) => count_after_street(params, &s2, dealt, rng, stats),
         }
     }
-    stats
 }
 
-fn count_after_street(params: &TreeParams, st: &BettingState, board_len: usize) -> TreeStats {
-    let mut stats = TreeStats::default();
+fn count_after_street(
+    params: &TreeParams,
+    st: &BettingState,
+    dealt: &mut Vec<Card>,
+    rng: &mut StdRng,
+    stats: &mut TreeStats,
+) {
     if st.street == Street::River {
-        stats.terminal_nodes = 1;
-        return stats;
+        stats.terminal_nodes += 1;
+        return;
     }
-    let remaining = (52 - board_len) as u64;
-    stats.chance_nodes = 1;
-    if st.stack[0] == 0 || st.stack[1] == 0 {
-        // All-in runout: chance nodes down to showdown.
-        let mut next = *st;
-        next.street = st.street.next().unwrap();
-        let child = count_after_street(params, &next, board_len + 1);
-        stats.add_scaled(&child, remaining);
-        return stats;
+    stats.chance_nodes += 1;
+    let all_in = st.stack[0] == 0 || st.stack[1] == 0;
+    let next = st.street.next().unwrap();
+    let (cards, refs, _) = params.chance_cards(dealt, all_in, next, rng);
+    // Subtrees only differ (in size) through isomorphism further down, so
+    // without isomorphism one child can stand for all.
+    let uniform = refs.is_empty() && !params.iso.enabled;
+    let reps: &[Card] = if uniform { &cards[..1] } else { &cards };
+    let mut sub = TreeStats::default();
+    for &c in reps {
+        dealt.push(c);
+        if all_in {
+            let mut s2 = *st;
+            s2.street = next;
+            count_after_street(params, &s2, dealt, rng, &mut sub);
+        } else {
+            let s2 = BettingState::street_start(next, st.pot, st.stack, params.big_blind);
+            count_player(params, &s2, dealt, rng, &mut sub);
+        }
+        dealt.pop();
     }
-    let next_street = st.street.next().unwrap();
-    let k = params.sample_size(next_street).map_or(remaining, |k| (k as u64).min(remaining));
-    let next = BettingState::street_start(next_street, st.pot, st.stack, params.big_blind);
-    let child = count_player(params, &next, board_len + 1);
-    stats.add_scaled(&child, k);
-    stats
+    let k = if uniform { cards.len() as u64 } else { 1 };
+    stats.player_nodes += sub.player_nodes * k;
+    stats.chance_nodes += sub.chance_nodes * k;
+    stats.terminal_nodes += sub.terminal_nodes * k;
+    stats.storage_cells += sub.storage_cells * k;
 }
 
-/// Builds the full game tree. Returns the root and the list of final boards
-/// (dealt cards beyond the root board) that need strength tables.
+/// Builds the tree into an arena.
 pub(crate) struct Builder<'a> {
-    pub params: &'a TreeParams<'a>,
-    pub root_board: Vec<Card>,
-    pub boards: Vec<Vec<Card>>,
+    params: &'a TreeParams<'a>,
+    nodes: Vec<Node>,
+    chance: Vec<ChanceInfo>,
+    boards: Vec<Vec<Card>>,
     board_index: HashMap<u64, u32>,
+    storage_len: u64,
+    player_slots: u32,
     rng: StdRng,
 }
 
 impl<'a> Builder<'a> {
-    pub fn new(params: &'a TreeParams<'a>, root_board: Vec<Card>) -> Builder<'a> {
+    pub fn new(params: &'a TreeParams<'a>) -> Builder<'a> {
         let seed = match params.chance {
             ChanceMode::Sampled { seed, .. } => seed,
             ChanceMode::Exact => 0,
         };
         Builder {
             params,
-            root_board,
+            nodes: Vec::new(),
+            chance: Vec::new(),
             boards: Vec::new(),
             board_index: HashMap::new(),
+            storage_len: 0,
+            player_slots: 0,
             rng: StdRng::seed_from_u64(seed),
         }
     }
 
-    pub fn build(&mut self, root: &BettingState) -> Node {
-        self.build_player(root, [0, 0], &[])
+    pub fn build(mut self, root: &BettingState) -> Tree {
+        self.nodes.push(Node::placeholder());
+        self.fill_player(0, root, [0, 0], &mut Vec::new());
+        Tree {
+            nodes: self.nodes,
+            chance: self.chance,
+            boards: self.boards,
+            storage_len: self.storage_len,
+            num_player_nodes: self.player_slots,
+        }
     }
 
-    fn build_player(&mut self, st: &BettingState, invest: [Chips; 2], dealt: &[Card]) -> Node {
-        let mut node = Node::new(Kind::Player(st.to_act as u8), invest);
+    fn alloc_children(&mut self, k: usize) -> usize {
+        let first = self.nodes.len();
+        self.nodes.resize(first + k, Node::placeholder());
+        first
+    }
+
+    fn fill_player(&mut self, id: usize, st: &BettingState, invest: [i32; 2], dealt: &mut Vec<Card>) {
         let actions = self.params.actions(st);
-        let n = self.params.num_hands[st.to_act];
-        node.regrets = vec![0.0; actions.len() * n];
-        node.strat_sum = vec![0.0; actions.len() * n];
-        for &a in &actions {
+        let k = actions.len();
+        let first = self.alloc_children(k);
+        let edge = self.nodes[id].edge;
+        self.nodes[id] = Node {
+            kind: Kind::Player(st.to_act as u8),
+            street: st.street,
+            num_children: k as u16,
+            first_child: first as u32,
+            invest,
+            offset: self.storage_len,
+            slot: self.player_slots,
+            rake: 0.0,
+            chance_factor: 1.0,
+            edge,
+        };
+        self.storage_len += (k * self.params.num_hands[st.to_act]) as u64;
+        self.player_slots += 1;
+        for (i, &a) in actions.iter().enumerate() {
+            let child = first + i;
             let (tr, put) = st.apply(a);
             let mut inv = invest;
-            inv[st.to_act] += put;
-            let child = match tr {
-                Transition::Continue(s2) => self.build_player(&s2, inv, dealt),
-                Transition::Fold(f) => Node::new(Kind::Fold(f as u8), inv),
-                Transition::StreetOver(s2) => self.build_after_street(&s2, inv, dealt),
-            };
-            node.children.push(child);
+            inv[st.to_act] += put as i32;
+            match tr {
+                Transition::Continue(s2) => {
+                    self.nodes[child].edge = Edge::Action(a);
+                    self.fill_player(child, &s2, inv, dealt);
+                }
+                Transition::Fold(f) => {
+                    // Uncalled chips are returned and not raked.
+                    let o = f ^ 1;
+                    let uncalled = (st.commit[o] - st.commit[f]).max(0);
+                    self.nodes[child] = Node {
+                        kind: Kind::Fold(f as u8),
+                        street: st.street,
+                        invest: inv,
+                        rake: self.params.rake(st.pot - uncalled),
+                        edge: Edge::Action(a),
+                        ..Node::placeholder()
+                    };
+                }
+                Transition::StreetOver(s2) => {
+                    self.nodes[child].edge = Edge::Action(a);
+                    self.fill_after_street(child, &s2, inv, dealt);
+                }
+            }
         }
-        node.actions = actions;
-        node
     }
 
-    fn build_after_street(&mut self, st: &BettingState, invest: [Chips; 2], dealt: &[Card]) -> Node {
+    fn fill_after_street(&mut self, id: usize, st: &BettingState, invest: [i32; 2], dealt: &mut Vec<Card>) {
+        let edge = self.nodes[id].edge;
         if st.street == Street::River {
-            let mut node = Node::new(Kind::Showdown, invest);
-            node.table = self.table_for(dealt);
-            return node;
-        }
-        let used: CardSet = CardSet::from_cards(&self.root_board).union(CardSet::from_cards(dealt));
-        let available: Vec<Card> = Card::all().filter(|c| !used.contains(*c)).collect();
-        let board_len = self.root_board.len() + dealt.len();
-        let compatible = (52 - board_len - 4) as f32;
-        let mut node = Node::new(Kind::Chance, invest);
-        let next_street = st.street.next().unwrap();
-        let all_in = st.stack[0] == 0 || st.stack[1] == 0;
-        let cards = match (all_in, self.params.sample_size(next_street)) {
-            (false, Some(k)) if k < available.len() => sample_cards(&available, k, &mut self.rng),
-            _ => available.clone(),
-        };
-        node.chance_factor = 1.0 / (cards.len() as f32 * compatible / available.len() as f32);
-        let mut next_dealt = dealt.to_vec();
-        next_dealt.push(Card::from_index(0));
-        for &c in &cards {
-            *next_dealt.last_mut().unwrap() = c;
-            let child = if all_in {
-                let mut next = *st;
-                next.street = next_street;
-                self.build_after_street(&next, invest, &next_dealt)
-            } else {
-                let next = BettingState::street_start(next_street, st.pot, st.stack, self.params.big_blind);
-                self.build_player(&next, invest, &next_dealt)
+            let table = self.table_for(dealt);
+            self.nodes[id] = Node {
+                kind: Kind::Showdown,
+                street: Street::River,
+                invest,
+                offset: table as u64,
+                rake: self.params.rake(st.pot),
+                edge,
+                ..Node::placeholder()
             };
-            node.children.push(child);
+            return;
         }
-        node.cards = cards;
-        node
+        let all_in = st.stack[0] == 0 || st.stack[1] == 0;
+        let next = st.street.next().unwrap();
+        let (cards, refs, n_avail) = self.params.chance_cards(dealt, all_in, next, &mut self.rng);
+        let board_len = self.params.root_board.len() + dealt.len();
+        let compatible = (52 - board_len - 4) as f32;
+        let total_cards = cards.len() + refs.len();
+        let first = self.alloc_children(cards.len());
+        let slot = self.chance.len() as u32;
+        let info = ChanceInfo {
+            iso: refs
+                .iter()
+                .map(|r| {
+                    let k = cards.iter().position(|&c| c == r.canonical).expect("canonical card present");
+                    (k as u16, r.pair)
+                })
+                .collect(),
+            iso_cards: refs.iter().map(|r| r.card).collect(),
+        };
+        self.chance.push(info);
+        self.nodes[id] = Node {
+            kind: Kind::Chance,
+            street: st.street,
+            num_children: cards.len() as u16,
+            first_child: first as u32,
+            invest,
+            slot,
+            chance_factor: 1.0 / (total_cards as f32 * compatible / n_avail as f32),
+            edge,
+            ..Node::placeholder()
+        };
+        for (i, &c) in cards.iter().enumerate() {
+            let child = first + i;
+            self.nodes[child].edge = Edge::Card(c);
+            dealt.push(c);
+            if all_in {
+                let mut s2 = *st;
+                s2.street = next;
+                self.fill_after_street(child, &s2, invest, dealt);
+            } else {
+                let s2 = BettingState::street_start(next, st.pot, st.stack, self.params.big_blind);
+                self.fill_player(child, &s2, invest, dealt);
+            }
+            dealt.pop();
+        }
     }
 
     fn table_for(&mut self, dealt: &[Card]) -> u32 {
@@ -362,20 +555,10 @@ impl<'a> Builder<'a> {
             return i;
         }
         let i = self.boards.len() as u32;
-        let mut board = self.root_board.clone();
+        let mut board = self.params.root_board.to_vec();
         board.extend_from_slice(dealt);
         self.boards.push(board);
         self.board_index.insert(key, i);
         i
-    }
-}
-
-trait Union {
-    fn union(self, other: CardSet) -> CardSet;
-}
-
-impl Union for CardSet {
-    fn union(self, other: CardSet) -> CardSet {
-        CardSet(self.0 | other.0)
     }
 }

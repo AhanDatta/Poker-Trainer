@@ -134,7 +134,10 @@ impl Session {
         let stack = (self.config.stack_bb * BB as f64).round() as Chips;
         let setup = HandSetup {
             id: self.next_id,
-            table: TableConfig::new(n, BB / 2, BB),
+            table: TableConfig::new(n, BB / 2, BB).with_rake(
+                self.config.rake_pct / 100.0,
+                (self.config.rake_cap_bb * BB as f64).round() as Chips,
+            ),
             button,
             stacks: vec![stack; n],
             hero,

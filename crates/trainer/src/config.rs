@@ -63,9 +63,11 @@ pub struct SolverSettings {
 
 impl Default for SolverSettings {
     fn default() -> Self {
+        // Later streets inside flop solves: one bet size, raises only all-in.
+        // Keeps exact heads-up flop trees around 2-3 GB.
         let future = PostflopMenu {
-            turn: StreetSizes::new(&["66%"], &["3x"]),
-            river: StreetSizes::new(&["75%"], &["3x"]),
+            turn: StreetSizes::new(&["66%"], &["allin"]),
+            river: StreetSizes::new(&["75%"], &["allin"]),
             max_raises: 2,
             ..PostflopMenu::default()
         };
@@ -77,7 +79,7 @@ impl Default for SolverSettings {
             villain_range: VillainRange::Gto,
             target_exploitability_pct: 0.5,
             max_iterations: 400,
-            max_memory_gb: 6.0,
+            max_memory_gb: 5.0,
             prune: 0.001,
             off_equilibrium_threshold: 0.015,
             hero_hand_floor: 0.02,
@@ -104,6 +106,10 @@ pub struct TrainerConfig {
     /// review).
     pub show_opponent_style: bool,
     pub hero_position: HeroPosition,
+    /// Rake in percent of the pot (no flop, no drop). 0 disables rake.
+    pub rake_pct: f64,
+    /// Rake cap in big blinds.
+    pub rake_cap_bb: f64,
     /// Preflop chart file (built-in heads-up 100bb charts when unset).
     pub charts_file: Option<String>,
     /// Milliseconds between AI actions in the UI.
@@ -125,6 +131,8 @@ impl Default for TrainerConfig {
             random_each_hand: true,
             show_opponent_style: false,
             hero_position: HeroPosition::Alternate,
+            rake_pct: 0.0,
+            rake_cap_bb: 3.0,
             charts_file: None,
             ai_delay_ms: 450,
             seed: None,
@@ -157,6 +165,9 @@ impl TrainerConfig {
         }
         if !(5.0..=1000.0).contains(&self.stack_bb) {
             return Err("stack_bb must be between 5 and 1000".into());
+        }
+        if !(0.0..=20.0).contains(&self.rake_pct) || self.rake_cap_bb < 0.0 {
+            return Err("rake_pct must be within 0-20 and rake_cap_bb non-negative".into());
         }
         if !self.opponent.eq_ignore_ascii_case("random") && self.profile_by_name(&self.opponent).is_none() {
             return Err(format!("unknown opponent style {:?}", self.opponent));
