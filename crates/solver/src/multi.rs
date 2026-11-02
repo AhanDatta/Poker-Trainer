@@ -867,7 +867,19 @@ impl MultiSolver {
         self.iterations
     }
 
-    pub fn solve(&mut self, opts: &SolveOptions, mut on_progress: impl FnMut(&Progress) -> bool) -> Progress {
+    pub fn solve(&mut self, opts: &SolveOptions, on_progress: impl FnMut(&Progress) -> bool) -> Progress {
+        self.solve_cancellable(opts, &std::sync::atomic::AtomicBool::new(false), on_progress)
+    }
+
+    /// Like [`Self::solve`], but stops within one iteration once `cancel` is
+    /// set (`on_progress` only runs at exploitability checks, which can be
+    /// many seconds apart on big trees).
+    pub fn solve_cancellable(
+        &mut self,
+        opts: &SolveOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut on_progress: impl FnMut(&Progress) -> bool,
+    ) -> Progress {
         let pot = self.config.root.pot as f64;
         let check = opts.check_every.max(1);
         let target = opts.target_exploitability_pct * pot / 100.0;
@@ -881,6 +893,10 @@ impl MultiSolver {
             finished: false,
         };
         while self.iterations < opts.max_iterations {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                progress.finished = true;
+                return progress;
+            }
             self.iterations += 1;
             let t = self.iterations as f64;
             let prev = t - 1.0;

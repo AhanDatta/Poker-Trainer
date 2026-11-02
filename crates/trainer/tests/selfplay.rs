@@ -157,3 +157,61 @@ fn multiway_tables_play_and_review() {
         assert!(three_way >= 1, "{players}-max: no 3-way pot was reviewed");
     }
 }
+
+/// Starting the next hand stops the previous hands' solves (they would keep
+/// the CPU and the solve queue busy), promptly and visibly.
+#[test]
+fn next_hand_cancels_running_reviews() {
+    for players in [2, 6] {
+        let mut cfg = quick_config(7);
+        cfg.players = players;
+        cfg.opponent = "Calling Station".into();
+        // Solves that never reach their target: they run until cancelled.
+        cfg.solver.target_exploitability_pct = 0.0;
+        cfg.solver.multiway_target_pct = 0.0;
+        cfg.solver.max_iterations = 1_000_000;
+        cfg.solver.villain_range = VillainRange::Gto;
+        let mut session = Session::new(cfg).unwrap();
+        let mut tested = false;
+        for _ in 0..200 {
+            let mut hand = session.new_hand();
+            while hand.run_until_hero() == StepResult::HeroToAct {
+                let acts = hand.hero_actions();
+                let passive = acts.iter().copied().find(|a| matches!(a, Action::Check | Action::Call));
+                hand.hero_act(passive.unwrap_or(acts[0])).unwrap();
+            }
+            let Some(review) = hand.review() else {
+                session.finish_hand(hand);
+                continue;
+            };
+            // Let the review get into a solve.
+            let start = Instant::now();
+            while !review.status().stage.contains("solving") && !review.is_finished() {
+                assert!(start.elapsed() < Duration::from_secs(120), "review never started solving");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // At 6-max, test a 3-way solve specifically.
+            if review.is_finished() || (players > 2 && !review.status().stage.contains("3-way")) {
+                review.cancel();
+                session.finish_hand(hand);
+                continue;
+            }
+            let id = hand.id;
+            session.finish_hand(hand);
+            let _next = session.new_hand();
+            let prev = session.history.iter().find(|h| h.id == id).unwrap().review().unwrap();
+            let t = Instant::now();
+            while !prev.is_finished() {
+                assert!(
+                    t.elapsed() < Duration::from_secs(20),
+                    "{players} players: previous review still running"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(prev.status().cancelled, "{:?}", prev.status().stage);
+            tested = true;
+            break;
+        }
+        assert!(tested, "{players} players: no hand reached a running solve");
+    }
+}

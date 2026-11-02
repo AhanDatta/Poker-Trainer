@@ -49,11 +49,15 @@ pub struct DcfrParams {
     /// clips them to zero every iteration (DCFR+).
     pub beta: Option<f64>,
     pub gamma: f64,
+    /// Restart the strategy average at iterations 4, 16, 64, 256, ... so
+    /// the early, poor iterations drop out of it (as b-inary/postflop-solver
+    /// does).
+    pub restart_average: bool,
 }
 
 impl Default for DcfrParams {
     fn default() -> Self {
-        DcfrParams { alpha: 1.5, beta: Some(0.0), gamma: 2.0 }
+        DcfrParams { alpha: 1.5, beta: Some(0.0), gamma: 2.0, restart_average: false }
     }
 }
 
@@ -71,7 +75,15 @@ impl Discount {
             }
             None => 0.0,
         };
-        Discount { pos: (pa / (pa + 1.0)) as f32, neg, strat: ((tf - 1.0) / tf).powf(params.gamma) as f32 }
+        // Iterations since the average was (re)started, 0-based.
+        let mut since = tf - 1.0;
+        if params.restart_average {
+            let t0 = t.max(1) - 1;
+            let p4 = if t0 == 0 { 0 } else { 1u32 << ((31 - t0.leading_zeros()) & !1) };
+            since = (t0 - p4) as f64;
+        }
+        let strat = (since / (since + 1.0)).powf(params.gamma) as f32;
+        Discount { pos: (pa / (pa + 1.0)) as f32, neg, strat }
     }
 }
 

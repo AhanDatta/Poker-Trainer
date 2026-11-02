@@ -438,7 +438,19 @@ impl Solver {
     /// Runs DCFR iterations until the target exploitability or iteration cap
     /// is reached. `on_progress` is called after every exploitability check;
     /// returning `false` cancels the solve.
-    pub fn solve(&mut self, opts: &SolveOptions, mut on_progress: impl FnMut(&Progress) -> bool) -> Progress {
+    pub fn solve(&mut self, opts: &SolveOptions, on_progress: impl FnMut(&Progress) -> bool) -> Progress {
+        self.solve_cancellable(opts, &std::sync::atomic::AtomicBool::new(false), on_progress)
+    }
+
+    /// Like [`Self::solve`], but stops within one iteration once `cancel` is
+    /// set (`on_progress` only runs at exploitability checks, which can be
+    /// many seconds apart on big trees).
+    pub fn solve_cancellable(
+        &mut self,
+        opts: &SolveOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut on_progress: impl FnMut(&Progress) -> bool,
+    ) -> Progress {
         let pot = self.config.root.pot as f64;
         let check_every = opts.check_every.max(1);
         let raked = self.raked();
@@ -453,6 +465,10 @@ impl Solver {
         let mut next_check = self.iterations + check_every;
         let mut last_check: Option<(u32, f64)> = None;
         while self.iterations < opts.max_iterations {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                progress.finished = true;
+                return progress;
+            }
             self.iterations += 1;
             let d = Discount::new(self.iterations, &self.config.dcfr);
             let ctx = self.ctx();

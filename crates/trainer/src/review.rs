@@ -61,12 +61,14 @@ impl Drop for SolveTurn {
 }
 
 /// Waits for this hand's turn to solve; `None` if cancelled while waiting.
-fn wait_solve_turn(hand: u64, cancel: &AtomicBool) -> Option<SolveTurn> {
+/// `on_wait` is told how many solves are ahead whenever that changes.
+fn wait_solve_turn(hand: u64, cancel: &AtomicBool, mut on_wait: impl FnMut(usize)) -> Option<SolveTurn> {
     let q = &SOLVE_QUEUE;
     let mut st = q.state.lock().unwrap_or_else(|e| e.into_inner());
     let key = (hand, st.next_ticket);
     st.next_ticket += 1;
     st.waiting.insert(key);
+    let mut reported = usize::MAX;
     loop {
         if cancel.load(Ordering::Relaxed) {
             st.waiting.remove(&key);
@@ -77,6 +79,11 @@ fn wait_solve_turn(hand: u64, cancel: &AtomicBool) -> Option<SolveTurn> {
             st.waiting.remove(&key);
             st.busy = true;
             return Some(SolveTurn);
+        }
+        let ahead = st.waiting.range(..key).count() + usize::from(st.busy);
+        if ahead != reported {
+            reported = ahead;
+            on_wait(ahead);
         }
         st = q.cv.wait_timeout(st, Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
     }
@@ -197,6 +204,9 @@ pub struct ReviewStatus {
     pub decisions: Vec<DecisionReview>,
     pub notes: Vec<String>,
     pub finished: bool,
+    /// Stopped before completion (the hand was abandoned or the player
+    /// moved on to the next hand).
+    pub cancelled: bool,
     pub error: Option<String>,
 }
 
@@ -279,13 +289,28 @@ impl Review {
         let handle = std::thread::Builder::new()
             .name("review".into())
             .spawn(move || {
-                let result = Worker::new(&worker, &setup).run();
+                // A panic must not leave the review "solving" forever (and
+                // its message hidden behind the full-screen UI): report it.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    Worker::new(&worker, &setup).run()
+                }))
+                .unwrap_or_else(|e| {
+                    let msg = e
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| e.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    Err(format!("internal error: {msg}"))
+                });
                 worker.with_status(|st| {
                     st.finished = true;
                     st.progress = None;
                     match result {
                         Ok(()) => st.stage = "Review complete".into(),
-                        Err(e) if e == CANCELLED => st.stage = "Review cancelled".into(),
+                        Err(e) if e == CANCELLED => {
+                            st.stage = "Review cancelled".into();
+                            st.cancelled = true;
+                        }
                         Err(e) => {
                             st.stage = "Review failed".into();
                             st.error = Some(e);
@@ -805,9 +830,17 @@ impl<'a> Worker<'a> {
     }
 
     fn solve(&self, mut cfg: SolveConfig, label: &str) -> Result<(Solver, f64), String> {
+        if let Some(dir) = std::env::var_os("POKER_TRAINER_DUMP") {
+            dump_config(std::path::Path::new(&dir), self.setup.hand_id, label, &cfg);
+        }
         let shared = self.shared;
         shared.set_stage(format!("{label}: waiting for the solver"));
-        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel) else {
+        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel, |ahead| {
+            shared.set_stage(format!(
+                "{label}: waiting for the solver ({ahead} solve{} ahead)",
+                if ahead == 1 { "" } else { "s" }
+            ))
+        }) else {
             return Err(CANCELLED.into());
         };
         shared.set_stage(format!("{label}: building the game tree"));
@@ -839,7 +872,7 @@ impl<'a> Worker<'a> {
             check_every: if big { 20 } else { 10 },
         };
         let mut run = || {
-            solver.solve(&opts, |p| {
+            solver.solve_cancellable(&opts, &shared.cancel, |p| {
                 shared.with_status(|st| st.progress = Some(*p));
                 !shared.cancel.load(Ordering::Relaxed)
             })
@@ -859,7 +892,12 @@ impl Worker<'_> {
     fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, f64), String> {
         let shared = self.shared;
         shared.set_stage(format!("{label}: waiting for the solver"));
-        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel) else {
+        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel, |ahead| {
+            shared.set_stage(format!(
+                "{label}: waiting for the solver ({ahead} solve{} ahead)",
+                if ahead == 1 { "" } else { "s" }
+            ))
+        }) else {
             return Err(CANCELLED.into());
         };
         shared.set_stage(format!("{label}: building the game tree"));
@@ -872,7 +910,7 @@ impl Worker<'_> {
             check_every: 20,
         };
         let mut run = || {
-            solver.solve(&opts, |p| {
+            solver.solve_cancellable(&opts, &shared.cancel, |p| {
                 shared.with_status(|st| st.progress = Some(*p));
                 !shared.cancel.load(Ordering::Relaxed)
             })
@@ -930,6 +968,50 @@ fn fraction(now: &[f32], root: &[f32]) -> f64 {
 
 /// For players whose range almost never reaches the current node, keep a
 /// fraction of their earlier range so the solver has something to work with.
+/// Debugging aid: with `POKER_TRAINER_DUMP=<dir>` set, every heads-up solve
+/// writes its inputs (board, ranges, betting state, menu) to a text file, so
+/// a spot can be inspected or re-solved with another solver.
+fn dump_config(dir: &std::path::Path, hand: u64, label: &str, cfg: &SolveConfig) {
+    let range = |w: &[f32]| -> String {
+        (0..w.len())
+            .filter(|&c| w[c] > 0.0)
+            .map(|c| {
+                let (a, b) = holdem::combo_cards(c);
+                let (hi, lo) = if a.rank() >= b.rank() { (a, b) } else { (b, a) };
+                format!("{hi}{lo}:{}", w[c])
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let r = &cfg.root;
+    let board: String = cfg.board.iter().map(|c| c.to_string()).collect();
+    let text = format!(
+        "label={label}\nboard={board}\nstreet={:?}\npot={}\ncommit={},{}\nstack={},{}\nto_act={}\n\
+         current_bet={}\nnum_raises={}\nrake={},{}\nmenu={:?}\nfuture_menu={:?}\noop={}\nip={}\n",
+        r.street,
+        r.pot,
+        r.commit[0],
+        r.commit[1],
+        r.stack[0],
+        r.stack[1],
+        r.to_act,
+        r.current_bet,
+        r.num_raises,
+        cfg.rake_rate,
+        cfg.rake_cap,
+        cfg.menu,
+        cfg.future_menu,
+        range(&cfg.ranges[0]),
+        range(&cfg.ranges[1]),
+    );
+    let name: String = format!("hand{hand:04}-{label}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .collect();
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(dir.join(format!("{name}.txt")), text);
+}
+
 fn floor_ranges(ranges: &mut [Vec<f32>; 2], root: &[Vec<f32>; 2], frac: &[f64; 2], threshold: f64) {
     for x in 0..2 {
         if frac[x] < threshold {
