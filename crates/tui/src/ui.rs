@@ -650,7 +650,7 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {:<18}", truncate(&d.labels[i], 18)),
+                format!(" {:<19}", truncate(&d.labels[i], 18)),
                 Style::default().fg(action_color(&d.actions, i)),
             ),
             Span::styled(bar(d.hero_strategy[i], 10), Style::default().fg(action_color(&d.actions, i))),
@@ -666,7 +666,7 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
     for i in 0..d.actions.len() {
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {:<18}", truncate(&d.labels[i], 18)),
+                format!(" {:<19}", truncate(&d.labels[i], 18)),
                 Style::default().fg(action_color(&d.actions, i)),
             ),
             Span::styled(

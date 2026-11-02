@@ -227,6 +227,8 @@ scales almost linearly with cores (3.8× on 4 threads).
 | Flop **exact**, two-tone board (isomorphism) | ~1.9 GB | ~1.8 s/iteration, ~5–7 min to 0.5% pot |
 | Flop **exact**, rainbow board | ~3.1 GB | ~8–12 min to 0.5% pot |
 | Flop **fast** (49 turns × 10 rivers) | ~0.4–0.7 GB | ~1.5–4 min |
+| Heads-up **limped** pot, flop exact (~890 × 860 combos) | ~2.7 GB | ~15–20 min |
+| 6-max single-raised pot, flop exact (~290 × 220 combos) | <1 GB | a few minutes |
 
 Exact flop trees use one bet size on the turn and river, with all-in as the
 only raise there. The flop itself always uses the full menu. Before this
@@ -309,6 +311,11 @@ Custom opponent styles go under `[[custom_profiles]]`, using the same fields as
 the presets in `crates/trainer/src/profiles.rs`.
 
 ## Known limitations / next steps
+
+* **Reviews take a while on small machines.** Solves run one at a time,
+  oldest hand first, while you keep playing; the review screen shows each
+  solve's progress and elapsed time. Wide ranges (limped heads-up pots) are
+  the slowest.
 
 * **4+-way pots** aren't analyzed.
 * **3-way review is approximate:** it ignores card removal between the two

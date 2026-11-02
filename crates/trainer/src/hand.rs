@@ -359,9 +359,19 @@ impl LiveHand {
         if n == 2 {
             return style(1 - self.hero);
         }
-        let live: Vec<usize> = self.state.players_in_hand().into_iter().filter(|&s| s != self.hero).collect();
-        if live.len() == 1 && !self.hero_folded() && self.state.board.len() >= 3 {
-            format!("{} {}", self.state.position_name(live[0]), style(live[0]))
+        // Name the opponents who saw the flop with the hero (whatever
+        // happened later); otherwise count the table.
+        let flop: Vec<usize> = if self.state.board.len() >= 3 {
+            crate::review::in_hand_at(&self.state, Street::Flop)
+        } else {
+            Vec::new()
+        };
+        let opps: Vec<usize> = flop.iter().copied().filter(|&s| s != self.hero).collect();
+        if flop.contains(&self.hero) && !opps.is_empty() && opps.len() <= 2 {
+            opps.iter()
+                .map(|&s| format!("{} {}", self.state.position_name(s), style(s)))
+                .collect::<Vec<_>>()
+                .join(" & ")
         } else {
             format!("{} opponents", n - 1)
         }
