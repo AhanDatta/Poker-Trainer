@@ -95,7 +95,7 @@ impl Default for SolverSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainerConfig {
-    /// Number of players at the table (only 2 is supported for now).
+    /// Number of players at the table (2 = heads-up, 6 = 6-max, 9 = full ring).
     pub players: usize,
     /// Starting stack in big blinds (every hand starts fresh).
     pub stack_bb: f64,
@@ -169,8 +169,8 @@ impl TrainerConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.players != 2 {
-            return Err(format!("players = {}: only heads-up (2) is implemented so far", self.players));
+        if !(2..=9).contains(&self.players) {
+            return Err(format!("players = {}: tables of 2 to 9 players are supported", self.players));
         }
         if !(5.0..=1000.0).contains(&self.stack_bb) {
             return Err("stack_bb must be between 5 and 1000".into());
@@ -232,7 +232,8 @@ mod tests {
         assert_eq!(cfg.solver.villain_range, VillainRange::Both);
         assert_eq!(cfg.menu.postflop.flop.bet.len(), 1);
         assert_eq!(cfg.stack_bb, 100.0);
-        assert!(TrainerConfig::from_toml("players = 6").is_err());
+        assert!(TrainerConfig::from_toml("players = 6").is_ok());
+        assert!(TrainerConfig::from_toml("players = 12").is_err());
         assert!(TrainerConfig::from_toml("opponent = \"shark\"").is_err());
     }
 }

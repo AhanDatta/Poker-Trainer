@@ -143,7 +143,12 @@ fn draw_setup(f: &mut Frame, app: &App) {
     let cfg = &app.session.config;
     let value = |item: SetupItem| -> String {
         match item {
-            SetupItem::Table => "Heads-up (2 players)   [6-max / 9-max coming]".into(),
+            SetupItem::Table => match cfg.players {
+                2 => "Heads-up (2 players)".into(),
+                6 => "6-max".into(),
+                9 => "9-max (full ring)".into(),
+                n => format!("{n} players"),
+            },
             SetupItem::Opponent => {
                 if cfg.opponent.eq_ignore_ascii_case("random") {
                     "Random style each hand".into()
@@ -250,10 +255,11 @@ fn seat_line(hand: &LiveHand, seat: usize, show_cards: bool, app: &App) -> Line<
         "You".to_string()
     } else {
         let style = hand.profiles[seat].as_ref().map(|p| p.name.clone()).unwrap_or_default();
+        let who = if st.num_players() == 2 { "Villain".to_string() } else { format!("Player {}", seat + 1) };
         if app.session.config.show_opponent_style || hand.is_finished() {
-            format!("Villain ({style})")
+            format!("{who} ({style})")
         } else {
-            "Villain".to_string()
+            who
         }
     };
     let to_act = st.to_act == Some(seat);
@@ -303,7 +309,7 @@ fn draw_table(f: &mut Frame, app: &App) {
 
     // Felt.
     let st = &hand.state;
-    let villain = (0..st.num_players()).find(|&s| s != hand.hero).unwrap_or(0);
+    let n = st.num_players();
     let showdown = hand.is_finished() && hand.settlement().is_some_and(|s| s.showdown);
     let mut board_spans = vec![Span::raw("      Board  ")];
     for i in 0..5 {
@@ -315,21 +321,25 @@ fn draw_table(f: &mut Frame, app: &App) {
             None => board_spans.push(Span::styled("··", Style::default().fg(Color::DarkGray))),
         }
     }
-    let felt = vec![
-        Line::from(""),
-        seat_line(hand, villain, showdown, app),
-        Line::from(""),
-        Line::from(""),
+    // Opponents in seating order starting left of the hero; cards are shown
+    // at showdown for players still in the hand.
+    let mut felt = vec![Line::from("")];
+    for k in 1..n {
+        let seat = (hand.hero + k) % n;
+        felt.push(seat_line(hand, seat, showdown && !st.folded[seat], app));
+    }
+    let spacer = if n <= 3 { 2 } else { 1 };
+    felt.extend(std::iter::repeat_n(Line::from(""), spacer));
+    felt.extend(vec![
         Line::from(board_spans),
         Line::from(vec![
             Span::raw("      Pot    "),
             Span::styled(bb(st.pot()), Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
             Span::styled(format!("   {}", st.street), Style::default().fg(Color::DarkGray)),
         ]),
-        Line::from(""),
-        Line::from(""),
-        seat_line(hand, hand.hero, true, app),
-    ];
+    ]);
+    felt.extend(std::iter::repeat_n(Line::from(""), spacer));
+    felt.push(seat_line(hand, hand.hero, true, app));
     f.render_widget(
         Paragraph::new(felt).block(
             Block::default()
@@ -446,7 +456,7 @@ fn draw_review(f: &mut Frame, app: &App) {
     f.render_widget(title_bar(app, &format!("Review — hand #{}", hand.id)), rows[0]);
 
     let status = hand.review().map(|r| r.status()).unwrap_or_default();
-    let villain_style = hand.villain_profile().map(|p| p.name.clone()).unwrap_or_default();
+    let villain_style = hand.opponents_label();
     let net = hand.hero_net().unwrap_or(0);
     let mut head = vec![Span::raw(" You held ")];
     head.extend(cards_spans(&hand.state.hole[hand.hero]));
@@ -707,10 +717,7 @@ fn draw_history(f: &mut Frame, app: &App) {
             let net = h.hero_net().unwrap_or(0);
             let mut spans = vec![Span::raw(format!("#{:<4} {:<3} ", h.id, h.state.position_name(h.hero)))];
             spans.extend(cards_spans(&h.state.hole[h.hero]));
-            spans.push(Span::raw(format!(
-                "  vs {:<16}",
-                h.villain_profile().map(|p| p.name.clone()).unwrap_or_default()
-            )));
+            spans.push(Span::raw(format!("  vs {:<16}", h.opponents_label())));
             spans.push(Span::styled(
                 format!("{:>9}  ", format!("{}{}", if net >= 0 { "+" } else { "" }, bb(net))),
                 Style::default().fg(if net >= 0 { Color::Green } else { Color::Red }),

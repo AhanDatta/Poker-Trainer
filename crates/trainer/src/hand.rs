@@ -332,6 +332,27 @@ impl LiveHand {
         self.profiles.iter().flatten().next()
     }
 
+    /// Whether the hero has folded (the rest of the hand can be skipped).
+    pub fn hero_folded(&self) -> bool {
+        self.state.folded[self.hero]
+    }
+
+    /// Short description of the opposition: the villain's style heads-up or
+    /// in a heads-up pot, otherwise the number of opponents.
+    pub fn opponents_label(&self) -> String {
+        let n = self.state.num_players();
+        let style = |s: usize| self.profiles[s].as_ref().map_or("?".to_string(), |p| p.name.clone());
+        if n == 2 {
+            return style(1 - self.hero);
+        }
+        let live: Vec<usize> = self.state.players_in_hand().into_iter().filter(|&s| s != self.hero).collect();
+        if live.len() == 1 && !self.hero_folded() && self.state.board.len() >= 3 {
+            format!("{} {}", self.state.position_name(live[0]), style(live[0]))
+        } else {
+            format!("{} opponents", n - 1)
+        }
+    }
+
     /// Runs AI actions and deals cards until the hero must act or the hand
     /// ends (no animation). Returns the last step result.
     pub fn run_until_hero(&mut self) -> StepResult {

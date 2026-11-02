@@ -282,6 +282,17 @@ impl Drop for Review {
     }
 }
 
+/// `[out of position, in position]` for two seats after the flop.
+pub fn postflop_order(state: &HandState, a: usize, b: usize) -> [usize; 2] {
+    let n = state.num_players();
+    let offset = |s: usize| (s + n - state.button - 1) % n;
+    if offset(a) < offset(b) {
+        [a, b]
+    } else {
+        [b, a]
+    }
+}
+
 /// Pot and per-seat stacks at the start of `street`.
 pub fn street_start(state: &HandState, street: Street) -> (holdem::Chips, Vec<holdem::Chips>) {
     let n = state.num_players();
@@ -334,8 +345,9 @@ impl<'a> Worker<'a> {
         }
         let st0 = &snap.state;
         let (hero, villain) = (setup.hero, setup.villain);
-        // Heads-up: the big blind is out of position (solver player 0).
-        let seats = [st0.bb_seat(), st0.sb_seat()];
+        // Solver player 0 is out of position: whoever acts first postflop
+        // (closest to the left of the button).
+        let seats = postflop_order(st0, hero, villain);
         let hero_p = if seats[0] == hero { 0 } else { 1 };
         let hero_combo = combo_index(st0.hole[hero][0], st0.hole[hero][1]);
         let variants = self.variants();

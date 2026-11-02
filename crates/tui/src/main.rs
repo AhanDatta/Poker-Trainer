@@ -232,6 +232,8 @@ mod tests {
         cfg.seed = Some(11);
         cfg.ai_delay_ms = 0;
         cfg.opponent = "LAG".into();
+        cfg.players = std::env::var("PLAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        cfg.solver.flop_mode = trainer::FlopMode::Fast;
         let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
         println!("{}", render(&app));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));

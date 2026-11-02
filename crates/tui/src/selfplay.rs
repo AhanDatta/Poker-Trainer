@@ -35,7 +35,7 @@ pub fn run(cfg: TrainerConfig, hands: usize) -> Result<()> {
             hand.state.position_name(hand.hero),
             h[0],
             h[1],
-            hand.villain_profile().map(|p| p.name.as_str()).unwrap_or("?")
+            hand.opponents_label()
         );
         for l in &hand.log {
             println!("   {}", l.text);

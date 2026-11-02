@@ -121,6 +121,8 @@ impl App {
         }
         let delay = Duration::from_millis(self.session.config.ai_delay_ms);
         if let Some(hand) = &mut self.hand {
+            // After the hero folds, play the rest of the hand out instantly.
+            let delay = if hand.hero_folded() { Duration::ZERO } else { delay };
             if !hand.is_finished() && !hand.hero_to_act() && self.last_step.elapsed() >= delay {
                 hand.step();
                 self.last_step = Instant::now();
@@ -210,7 +212,18 @@ impl App {
         let cycle = |i: usize, n: usize| -> usize { ((i as i32 + dir).rem_euclid(n as i32)) as usize };
         let cfg = &mut self.session.config;
         match SETUP_ITEMS[self.setup_cursor] {
-            SetupItem::Table => self.flash("6-max and 9-max are planned; heads-up is available now."),
+            SetupItem::Table => {
+                let sizes = [2usize, 6, 9];
+                let cur = sizes.iter().position(|&n| n == self.session.config.players).unwrap_or(0);
+                let next = sizes[cycle(cur, sizes.len())];
+                if let Err(e) = self.session.set_players(next) {
+                    self.flash(e);
+                } else if next > 2 && self.session.config.charts_for(next).is_none() {
+                    self.flash(
+                        "Using built-in preflop rules; run `poker-trainer fetch-charts` for solver charts.",
+                    );
+                }
+            }
             SetupItem::Opponent => {
                 let choices = self.opponent_choices();
                 let cur = choices

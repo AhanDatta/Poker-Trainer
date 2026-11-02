@@ -17,8 +17,11 @@ pub struct Session {
     charts: Arc<ChartSet>,
     rng: StdRng,
     next_id: u64,
+    /// Fixed style for every opponent (when one was chosen).
     session_profile: Option<Profile>,
-    last_hero_was_sb: bool,
+    /// Per-seat styles kept for the whole session (random, not per hand).
+    seat_profiles: Vec<Profile>,
+    button: usize,
     /// Finished hands (most recent last).
     pub history: Vec<LiveHand>,
 }
@@ -55,16 +58,21 @@ impl Stats {
     }
 }
 
+/// Charts for the configured table size (file or built-in).
+fn load_charts(config: &TrainerConfig) -> Result<ChartSet, String> {
+    Ok(match config.charts_for(config.players) {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            ChartSet::parse(&text, config.players).map_err(|e| format!("{path}: {e}"))?
+        }
+        None => ChartSet::builtin(config.players),
+    })
+}
+
 impl Session {
     pub fn new(config: TrainerConfig) -> Result<Session, String> {
         config.validate()?;
-        let charts = match config.charts_for(config.players) {
-            Some(path) => {
-                let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-                ChartSet::parse(&text, config.players).map_err(|e| format!("{path}: {e}"))?
-            }
-            None => ChartSet::builtin(config.players),
-        };
+        let charts = load_charts(&config)?;
         let rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_os_rng(),
@@ -79,14 +87,15 @@ impl Session {
             rng,
             next_id: 1,
             session_profile: None,
-            last_hero_was_sb: false,
+            seat_profiles: Vec::new(),
+            button: 0,
             history: Vec::new(),
         };
         if !s.config.opponent.eq_ignore_ascii_case("random") {
             s.session_profile = s.config.profile_by_name(&s.config.opponent);
-        } else if !s.config.random_each_hand {
-            s.session_profile = Some(s.random_profile());
         }
+        s.button = s.rng.random_range(0..s.config.players);
+        s.reset_seat_profiles();
         Ok(s)
     }
 
@@ -95,12 +104,31 @@ impl Session {
         all[self.rng.random_range(0..all.len())].clone()
     }
 
+    /// New random styles for every seat (used when styles are random per
+    /// session rather than per hand).
+    fn reset_seat_profiles(&mut self) {
+        let n = self.config.players;
+        self.seat_profiles = (0..n).map(|_| self.random_profile()).collect();
+    }
+
+    /// Changes the table size (2..=9 players) and reloads the matching charts.
+    pub fn set_players(&mut self, players: usize) -> Result<(), String> {
+        let mut cfg = self.config.clone();
+        cfg.players = players;
+        cfg.validate()?;
+        self.charts = Arc::new(load_charts(&cfg)?);
+        self.config = cfg;
+        self.button = self.rng.random_range(0..players);
+        self.reset_seat_profiles();
+        Ok(())
+    }
+
     /// Changes the opponent style ("random" or a style name).
     pub fn set_opponent(&mut self, name: &str) -> Result<(), String> {
         if name.eq_ignore_ascii_case("random") {
             self.config.opponent = "random".into();
-            self.session_profile =
-                if self.config.random_each_hand { None } else { Some(self.random_profile()) };
+            self.session_profile = None;
+            self.reset_seat_profiles();
             return Ok(());
         }
         let p = self.config.profile_by_name(name).ok_or_else(|| format!("unknown style {name:?}"))?;
@@ -114,23 +142,45 @@ impl Session {
     }
 
     /// Deals a new hand. Every hand starts with fresh `stack_bb` stacks.
+    /// The hero sits in seat 0; the button position decides the hero's
+    /// position (rotating, random, or pinned to a blind).
     pub fn new_hand(&mut self) -> LiveHand {
         let n = self.config.players;
-        let hero_sb = match self.config.hero_position {
-            HeroPosition::Sb => true,
-            HeroPosition::Bb => false,
-            HeroPosition::Random => self.rng.random_bool(0.5),
-            HeroPosition::Alternate => !self.last_hero_was_sb,
-        };
-        self.last_hero_was_sb = hero_sb;
-        // Heads-up: the button is the small blind.
         let hero = 0;
-        let button = if hero_sb { hero } else { 1 };
-        let profile = match &self.session_profile {
-            Some(p) => p.clone(),
-            None => self.random_profile(),
+        let button = match self.config.hero_position {
+            // Heads-up the button is the small blind.
+            HeroPosition::Sb => {
+                if n == 2 {
+                    hero
+                } else {
+                    (hero + n - 1) % n
+                }
+            }
+            HeroPosition::Bb => {
+                if n == 2 {
+                    (hero + 1) % n
+                } else {
+                    (hero + n - 2) % n
+                }
+            }
+            HeroPosition::Random => self.rng.random_range(0..n),
+            HeroPosition::Alternate => (self.button + 1) % n,
         };
-        let profiles = (0..n).map(|s| if s == hero { None } else { Some(profile.clone()) }).collect();
+        self.button = button;
+        let per_hand_random = self.session_profile.is_none() && self.config.random_each_hand;
+        let profiles: Vec<Option<Profile>> = (0..n)
+            .map(|s| {
+                if s == hero {
+                    None
+                } else if let Some(p) = &self.session_profile {
+                    Some(p.clone())
+                } else if per_hand_random {
+                    Some(self.random_profile())
+                } else {
+                    Some(self.seat_profiles[s].clone())
+                }
+            })
+            .collect();
         let stack = (self.config.stack_bb * BB as f64).round() as Chips;
         let setup = HandSetup {
             id: self.next_id,

@@ -92,3 +92,51 @@ fn hands_are_played_and_reviewed() {
     let stats = session.stats();
     assert!(stats.decisions > 0);
 }
+
+/// 6-max and 9-max: hands complete, heads-up pots between the hero and one
+/// opponent are reviewed (with positions taken from the postflop order).
+#[test]
+fn multiway_tables_play_and_review() {
+    for players in [6usize, 9] {
+        let mut cfg = quick_config(7 + players as u64);
+        cfg.players = players;
+        cfg.opponent = "random".into();
+        cfg.solver.villain_range = VillainRange::Gto;
+        cfg.solver.flop_mode = trainer::FlopMode::Fast;
+        let mut session = Session::new(cfg).unwrap();
+        let mut reviewed = 0;
+        for _ in 0..60 {
+            let mut hand = session.new_hand();
+            loop {
+                match hand.run_until_hero() {
+                    StepResult::HeroToAct => {
+                        let actions = hand.hero_actions();
+                        // Defend wide preflop so hands reach the flop.
+                        let street_idx = hand.state.board.len().saturating_sub(2);
+                        hand.hero_act(hero_choice(&actions, street_idx)).unwrap();
+                    }
+                    StepResult::Finished => break,
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(hand.state.invariants(), Ok(()));
+            if let Some(review) = hand.review() {
+                let start = Instant::now();
+                while !review.is_finished() {
+                    assert!(start.elapsed() < Duration::from_secs(300), "review timed out");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let st = review.status();
+                assert!(st.error.is_none(), "{:?} {:?}", st.error, st.notes);
+                if !st.decisions.is_empty() {
+                    reviewed += 1;
+                }
+            }
+            session.finish_hand(hand);
+            if reviewed >= 1 {
+                break;
+            }
+        }
+        assert!(reviewed >= 1, "{players}-max: no heads-up pot was reviewed");
+    }
+}
