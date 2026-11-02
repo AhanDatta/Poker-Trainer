@@ -339,3 +339,17 @@ fn rake_on_folds() {
     assert!((ev[1] - 950.0).abs() < 2.0, "bet EV {}", ev[1]);
     assert!((ev[0] - 950.0).abs() < 2.0, "check EV {}", ev[0]);
 }
+
+#[test]
+fn check_schedule_aims_at_predicted_convergence() {
+    use crate::next_check_gap as gap;
+    assert_eq!(gap(None, (20, 2.0), 0.5, 20), 20);
+    // e ∝ 1/t: the target is predicted at t = 80, further than the max gap.
+    assert_eq!(gap(Some((20, 2.0)), (40, 1.0), 0.5, 20), 20);
+    // Close to the target: check again soon (but not sooner than max/4).
+    assert_eq!(gap(Some((20, 1.0)), (40, 0.55), 0.5, 20), 5);
+    let g = gap(Some((20, 1.0)), (40, 0.6), 0.5, 20);
+    assert!((5..20).contains(&g), "{g}");
+    // No progress: fall back to the max gap.
+    assert_eq!(gap(Some((20, 1.0)), (40, 1.2), 0.5, 20), 20);
+}

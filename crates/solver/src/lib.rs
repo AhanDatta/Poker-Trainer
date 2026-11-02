@@ -113,13 +113,35 @@ pub struct SolveOptions {
     pub max_iterations: u32,
     /// Stop once exploitability is at most this percentage of the root pot.
     pub target_exploitability_pct: f64,
-    /// Compute exploitability every this many iterations.
+    /// Compute exploitability at least every this many iterations. Near
+    /// the target, checks are scheduled for when the convergence trend
+    /// predicts it will be reached (but at most 4 times as often), so the
+    /// solve stops closer to the target.
     pub check_every: u32,
 }
 
 impl Default for SolveOptions {
     fn default() -> Self {
         SolveOptions { max_iterations: 1000, target_exploitability_pct: 0.5, check_every: 10 }
+    }
+}
+
+/// Iterations until the next exploitability check: fits `e ∝ t^-k` through
+/// the last two checks and aims at the iteration where the target is
+/// predicted, between `max_gap / 4` and `max_gap` iterations ahead.
+pub(crate) fn next_check_gap(prev: Option<(u32, f64)>, (t, e): (u32, f64), target: f64, max_gap: u32) -> u32 {
+    let min_gap = (max_gap / 4).max(1);
+    let Some((t0, e0)) = prev else { return max_gap };
+    if !(e < e0 && e > target && t > t0 && target > 0.0) {
+        return max_gap;
+    }
+    let k = (e0 / e).ln() / (t as f64 / t0 as f64).ln();
+    let predicted = t as f64 * (e / target).powf(1.0 / k);
+    let gap = (predicted - t as f64).ceil();
+    if gap.is_finite() {
+        (gap.max(0.0) as u32).clamp(min_gap, max_gap)
+    } else {
+        max_gap
     }
 }
 
@@ -427,6 +449,9 @@ impl Solver {
             exploitability_pct: 100.0 * self.exploitability / pot,
             finished: false,
         };
+        let target = opts.target_exploitability_pct * pot / 100.0;
+        let mut next_check = self.iterations + check_every;
+        let mut last_check: Option<(u32, f64)> = None;
         while self.iterations < opts.max_iterations {
             self.iterations += 1;
             let d = Discount::new(self.iterations, &self.config.dcfr);
@@ -436,7 +461,7 @@ impl Solver {
                 cfr::traverse(&ctx, 0, p, &self.hands.weights[p ^ 1], Mode::Cfr(d), &mut out);
             }
             let last = self.iterations >= opts.max_iterations;
-            if self.iterations.is_multiple_of(check_every) || last {
+            if self.iterations >= next_check || last {
                 let e = cfr::exploitability(&ctx, raked);
                 self.exploitability = e;
                 progress.iteration = self.iterations;
@@ -449,6 +474,9 @@ impl Solver {
                     progress.finished = true;
                     return progress;
                 }
+                let t = self.iterations;
+                next_check = t + next_check_gap(last_check, (t, e), target, check_every);
+                last_check = Some((t, e));
             }
         }
         progress.finished = true;

@@ -295,7 +295,10 @@ fn chance(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode, out: 
     let o = p ^ 1;
     let factor = node.chance_factor;
     let k = node.num_actions();
-    let mut rows = vec![0f32; k * n];
+    // Pooled: a fresh ~200 KB allocation per chance node made glibc return
+    // the memory to the kernel and fault it back in (page zeroing and TLB
+    // shootdowns took ~15% of flop solves). Every row is fully written.
+    let mut rows = Buf::uninit(k * n);
     rows.par_chunks_mut(n).zip(node.children().into_par_iter()).for_each(|(row, c)| {
         let card = ctx.tree.card(c).index();
         let mut r = Buf::from_slice(opp_reach);

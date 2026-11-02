@@ -42,6 +42,16 @@ thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
 
+/// Resizes `v` to `len` without clearing existing elements (only growth is
+/// zero-filled), for buffers that are completely overwritten.
+fn set_len_unzeroed(v: &mut Vec<f32>, len: usize) {
+    if v.len() >= len {
+        v.truncate(len);
+    } else {
+        v.resize(len, 0.0);
+    }
+}
+
 pub(crate) fn subtree(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
     SCRATCH.with(|cell| {
         let mut s = cell.borrow_mut();
@@ -74,9 +84,9 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
         k += 1;
     }
 
-    // Phase 1: top-down opponent reach.
-    reach.clear();
-    reach.resize(reach_slots * nq, 0.0);
+    // Phase 1: top-down opponent reach. Every slot is written before it is
+    // read (dead items' slots are never read), so no zeroing.
+    set_len_unzeroed(reach, reach_slots * nq);
     reach[..nq].copy_from_slice(opp_reach);
     let mut next_slot = 1usize;
     for k in 0..items.len() {
@@ -99,8 +109,7 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
         }
         // Opponent node: its strategy splits the reach.
         let b = node.block(nq);
-        strat.clear();
-        strat.resize(na * nq, 0.0);
+        set_len_unzeroed(strat, na * nq); // overwritten by the load below
         unsafe {
             match mode {
                 Mode::Cfr(d) => {

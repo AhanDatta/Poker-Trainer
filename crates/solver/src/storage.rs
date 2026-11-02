@@ -21,9 +21,24 @@ pub(crate) struct SharedBuf<T> {
 unsafe impl<T: Send> Send for SharedBuf<T> {}
 unsafe impl<T: Send> Sync for SharedBuf<T> {}
 
-impl<T: Copy + Default> SharedBuf<T> {
+impl<T: Copy + Default + Send + Sync> SharedBuf<T> {
     pub fn new(len: usize) -> SharedBuf<T> {
-        let mut data = vec![T::default(); len].into_boxed_slice();
+        // Written in parallel instead of `vec![0; len]`: a zeroed allocation
+        // is mapped lazily, and since the solver reads each block before
+        // writing it, every page would first map the shared zero page and
+        // then take a copy-on-write fault with a TLB shootdown across all
+        // cores (several seconds per flop solve). Writing first faults the
+        // pages in directly, spread over the threads.
+        use rayon::prelude::*;
+        let mut v: Vec<T> = Vec::with_capacity(len);
+        v.spare_capacity_mut().par_chunks_mut(1 << 16).for_each(|c| {
+            for x in c {
+                x.write(T::default());
+            }
+        });
+        // SAFETY: all `len` elements were initialized above.
+        unsafe { v.set_len(len) };
+        let mut data = v.into_boxed_slice();
         let ptr = data.as_mut_ptr();
         SharedBuf { data, ptr }
     }

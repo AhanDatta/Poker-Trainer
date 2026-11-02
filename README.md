@@ -37,13 +37,34 @@ against a solver.
 
 ## Quick start
 
-Requires Rust 1.88 or newer (`rustup update` if needed).
+Requires Rust 1.88 or newer ([rustup](https://rustup.rs); `rustup update`
+if you already have it). Everything else is pure Rust: no system libraries,
+and it builds on Linux, macOS and Windows.
 
 ```bash
+git clone https://github.com/AhanDatta/Poker-Trainer
+cd Poker-Trainer
 cargo run --release
 ```
 
-Always use `--release`: the solver is far slower in a debug build.
+Always use `--release`: the solver is far slower in a debug build. To put a
+`poker-trainer` command on your `PATH` (in `~/.cargo/bin`) instead:
+
+```bash
+cargo install --path crates/tui
+```
+
+Optional: build for your exact CPU. Solves were ~10% faster this way on the
+development machine. The binary then only runs on CPUs with the same
+features, which is fine for a local build.
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo install --path crates/tui
+```
+
+Use a terminal with Unicode and colors (any modern one; on Windows,
+Windows Terminal). The review shows its two panels side by side at 110+
+columns and stacked otherwise.
 
 Other commands:
 

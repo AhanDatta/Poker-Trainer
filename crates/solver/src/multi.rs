@@ -870,6 +870,9 @@ impl MultiSolver {
     pub fn solve(&mut self, opts: &SolveOptions, mut on_progress: impl FnMut(&Progress) -> bool) -> Progress {
         let pot = self.config.root.pot as f64;
         let check = opts.check_every.max(1);
+        let target = opts.target_exploitability_pct * pot / 100.0;
+        let mut next_check = self.iterations + check;
+        let mut last_check: Option<(u32, f64)> = None;
         let mut progress = Progress {
             iteration: self.iterations,
             max_iterations: opts.max_iterations,
@@ -889,7 +892,7 @@ impl MultiSolver {
                 cfr(&ctx, &mut self.root, p, &self.hands.weights, d, &mut out);
             }
             let last = self.iterations >= opts.max_iterations;
-            if self.iterations.is_multiple_of(check) || last {
+            if self.iterations >= next_check || last {
                 self.convergence = self.convergence();
                 progress.iteration = self.iterations;
                 progress.exploitability = self.convergence;
@@ -900,6 +903,9 @@ impl MultiSolver {
                     progress.finished = true;
                     return progress;
                 }
+                let (t, e) = (self.iterations, self.convergence);
+                next_check = t + crate::next_check_gap(last_check, (t, e), target, check);
+                last_check = Some((t, e));
             }
         }
         progress.finished = true;
