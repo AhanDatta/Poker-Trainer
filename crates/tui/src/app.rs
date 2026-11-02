@@ -68,7 +68,7 @@ impl App {
             screen: Screen::Setup,
             prev_screen: Screen::Setup,
             hand: None,
-            setup_cursor: 1,
+            setup_cursor: 0,
             review_target: None,
             review_selected: 0,
             review_variant: Variant::Gto,

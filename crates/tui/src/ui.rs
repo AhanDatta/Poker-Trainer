@@ -157,11 +157,13 @@ fn draw_setup(f: &mut Frame, app: &App) {
                     format!("{} — {d}", cfg.opponent)
                 }
             }
-            SetupItem::Position => match cfg.hero_position {
-                HeroPosition::Alternate => "Alternate SB / BB".into(),
-                HeroPosition::Random => "Random".into(),
-                HeroPosition::Sb => "Always SB (button)".into(),
-                HeroPosition::Bb => "Always BB".into(),
+            SetupItem::Position => match (cfg.hero_position, cfg.players) {
+                (HeroPosition::Alternate, 2) => "Alternate SB / BB".into(),
+                (HeroPosition::Alternate, _) => "Rotate (the button moves every hand)".into(),
+                (HeroPosition::Random, _) => "Random".into(),
+                (HeroPosition::Sb, 2) => "Always SB (button)".into(),
+                (HeroPosition::Sb, _) => "Always SB".into(),
+                (HeroPosition::Bb, _) => "Always BB".into(),
             },
             SetupItem::Stack => format!("{}bb", cfg.stack_bb),
             SetupItem::Rake => {
@@ -225,9 +227,9 @@ fn draw_setup(f: &mut Frame, app: &App) {
         .split(rows[1]);
     f.render_stateful_widget(list, mid[0], &mut state);
     let about = vec![
-        Line::from("Play heads-up NLHE hands from preflop to the river against AI opponents with"),
-        Line::from("different styles. After each hand, press R to see what the solver would have"),
-        Line::from("done in every postflop spot you played, with the EV of each option."),
+        Line::from("Play NLHE hands (heads-up, 6-max or 9-max) from preflop to the river against AI"),
+        Line::from("opponents with different styles. After each hand, press R to see what the solver"),
+        Line::from("would have done in every postflop spot you played, with the EV of each option."),
         Line::from(""),
         Line::from(Span::styled(
             "Preflop decisions are not graded yet; the charts set the AIs' play and the starting ranges.",
@@ -412,7 +414,13 @@ fn draw_table(f: &mut Frame, app: &App) {
     // Solver status.
     let status = match hand.review() {
         None => Line::from(Span::styled(
-            "Solver review starts when the flop is dealt.",
+            if hand.is_finished() {
+                "No postflop decisions to review in this hand."
+            } else if hand.hero_folded() {
+                "You folded: nothing to review."
+            } else {
+                "Solver review starts when the flop is dealt."
+            },
             Style::default().fg(Color::DarkGray),
         )),
         Some(r) => {
@@ -424,6 +432,7 @@ fn draw_table(f: &mut Frame, app: &App) {
                     p.iteration, p.exploitability_pct
                 ));
             }
+            text.push_str(&elapsed(&s));
             if s.finished && s.error.is_none() {
                 text = format!(
                     "Solver: review ready ({} decisions graded) — press R after the hand",
@@ -434,6 +443,18 @@ fn draw_table(f: &mut Frame, app: &App) {
         }
     };
     f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP)), rows[3]);
+}
+
+/// " · 1:23" for a running solve stage, so a long solve visibly moves
+/// before its first exploitability check.
+fn elapsed(s: &trainer::ReviewStatus) -> String {
+    match s.stage_since {
+        Some(t) if !s.finished && s.stage.contains("solving") => {
+            let secs = t.elapsed().as_secs();
+            format!(" · {}:{:02}", secs / 60, secs % 60)
+        }
+        _ => String::new(),
+    }
 }
 
 fn bar(frac: f32, width: usize) -> String {
@@ -460,13 +481,6 @@ fn draw_review(f: &mut Frame, app: &App) {
     let net = hand.hero_net().unwrap_or(0);
     let mut head = vec![Span::raw(" You held ")];
     head.extend(cards_spans(&hand.state.hole[hand.hero]));
-    head.push(Span::raw(format!(
-        " as {} vs {} · result {}{} · ",
-        hand.state.position_name(hand.hero),
-        villain_style,
-        if net >= 0 { "+" } else { "" },
-        bb(net)
-    )));
     let variants: Vec<Variant> = {
         let mut v: Vec<Variant> = status.decisions.iter().map(|d| d.variant).collect();
         v.dedup();
@@ -474,6 +488,14 @@ fn draw_review(f: &mut Frame, app: &App) {
         v.dedup();
         v
     };
+    head.push(Span::raw(format!(
+        " as {} vs {} · result {}{}{}",
+        hand.state.position_name(hand.hero),
+        villain_style,
+        if net >= 0 { "+" } else { "" },
+        bb(net),
+        if variants.is_empty() { "" } else { " · " }
+    )));
     for v in &variants {
         let active = *v == app.review_variant || variants.len() == 1;
         head.push(Span::styled(
@@ -492,6 +514,7 @@ fn draw_review(f: &mut Frame, app: &App) {
         if let Some(p) = status.progress {
             second.push_str(&format!(" (iteration {}, {:.2}% pot)", p.iteration, p.exploitability_pct));
         }
+        second.push_str(&elapsed(&status));
     } else if let Some(e) = &status.error {
         second = format!("Review error: {e}");
     }

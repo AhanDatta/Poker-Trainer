@@ -266,6 +266,7 @@ impl LiveHand {
         if let Some(settings) = self.review_settings.clone() {
             if settings.enabled && live.len() >= 2 && live.contains(&self.hero) {
                 let setup = ReviewSetup {
+                    hand_id: self.id,
                     hero: self.hero,
                     profiles: self.profiles.clone(),
                     charts: Arc::clone(&self.charts),
@@ -291,9 +292,24 @@ impl LiveHand {
                 self.push_log(Some(p), text);
             }
         }
+        // The top contributor's chips beyond the second-highest commitment
+        // were never called: they go back, and aren't part of what it won.
+        let commits = self.state.total_commit.clone();
+        let mut sorted = commits.clone();
+        sorted.sort_unstable();
+        let n = sorted.len();
+        let (top, second) = (sorted[n - 1], if n > 1 { sorted[n - 2] } else { 0 });
         for p in 0..self.state.num_players() {
-            if st.payouts[p] > 0 {
-                let text = format!("{} wins {}", self.seat_name(p), bb(st.payouts[p]));
+            let uncalled = if commits[p] == top && top > second { top - second } else { 0 };
+            if uncalled > 0 {
+                self.push_log(
+                    Some(p),
+                    format!("Uncalled {} returned to {}", bb(uncalled), self.seat_name(p)),
+                );
+            }
+            let won = st.payouts[p] - uncalled.min(st.payouts[p]);
+            if won > 0 {
+                let text = format!("{} wins {}", self.seat_name(p), bb(won));
                 self.push_log(Some(p), text);
             }
         }

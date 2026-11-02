@@ -27,10 +27,60 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Serializes solves across hands so reviews don't fight over the CPU.
-static SOLVE_LOCK: Mutex<()> = Mutex::new(());
+/// Runs solves one at a time (each uses every core and up to gigabytes of
+/// memory), oldest hand first. A plain mutex isn't fair: a later hand's
+/// flop solve could slip in between a hand's flop and turn solves, so every
+/// review finished late.
+struct SolveQueue {
+    state: Mutex<QueueState>,
+    cv: Condvar,
+}
+
+struct QueueState {
+    busy: bool,
+    next_ticket: u64,
+    /// Waiting solves as `(hand id, ticket)`: the smallest goes next.
+    waiting: std::collections::BTreeSet<(u64, u64)>,
+}
+
+static SOLVE_QUEUE: SolveQueue = SolveQueue {
+    state: Mutex::new(QueueState { busy: false, next_ticket: 0, waiting: std::collections::BTreeSet::new() }),
+    cv: Condvar::new(),
+};
+
+/// Exclusive right to run a solve; released on drop.
+struct SolveTurn;
+
+impl Drop for SolveTurn {
+    fn drop(&mut self) {
+        SOLVE_QUEUE.state.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
+        SOLVE_QUEUE.cv.notify_all();
+    }
+}
+
+/// Waits for this hand's turn to solve; `None` if cancelled while waiting.
+fn wait_solve_turn(hand: u64, cancel: &AtomicBool) -> Option<SolveTurn> {
+    let q = &SOLVE_QUEUE;
+    let mut st = q.state.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (hand, st.next_ticket);
+    st.next_ticket += 1;
+    st.waiting.insert(key);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            st.waiting.remove(&key);
+            q.cv.notify_all();
+            return None;
+        }
+        if !st.busy && st.waiting.first() == Some(&key) {
+            st.waiting.remove(&key);
+            st.busy = true;
+            return Some(SolveTurn);
+        }
+        st = q.cv.wait_timeout(st, Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
 
 const CANCELLED: &str = "cancelled";
 
@@ -141,6 +191,8 @@ pub struct DecisionReview {
 #[derive(Clone, Debug, Default)]
 pub struct ReviewStatus {
     pub stage: String,
+    /// When the current stage started (to show elapsed time).
+    pub stage_since: Option<Instant>,
     pub progress: Option<Progress>,
     pub decisions: Vec<DecisionReview>,
     pub notes: Vec<String>,
@@ -151,6 +203,8 @@ pub struct ReviewStatus {
 /// Static inputs of a review.
 #[derive(Clone)]
 pub struct ReviewSetup {
+    /// Hand number: earlier hands' solves run first.
+    pub hand_id: u64,
     pub hero: usize,
     /// Style of every seat (`None` for the hero).
     pub profiles: Vec<Option<Profile>>,
@@ -197,6 +251,7 @@ impl Shared {
     fn set_stage(&self, s: String) {
         self.with_status(|st| {
             st.stage = s;
+            st.stage_since = Some(Instant::now());
             st.progress = None;
         });
     }
@@ -752,10 +807,9 @@ impl<'a> Worker<'a> {
     fn solve(&self, mut cfg: SolveConfig, label: &str) -> Result<(Solver, f64), String> {
         let shared = self.shared;
         shared.set_stage(format!("{label}: waiting for the solver"));
-        let _guard = SOLVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if shared.cancel.load(Ordering::Relaxed) {
+        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel) else {
             return Err(CANCELLED.into());
-        }
+        };
         shared.set_stage(format!("{label}: building the game tree"));
         let s = &self.setup.settings;
         let mut solver = match Solver::new(cfg.clone()) {
@@ -805,10 +859,9 @@ impl Worker<'_> {
     fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, f64), String> {
         let shared = self.shared;
         shared.set_stage(format!("{label}: waiting for the solver"));
-        let _guard = SOLVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        if shared.cancel.load(Ordering::Relaxed) {
+        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel) else {
             return Err(CANCELLED.into());
-        }
+        };
         shared.set_stage(format!("{label}: building the game tree"));
         let mut solver = MultiSolver::new(cfg).map_err(|e| e.to_string())?;
         shared.set_stage(format!("{label}: solving (approximate)"));

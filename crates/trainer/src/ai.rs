@@ -111,7 +111,13 @@ impl AiPlayer {
             .filter(|&q| q != p)
             .map(|q| self.reads[q].as_slice())
             .collect();
+        // `eq` is the chance of beating every opponent: right for pot odds,
+        // but in multiway pots it understates hand strength (top pair is
+        // well ahead of the 1/n fair share). The style thresholds are
+        // heads-up equities, so compare them with a heads-up equivalent:
+        // with independent opponents P(beat all) ≈ P(beat one)^n.
         let eq = equity_vs_ranges(hole, &state.board, &opps, 600, rng);
+        let strength = if opps.len() > 1 { eq.powf(1.0 / opps.len() as f32) } else { eq };
         let draw = draw_strength(hole, &state.board);
         let prof = &self.profile;
         let street_factor = match state.street {
@@ -130,17 +136,17 @@ impl AiPlayer {
 
         if sit.to_call == 0 {
             if !raises.is_empty() {
-                if eq >= prof.value_threshold {
+                if strength >= prof.value_threshold {
                     if rng.random::<f32>() >= prof.slowplay && rng.random::<f32>() < prof.bet_freq {
-                        let s = (eq - prof.value_threshold) * 3.0;
+                        let s = (strength - prof.value_threshold) * 3.0;
                         return Action::Raise(size(s, rng));
                     }
                     return Action::Check;
                 }
-                if eq >= prof.value_threshold - 0.12 && rng.random::<f32>() < prof.bet_freq * 0.25 {
+                if strength >= prof.value_threshold - 0.12 && rng.random::<f32>() < prof.bet_freq * 0.25 {
                     return Action::Raise(size(-0.6, rng));
                 }
-                if eq < 0.42 {
+                if strength < 0.42 {
                     let p_bluff = prof.bluff_freq * street_factor * (0.45 + draw);
                     if rng.random::<f32>() < p_bluff {
                         return Action::Raise(size(0.0, rng));
@@ -158,10 +164,10 @@ impl AiPlayer {
             need += 0.05 * (1.0 - prof.call_down);
         }
         if !raises.is_empty()
-            && eq >= prof.raise_threshold
+            && strength >= prof.raise_threshold
             && rng.random::<f32>() < prof.bet_freq * (1.0 - prof.slowplay)
         {
-            let s = (eq - prof.raise_threshold) * 4.0;
+            let s = (strength - prof.raise_threshold) * 4.0;
             return Action::Raise(size(s, rng));
         }
         if eq >= need {
@@ -418,6 +424,51 @@ mod tests {
         let board = parse_cards("2c7d9hTsJc").unwrap();
         let e = equity_vs_ranges(cards2("KdQd"), &board, &[&any], 0, &mut rng);
         assert!(e > 0.99, "{e}");
+    }
+
+    /// Reads after a 3-bet pot: AJ on Jc7d5d beats one such range ~66% of
+    /// the time but both only ~45%.
+    const READ: &str = "QQ+, TT-66, AK, AQ, KQs, 98s";
+
+    /// Regression: in multiway pots the AI compared "chance to beat
+    /// everyone" with heads-up thresholds, so even a Maniac checked top
+    /// pair, top kicker.
+    #[test]
+    fn multiway_strong_hands_bet() {
+        use holdem::{BetMenu, TableConfig};
+        let hole = |s: &str| cards2(s);
+        // 6-max, three players see a flop of Jc 7d 5d; seat 2 holds AJ.
+        let mut st = HandState::new(
+            TableConfig::new(6, 50, 100),
+            0,
+            vec![10_000; 6],
+            vec![hole("2c3h"), hole("4c6h"), hole("AsJd"), hole("8c9h"), hole("TcTs"), hole("KcQh")],
+        );
+        let menu = BetMenu::default();
+        // Button 0: HJ (4) and BTN (0) limp, the others fold, BB (2) checks.
+        while let Some(p) = st.to_act.filter(|_| st.street == Street::Preflop) {
+            let a = if [0, 2, 4].contains(&p) { Action::Call } else { Action::Fold };
+            let a = if a == Action::Call && st.situation(p).to_call == 0 { Action::Check } else { a };
+            st.apply(a).unwrap();
+        }
+        st.deal_board(&parse_cards("Jc7d5d").unwrap()).unwrap();
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut bets = 0;
+        for _ in 0..40 {
+            // BB acts first on the flop (SB folded).
+            let mut s = st.clone();
+            while s.to_act != Some(2) {
+                s.apply(Action::Check).unwrap();
+            }
+            let mut ai = AiPlayer::new(2, Profile::maniac(), 6);
+            let read = holdem::Range::parse(READ).unwrap().into_weights();
+            ai.reads[0] = read.clone();
+            ai.reads[4] = read;
+            if matches!(ai.decide_postflop(&s, &menu, &mut rng), Action::Raise(_)) {
+                bets += 1;
+            }
+        }
+        assert!(bets >= 30, "maniac bet top pair top kicker 3-way only {bets}/40 times");
     }
 
     #[test]
