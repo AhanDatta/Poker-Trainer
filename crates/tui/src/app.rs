@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use holdem::Action;
 use std::time::{Duration, Instant};
-use trainer::config::{FlopMode, HeroPosition, VillainRange};
+use trainer::config::{FlopMode, GameType, HeroPosition, VillainRange};
 use trainer::{LiveHand, Session, Variant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +20,10 @@ pub enum Screen {
 pub enum SetupItem {
     Table,
     Opponent,
+    /// Custom table: how many players of style `i` (index into the style
+    /// list) sit at the table.
+    Count(usize),
+    SeatChanges,
     Position,
     Stack,
     Rake,
@@ -31,16 +35,21 @@ pub enum SetupItem {
 /// Rake presets: (percent, cap in big blinds).
 pub const RAKE_PRESETS: [(f64, f64); 5] = [(0.0, 3.0), (2.5, 1.0), (5.0, 1.0), (5.0, 3.0), (5.0, 5.0)];
 
-pub const SETUP_ITEMS: [SetupItem; 8] = [
-    SetupItem::Table,
-    SetupItem::Opponent,
-    SetupItem::Position,
-    SetupItem::Stack,
-    SetupItem::Rake,
-    SetupItem::FlopSolve,
-    SetupItem::VillainRange,
-    SetupItem::RevealStyle,
+/// Seat-change presets: (percent chance per opponent and hand, label).
+pub const SEAT_CHANGE_PRESETS: [(f64, &str); 5] = [
+    (0.0, "Never: same players all session"),
+    (0.5, "Rarely: a new player every ~40 hands (6-max)"),
+    (2.0, "Sometimes: a new player every ~10 hands (6-max)"),
+    (5.0, "Often: a new player every ~4 hands (6-max)"),
+    (100.0, "Every hand: a whole new lineup"),
 ];
+
+/// What the opponents row can be set to.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OpponentChoice {
+    Game(GameType),
+    Style(String),
+}
 
 pub struct App {
     pub session: Session,
@@ -108,9 +117,37 @@ impl App {
     }
 
     /// Opponent choices for the setup screen.
-    pub fn opponent_choices(&self) -> Vec<String> {
-        let mut v = vec!["random".to_string()];
-        v.extend(self.session.config.profiles().into_iter().map(|p| p.name));
+    /// Game types, then "everyone plays this style" for each style.
+    pub fn opponent_choices(&self) -> Vec<OpponentChoice> {
+        let mut v: Vec<OpponentChoice> = GameType::ALL.into_iter().map(OpponentChoice::Game).collect();
+        v.extend(self.session.config.profiles().into_iter().map(|p| OpponentChoice::Style(p.name)));
+        v
+    }
+
+    pub fn current_opponent_choice(&self) -> OpponentChoice {
+        let cfg = &self.session.config;
+        if cfg.opponent.eq_ignore_ascii_case("random") {
+            OpponentChoice::Game(cfg.game)
+        } else {
+            OpponentChoice::Style(cfg.opponent.clone())
+        }
+    }
+
+    /// Rows of the setup screen (custom tables get one row per style).
+    pub fn setup_items(&self) -> Vec<SetupItem> {
+        let mut v = vec![SetupItem::Table, SetupItem::Opponent];
+        if self.current_opponent_choice() == OpponentChoice::Game(GameType::Custom) {
+            v.extend((0..self.session.config.profiles().len()).map(SetupItem::Count));
+        }
+        v.extend([
+            SetupItem::SeatChanges,
+            SetupItem::Position,
+            SetupItem::Stack,
+            SetupItem::Rake,
+            SetupItem::FlopSolve,
+            SetupItem::VillainRange,
+            SetupItem::RevealStyle,
+        ]);
         v
     }
 
@@ -182,10 +219,12 @@ impl App {
     fn setup_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.setup_cursor = self.setup_cursor.checked_sub(1).unwrap_or(SETUP_ITEMS.len() - 1);
+                let n = self.setup_items().len();
+                self.setup_cursor = self.setup_cursor.checked_sub(1).unwrap_or(n - 1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.setup_cursor = (self.setup_cursor + 1) % SETUP_ITEMS.len();
+                let n = self.setup_items().len();
+                self.setup_cursor = (self.setup_cursor + 1) % n;
             }
             KeyCode::Left | KeyCode::Char('h') => self.change_setting(-1),
             KeyCode::Right | KeyCode::Char('l') => self.change_setting(1),
@@ -210,30 +249,47 @@ impl App {
 
     fn change_setting(&mut self, dir: i32) {
         let cycle = |i: usize, n: usize| -> usize { ((i as i32 + dir).rem_euclid(n as i32)) as usize };
+        let items = self.setup_items();
+        let item = items[self.setup_cursor.min(items.len() - 1)];
         let cfg = &mut self.session.config;
-        match SETUP_ITEMS[self.setup_cursor] {
+        match item {
             SetupItem::Table => {
                 let sizes = [2usize, 6, 9];
                 let cur = sizes.iter().position(|&n| n == self.session.config.players).unwrap_or(0);
                 let next = sizes[cycle(cur, sizes.len())];
                 if let Err(e) = self.session.set_players(next) {
                     self.flash(e);
-                } else if next > 2 && self.session.config.charts_for(next).is_none() {
-                    self.flash(
-                        "Using built-in preflop rules; run `poker-trainer fetch-charts` for solver charts.",
-                    );
+                } else if next > 6 && self.session.config.charts_for(next).is_none() {
+                    self.flash("9-max uses position-aware preflop rules (there are no 9-max solver charts).");
                 }
             }
             SetupItem::Opponent => {
                 let choices = self.opponent_choices();
-                let cur = choices
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(&self.session.config.opponent))
-                    .unwrap_or(0);
-                let next = choices[cycle(cur, choices.len())].clone();
-                if let Err(e) = self.session.set_opponent(&next) {
-                    self.flash(e);
+                let cur = choices.iter().position(|c| *c == self.current_opponent_choice()).unwrap_or(0);
+                match choices[cycle(cur, choices.len())].clone() {
+                    OpponentChoice::Game(g) => self.session.set_game(g),
+                    OpponentChoice::Style(name) => {
+                        if let Err(e) = self.session.set_opponent(&name) {
+                            self.flash(e);
+                        }
+                    }
                 }
+            }
+            SetupItem::Count(i) => {
+                let Some(style) = self.session.config.profiles().get(i).map(|p| p.name.clone()) else {
+                    return;
+                };
+                let cur = self.session.config.custom_table.get(&style).copied().unwrap_or(0);
+                let max = self.session.config.players.saturating_sub(1);
+                let next = (cur as i32 + dir).clamp(0, max as i32) as usize;
+                self.session.set_custom_count(&style, next);
+            }
+            SetupItem::SeatChanges => {
+                let cur = SEAT_CHANGE_PRESETS
+                    .iter()
+                    .position(|&(p, _)| (p - cfg.seat_change_pct).abs() < 1e-9)
+                    .unwrap_or(2);
+                cfg.seat_change_pct = SEAT_CHANGE_PRESETS[cycle(cur, SEAT_CHANGE_PRESETS.len())].0;
             }
             SetupItem::Position => {
                 let all = [HeroPosition::Alternate, HeroPosition::Random, HeroPosition::Sb, HeroPosition::Bb];

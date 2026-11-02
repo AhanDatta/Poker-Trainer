@@ -19,8 +19,12 @@ pub struct Profile {
     pub description: String,
     /// -1 (very tight) .. 1 (very loose) preflop.
     pub looseness: f32,
-    /// -1 (passive: flats instead of raising) .. 1 (raises instead of calling).
+    /// -1 (passive: limps/flats instead of raising) .. 1 (raises instead of
+    /// calling), in unopened and limped pots.
     pub aggression: f32,
+    /// The same when facing a raise: -1 (almost never 3-bets/4-bets,
+    /// flats instead) .. 1 (3-bets instead of calling).
+    pub three_bet: f32,
     /// Probability of betting/raising a hand that clears the value threshold.
     pub bet_freq: f32,
     /// Propensity to bluff with weak hands (scaled by draws/fold equity).
@@ -35,6 +39,12 @@ pub struct Profile {
     pub size_bias: f32,
     /// Probability of checking/calling a strong hand to trap.
     pub slowplay: f32,
+    /// Probability of a continuation bet on the flop as the preflop raiser
+    /// with a hand too weak to bet for value (heads-up; less multiway).
+    pub cbet: f32,
+    /// Probability of betting again on the turn/river after betting the
+    /// previous street, with a hand too weak to bet for value.
+    pub barrel: f32,
 }
 
 impl Default for Profile {
@@ -47,80 +57,138 @@ impl Profile {
     pub fn reg() -> Profile {
         Profile {
             name: "Reg".into(),
-            description: "Solid, balanced regular close to the charts".into(),
+            description: "Solid winning regular: plays close to the solver charts, c-bets often, balanced"
+                .into(),
             looseness: 0.0,
             aggression: 0.0,
-            bet_freq: 0.75,
+            three_bet: 0.0,
+            bet_freq: 0.85,
             bluff_freq: 0.3,
-            call_down: 0.45,
-            value_threshold: 0.62,
-            raise_threshold: 0.82,
+            call_down: 0.5,
+            value_threshold: 0.6,
+            raise_threshold: 0.8,
             size_bias: 0.0,
-            slowplay: 0.15,
-        }
-    }
-
-    pub fn nit() -> Profile {
-        Profile {
-            name: "Nit".into(),
-            description: "Tight and passive: plays few hands, rarely bluffs, folds to pressure".into(),
-            looseness: -0.55,
-            aggression: -0.4,
-            bet_freq: 0.6,
-            bluff_freq: 0.07,
-            call_down: 0.2,
-            value_threshold: 0.7,
-            raise_threshold: 0.9,
-            size_bias: -0.3,
-            slowplay: 0.25,
+            slowplay: 0.12,
+            cbet: 0.6,
+            barrel: 0.45,
         }
     }
 
     pub fn tag() -> Profile {
         Profile {
             name: "TAG".into(),
-            description: "Tight-aggressive: selective preflop, bets and raises its good hands".into(),
-            looseness: -0.25,
-            aggression: 0.4,
-            bet_freq: 0.85,
+            description: "Tight-aggressive: a bit tighter than a reg, bets and raises its good hands".into(),
+            looseness: -0.15,
+            aggression: 0.15,
+            three_bet: 0.1,
+            bet_freq: 0.9,
             bluff_freq: 0.3,
-            call_down: 0.35,
+            call_down: 0.4,
             value_threshold: 0.6,
-            raise_threshold: 0.8,
+            raise_threshold: 0.78,
             size_bias: 0.2,
-            slowplay: 0.1,
+            slowplay: 0.08,
+            cbet: 0.65,
+            barrel: 0.5,
         }
     }
 
     pub fn lag() -> Profile {
         Profile {
             name: "LAG".into(),
-            description: "Loose-aggressive: wide ranges, lots of pressure and bluffs".into(),
-            looseness: 0.45,
-            aggression: 0.6,
+            description:
+                "Loose-aggressive pro: wider ranges, more 3-bets, barrels and bluffs, but not reckless".into(),
+            looseness: 0.2,
+            aggression: 0.4,
+            three_bet: 0.3,
             bet_freq: 0.9,
-            bluff_freq: 0.5,
-            call_down: 0.5,
-            value_threshold: 0.58,
+            bluff_freq: 0.45,
+            call_down: 0.55,
+            value_threshold: 0.57,
             raise_threshold: 0.75,
-            size_bias: 0.4,
+            size_bias: 0.3,
             slowplay: 0.1,
+            cbet: 0.72,
+            barrel: 0.55,
+        }
+    }
+
+    pub fn nit() -> Profile {
+        Profile {
+            name: "Nit".into(),
+            description: "Very tight: plays few hands, bets them, rarely bluffs, folds to pressure".into(),
+            looseness: -0.55,
+            aggression: 0.0,
+            three_bet: -0.5,
+            bet_freq: 0.8,
+            bluff_freq: 0.08,
+            call_down: 0.25,
+            value_threshold: 0.66,
+            raise_threshold: 0.85,
+            size_bias: -0.2,
+            slowplay: 0.15,
+            cbet: 0.5,
+            barrel: 0.25,
+        }
+    }
+
+    pub fn rock() -> Profile {
+        Profile {
+            name: "Rock".into(),
+            description:
+                "Weak-tight recreational: tight, limps and calls more than it raises, gives up easily".into(),
+            looseness: -0.4,
+            aggression: -0.5,
+            three_bet: -0.6,
+            bet_freq: 0.6,
+            bluff_freq: 0.05,
+            call_down: 0.3,
+            value_threshold: 0.7,
+            raise_threshold: 0.9,
+            size_bias: -0.4,
+            slowplay: 0.3,
+            cbet: 0.35,
+            barrel: 0.15,
+        }
+    }
+
+    pub fn fish() -> Profile {
+        Profile {
+            name: "Fish".into(),
+            description:
+                "Loose-passive recreational: plays too many hands, calls too much, bets only good hands"
+                    .into(),
+            looseness: 0.35,
+            aggression: -0.5,
+            three_bet: -0.6,
+            bet_freq: 0.6,
+            bluff_freq: 0.12,
+            call_down: 0.65,
+            value_threshold: 0.66,
+            raise_threshold: 0.88,
+            size_bias: -0.3,
+            slowplay: 0.25,
+            cbet: 0.4,
+            barrel: 0.25,
         }
     }
 
     pub fn station() -> Profile {
         Profile {
             name: "Calling Station".into(),
-            description: "Loose-passive: limps and calls a lot, rarely raises or folds".into(),
-            looseness: 0.7,
+            description: "Very loose-passive: limps and calls almost anything, rarely raises or folds".into(),
+            looseness: 0.6,
             aggression: -0.7,
-            bet_freq: 0.4,
+            three_bet: -0.7,
+            bet_freq: 0.45,
             bluff_freq: 0.05,
-            call_down: 0.9,
+            call_down: 0.8,
             value_threshold: 0.7,
             raise_threshold: 0.92,
             size_bias: -0.5,
             slowplay: 0.3,
+            cbet: 0.3,
+            barrel: 0.15,
         }
     }
 
@@ -128,15 +196,18 @@ impl Profile {
         Profile {
             name: "Maniac".into(),
             description: "Hyper-aggressive: raises and overbets constantly, bluffs a ton".into(),
-            looseness: 0.85,
-            aggression: 0.95,
+            looseness: 0.6,
+            aggression: 0.8,
+            three_bet: 0.6,
             bet_freq: 0.95,
-            bluff_freq: 0.75,
-            call_down: 0.65,
+            bluff_freq: 0.7,
+            call_down: 0.6,
             value_threshold: 0.52,
             raise_threshold: 0.68,
             size_bias: 0.9,
             slowplay: 0.05,
+            cbet: 0.9,
+            barrel: 0.75,
         }
     }
 
@@ -144,9 +215,11 @@ impl Profile {
     pub fn presets() -> Vec<Profile> {
         vec![
             Profile::reg(),
-            Profile::nit(),
             Profile::tag(),
             Profile::lag(),
+            Profile::nit(),
+            Profile::rock(),
+            Profile::fish(),
             Profile::station(),
             Profile::maniac(),
         ]
@@ -158,7 +231,8 @@ impl Profile {
             .into_iter()
             .find(|p| p.name.to_ascii_lowercase().replace([' ', '-', '_'], "") == key)
             .or_else(|| match key.as_str() {
-                "station" | "fish" => Some(Profile::station()),
+                "station" | "callingstation" => Some(Profile::station()),
+                "weaktight" => Some(Profile::rock()),
                 "balanced" | "regular" => Some(Profile::reg()),
                 _ => None,
             })
@@ -166,7 +240,9 @@ impl Profile {
 
     /// Adjusts baseline (chart) frequencies for all 169 classes at one
     /// decision according to this profile's preflop tendencies.
-    pub fn adjust_preflop(&self, base: &[Freqs], avail: &Availability) -> Vec<Freqs> {
+    /// `facing_raise`: someone already raised (3-bet spots and beyond), so
+    /// `three_bet` applies instead of `aggression`.
+    pub fn adjust_preflop(&self, base: &[Freqs], avail: &Availability, facing_raise: bool) -> Vec<Freqs> {
         let mut f: Vec<Freqs> = base.to_vec();
         let combos: Vec<f32> =
             (0..NUM_CLASSES).map(|g| HandClass::from_grid_index(g).num_combos() as f32).collect();
@@ -187,8 +263,13 @@ impl Profile {
             let target = if l > 0.0 { cont + l * (1.0 - cont) * 0.7 } else { cont * (1.0 + l * 0.7) };
             let mut delta = (target - cont) * total; // in combos
             if delta > 0.0 {
-                // Strongest folding hands start continuing (mostly by calling).
-                let into = if can_pass {
+                // Strongest folding hands start continuing: by raising when
+                // the pot is unopened and the style is aggressive (a LAG
+                // opens wider, it doesn't limp), otherwise by calling.
+                let raise_first = !facing_raise && self.aggression > 0.0 && can_raise;
+                let into = if raise_first {
+                    raise_i
+                } else if can_pass {
                     pas_i
                 } else if can_raise {
                     raise_i
@@ -231,7 +312,7 @@ impl Profile {
         }
 
         // 2) Aggression: convert between calling and raising.
-        let g_ = self.aggression.clamp(-1.0, 1.0);
+        let g_ = if facing_raise { self.three_bet } else { self.aggression }.clamp(-1.0, 1.0);
         if g_ > 0.0 {
             for row in f.iter_mut() {
                 if can_raise {
@@ -246,7 +327,7 @@ impl Profile {
             }
         } else if g_ < 0.0 && can_pass {
             for row in f.iter_mut() {
-                let mv = row[raise_i] * (-g_) * 0.6;
+                let mv = row[raise_i] * (-g_);
                 row[raise_i] -= mv;
                 row[pas_i] += mv;
             }
@@ -285,9 +366,9 @@ mod tests {
         let charts = ChartSet::hu_100bb();
         let avail = open_avail();
         let base: Vec<Freqs> = (0..NUM_CLASSES).map(|g| charts.freqs(">SB", g, &avail).0).collect();
-        let nit = Profile::nit().adjust_preflop(&base, &avail);
-        let station = Profile::station().adjust_preflop(&base, &avail);
-        let reg = Profile::reg().adjust_preflop(&base, &avail);
+        let nit = Profile::nit().adjust_preflop(&base, &avail, false);
+        let station = Profile::station().adjust_preflop(&base, &avail, false);
+        let reg = Profile::reg().adjust_preflop(&base, &avail, false);
         assert!((vpip(&reg) - vpip(&base)).abs() < 1e-4);
         assert!(vpip(&nit) < vpip(&base) - 0.2, "nit {}", vpip(&nit));
         assert!(vpip(&station) > vpip(&base), "station {}", vpip(&station));

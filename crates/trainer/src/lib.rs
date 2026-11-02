@@ -16,13 +16,14 @@ pub mod charts_import;
 pub mod config;
 pub mod fmt;
 pub mod hand;
+pub mod population;
 pub mod preflop;
 pub mod profiles;
 pub mod review;
 pub mod session;
 pub mod strength;
 
-pub use config::{FlopMode, HeroPosition, SolverSettings, TrainerConfig, VillainRange};
+pub use config::{FlopMode, GameType, HeroPosition, SolverSettings, TrainerConfig, VillainRange};
 pub use hand::{LiveHand, LogEntry, StepResult};
 pub use profiles::Profile;
 pub use review::{DecisionReview, Review, ReviewStatus, Variant, Verdict};

@@ -1,6 +1,6 @@
 //! Rendering.
 
-use crate::app::{App, Screen, SetupItem, SETUP_ITEMS};
+use crate::app::{App, OpponentChoice, Screen, SetupItem, SEAT_CHANGE_PRESETS};
 use holdem::combo::{combo_cards, HandClass, NUM_CLASSES};
 use holdem::{Action, Card, Street};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -149,14 +149,26 @@ fn draw_setup(f: &mut Frame, app: &App) {
                 9 => "9-max (full ring)".into(),
                 n => format!("{n} players"),
             },
-            SetupItem::Opponent => {
-                if cfg.opponent.eq_ignore_ascii_case("random") {
-                    "Random style each hand".into()
-                } else {
-                    let d = cfg.profile_by_name(&cfg.opponent).map(|p| p.description).unwrap_or_default();
-                    format!("{} — {d}", cfg.opponent)
+            SetupItem::Opponent => match app.current_opponent_choice() {
+                OpponentChoice::Game(g) if cfg.players == 2 => {
+                    format!("{} — opponent drawn from: {}", g.label(), g.description())
                 }
+                OpponentChoice::Game(g) => format!("{} — {}", g.label(), g.description()),
+                OpponentChoice::Style(name) => {
+                    let d = cfg.profile_by_name(&name).map(|p| p.description).unwrap_or_default();
+                    format!("All {name} — {d}")
+                }
+            },
+            SetupItem::Count(i) => {
+                let name = cfg.profiles().get(i).map(|p| p.name.clone()).unwrap_or_default();
+                let n = cfg.custom_table.get(&name).copied().unwrap_or(0);
+                format!("{n} at the table")
             }
+            SetupItem::SeatChanges => SEAT_CHANGE_PRESETS
+                .iter()
+                .find(|&&(p, _)| (p - cfg.seat_change_pct).abs() < 1e-9)
+                .map(|&(_, l)| l.to_string())
+                .unwrap_or_else(|| format!("{}% chance per player and hand", cfg.seat_change_pct)),
             SetupItem::Position => match (cfg.hero_position, cfg.players) {
                 (HeroPosition::Alternate, 2) => "Alternate SB / BB".into(),
                 (HeroPosition::Alternate, _) => "Rotate (the button moves every hand)".into(),
@@ -195,17 +207,31 @@ fn draw_setup(f: &mut Frame, app: &App) {
             }
         }
     };
-    let label = |item: SetupItem| match item {
-        SetupItem::Table => "Table",
-        SetupItem::Opponent => "Opponent style",
-        SetupItem::Position => "Your position",
-        SetupItem::Stack => "Stacks",
-        SetupItem::Rake => "Rake",
-        SetupItem::FlopSolve => "Flop solving",
-        SetupItem::VillainRange => "Villain range in review",
-        SetupItem::RevealStyle => "Reveal style during hand",
+    let label = |item: SetupItem| -> String {
+        match item {
+            SetupItem::Table => "Table",
+            SetupItem::Opponent => {
+                if cfg.players == 2 {
+                    "Opponent"
+                } else {
+                    "Opponents"
+                }
+            }
+            SetupItem::Count(i) => {
+                return format!("    {}", cfg.profiles().get(i).map(|p| p.name.clone()).unwrap_or_default())
+            }
+            SetupItem::SeatChanges => "New players sit down",
+            SetupItem::Position => "Your position",
+            SetupItem::Stack => "Stacks",
+            SetupItem::Rake => "Rake",
+            SetupItem::FlopSolve => "Flop solving",
+            SetupItem::VillainRange => "Villain range in review",
+            SetupItem::RevealStyle => "Reveal style during hand",
+        }
+        .to_string()
     };
-    let items: Vec<ListItem> = SETUP_ITEMS
+    let setup_items = app.setup_items();
+    let items: Vec<ListItem> = setup_items
         .iter()
         .map(|&it| {
             ListItem::new(Line::from(vec![
@@ -223,7 +249,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
         .highlight_symbol("▶ ");
     let mid = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(SETUP_ITEMS.len() as u16 + 2), Constraint::Min(4)])
+        .constraints([Constraint::Length(setup_items.len() as u16 + 2), Constraint::Min(4)])
         .split(rows[1]);
     f.render_stateful_widget(list, mid[0], &mut state);
     let about = vec![

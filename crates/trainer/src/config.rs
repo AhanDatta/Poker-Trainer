@@ -3,6 +3,7 @@
 use crate::profiles::Profile;
 use holdem::{BetMenu, PostflopMenu, StreetSizes};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -108,6 +109,79 @@ impl Default for SolverSettings {
     }
 }
 
+/// Kind of game: how likely each opponent style is to sit at the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GameType {
+    /// Mostly winning regulars.
+    Tough,
+    /// A mix of regulars and recreational players.
+    Typical,
+    /// Mostly recreational players: fish, stations, weak-tight players.
+    Soft,
+    /// Maniacs and loose-aggressive players.
+    Wild,
+    /// Exactly the styles in `custom_table`.
+    Custom,
+}
+
+impl GameType {
+    pub const ALL: [GameType; 5] =
+        [GameType::Tough, GameType::Typical, GameType::Soft, GameType::Wild, GameType::Custom];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            GameType::Tough => "Tough game",
+            GameType::Typical => "Typical game",
+            GameType::Soft => "Soft game",
+            GameType::Wild => "Wild game",
+            GameType::Custom => "Custom table",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            GameType::Tough => "mostly regs and TAGs, a few LAGs and nits",
+            GameType::Typical => "regs and TAGs plus some fish, rocks and the odd maniac",
+            GameType::Soft => "mostly fish, calling stations and weak-tight players",
+            GameType::Wild => "maniacs and LAGs, with stations and fish",
+            GameType::Custom => "your own count of each style",
+        }
+    }
+
+    /// Relative chance of each style (by preset name) for the preset game
+    /// types; empty for `Custom`.
+    pub fn weights(self) -> &'static [(&'static str, f64)] {
+        match self {
+            GameType::Tough => &[("Reg", 4.0), ("TAG", 3.0), ("LAG", 2.0), ("Nit", 1.0)],
+            GameType::Typical => &[
+                ("Reg", 3.0),
+                ("TAG", 2.0),
+                ("Nit", 1.5),
+                ("LAG", 1.0),
+                ("Rock", 1.0),
+                ("Fish", 2.0),
+                ("Calling Station", 0.5),
+                ("Maniac", 0.3),
+            ],
+            GameType::Soft => &[
+                ("Reg", 1.5),
+                ("TAG", 0.5),
+                ("Nit", 1.0),
+                ("Rock", 2.0),
+                ("Fish", 3.0),
+                ("Calling Station", 2.0),
+                ("LAG", 0.5),
+                ("Maniac", 0.5),
+            ],
+            GameType::Wild => {
+                &[("Maniac", 3.0), ("LAG", 2.5), ("Calling Station", 1.5), ("Fish", 1.5), ("Reg", 1.0)]
+            }
+            GameType::Custom => &[],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TrainerConfig {
@@ -115,12 +189,20 @@ pub struct TrainerConfig {
     pub players: usize,
     /// Starting stack in big blinds (every hand starts fresh).
     pub stack_bb: f64,
-    /// Opponent style: a preset name (Reg, Nit, TAG, LAG, Calling Station,
-    /// Maniac), the name of a custom profile, or "random".
+    /// Opponent style: "random" (drawn according to `game`), or a style
+    /// name (preset or custom profile) for every opponent.
     pub opponent: String,
-    /// With `opponent = "random"`: pick a new style every hand (otherwise
-    /// once per session).
-    pub random_each_hand: bool,
+    /// With `opponent = "random"`: the kind of game, i.e. how likely each
+    /// style is to sit at the table.
+    pub game: GameType,
+    /// With `game = "custom"`: how many opponents of each style sit at the
+    /// table, e.g. `{ Reg = 2, Fish = 2, Maniac = 1 }`. Seats beyond the
+    /// counts are filled as in a typical game.
+    pub custom_table: BTreeMap<String, usize>,
+    /// Chance (percent, per opponent and hand) that a player leaves and a
+    /// new one sits down. 0 keeps the lineup for the session; 100 draws a
+    /// new lineup every hand.
+    pub seat_change_pct: f64,
     /// Reveal the opponent's style during the hand (it's always shown in the
     /// review).
     pub show_opponent_style: bool,
@@ -151,7 +233,12 @@ impl Default for TrainerConfig {
             players: 2,
             stack_bb: 100.0,
             opponent: "random".into(),
-            random_each_hand: true,
+            game: GameType::Typical,
+            custom_table: [("Reg", 2), ("TAG", 1), ("Fish", 1), ("Maniac", 1)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+            seat_change_pct: 2.0,
             show_opponent_style: false,
             hero_position: HeroPosition::Alternate,
             rake_pct: 0.0,
@@ -196,6 +283,14 @@ impl TrainerConfig {
         }
         if !self.opponent.eq_ignore_ascii_case("random") && self.profile_by_name(&self.opponent).is_none() {
             return Err(format!("unknown opponent style {:?}", self.opponent));
+        }
+        for name in self.custom_table.keys() {
+            if self.profile_by_name(name).is_none() {
+                return Err(format!("custom_table: unknown style {name:?}"));
+            }
+        }
+        if !(0.0..=100.0).contains(&self.seat_change_pct) {
+            return Err("seat_change_pct must be within 0-100".into());
         }
         Ok(())
     }

@@ -177,7 +177,7 @@ mod tests {
         cfg.solver.target_exploitability_pct = 5.0;
         let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
         let s = render(&app);
-        assert!(s.contains("Opponent style"), "{s}");
+        assert!(s.contains("Opponent") && s.contains("All Calling Station"), "{s}");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let mut reviewed = false;
         for _ in 0..4000 {

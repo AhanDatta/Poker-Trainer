@@ -25,7 +25,8 @@ against a solver.
 |---|---|
 | Heads-up, 6-max and 9-max tables, 100bb default | ✅ |
 | Full hands from preflop to river vs. AI | ✅ |
-| AI styles per seat: Reg, Nit, TAG, LAG, Calling Station, Maniac, or random | ✅ |
+| 8 AI styles, tuned to typical tracker stats (Reg, TAG, LAG, Nit, Rock, Fish, Calling Station, Maniac) | ✅ |
+| Game types (Tough, Typical, Soft, Wild, Custom counts) with session lineups | ✅ |
 | Heads-up pots: exact solver review of every hero decision (EV per action, mix, grade) | ✅ (at any table size) |
 | 3-way pots: approximate 3-player CFR review | ✅ approximate |
 | 4+-way pots | ❌ not analyzed (analysis resumes once ≤3 players remain) |
@@ -185,12 +186,43 @@ reproduces the exact heads-up solver.
 
 * **Preflop:** chart frequencies for the position and line, adjusted by the
   style. *Looseness* widens or narrows the continuing range along a
-  playability order; *aggression* turns calls into raises, or raises into
-  calls (limping).
+  playability order (aggressive styles open the extra hands, passive ones
+  limp them); *aggression* turns calls into raises in unopened and limped
+  pots, *3-bet tendency* does the same when facing a raise.
 * **Postflop:** Monte-Carlo equity against reads of every opponent's range,
   narrowed after each of their actions. Style thresholds then decide
-  value-betting, bluffing (more with draws), calling down, raising,
-  slow-playing and sizing.
+  value-betting, calling down, raising, slow-playing and sizing. The last
+  aggressor c-bets and barrels at its style's frequencies; bluffs and
+  c-bets shrink in multiway pots, and strength thresholds use a heads-up
+  equivalent of multiway equity.
+
+The styles were tuned with all-AI simulations
+(`cargo run --release -p trainer --example population`) to match typical
+6-max tracker stats for each player type. Measured over 20,000 hands each:
+
+| Style | VPIP | PFR | 3-bet | C-bet | Plays like |
+|---|---|---|---|---|---|
+| Reg | 20–23 | 15–19 | 10 | 67 | solid winning regular, close to the solver charts |
+| TAG | 18–20 | 14–16 | 9 | 72 | a bit tighter than a reg |
+| LAG | 31 | 24 | 13 | 74 | loose-aggressive pro, not reckless |
+| Nit | 13 | 10 | 3–4 | 55 | very tight, bets its hands, folds to pressure |
+| Rock | 16 | 8 | 4 | 36 | weak-tight recreational, limps and gives up |
+| Fish | 39–40 | 9–10 | 4 | 45 | loose-passive recreational |
+| Calling Station | 53 | 5–7 | 3–4 | 34 | calls almost anything (aggression factor 0.4) |
+| Maniac | 54 | 43 | 25 | 89 | raises and bluffs constantly |
+
+A test (`crates/trainer/tests/styles.rs`) keeps every style within the
+ranges of its player type.
+
+**Game types.** At 6-max and 9-max you choose the kind of game: *Tough*
+(regs, TAGs, some LAGs and nits), *Typical* (regs plus fish, rocks and the
+odd maniac), *Soft* (mostly fish, stations and weak-tight players), *Wild*
+(maniacs and LAGs), or a *Custom* table with your own count of each style.
+You can also make every opponent the same style. Players keep their seats
+for the session; now and then one leaves and a new one, drawn from the game
+type, sits down (the hand log says so). In simulated typical games, fish and
+stations fill about half of the multiway-pot seats, as at real tables; in
+tough games they're regs and LAGs.
 
 ### Preflop charts
 
@@ -287,8 +319,10 @@ useful ones:
 
 ```toml
 players = 6                  # 2 (heads-up), 6, 9
-opponent = "random"          # Reg | Nit | TAG | LAG | Calling Station | Maniac | random
-random_each_hand = true      # with "random": new style per seat each hand (else per session)
+opponent = "random"          # random (drawn by game type) | Reg | TAG | LAG | Nit | Rock | Fish | Calling Station | Maniac
+game = "typical"             # tough | typical | soft | wild | custom
+custom_table = { Reg = 2, TAG = 1, Fish = 1, Maniac = 1 }   # with game = "custom"
+seat_change_pct = 2.0        # chance per opponent and hand that a new player sits down (0 = never, 100 = every hand)
 show_opponent_style = false  # reveal styles during the hand (always shown in the review)
 hero_position = "alternate"  # alternate (rotate) | random | sb | bb
 stack_bb = 100.0
