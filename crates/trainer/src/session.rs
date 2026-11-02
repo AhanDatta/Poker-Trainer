@@ -59,13 +59,16 @@ impl Stats {
 }
 
 /// Charts for the configured table size (file or built-in).
+/// Built-in charts for the table size, overlaid with the configured chart
+/// file (whose spots take precedence) if there is one.
 fn load_charts(config: &TrainerConfig) -> Result<ChartSet, String> {
+    let builtin = ChartSet::builtin(config.players);
     Ok(match config.charts_for(config.players) {
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            ChartSet::parse(&text, config.players).map_err(|e| format!("{path}: {e}"))?
+            builtin.overlay(ChartSet::parse(&text, config.players).map_err(|e| format!("{path}: {e}"))?)
         }
-        None => ChartSet::builtin(config.players),
+        None => builtin,
     })
 }
 

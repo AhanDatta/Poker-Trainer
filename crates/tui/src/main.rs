@@ -42,7 +42,8 @@ enum Cmd {
         #[arg(default_value = DEFAULT_CONFIG)]
         path: String,
     },
-    /// Convert a downloaded preflop range collection into a chart file.
+    /// Convert a preflop range collection into a chart file (set it as
+    /// charts_hu / charts_6max / charts_9max in the config to use it).
     ImportCharts {
         /// Directory with the ranges.
         dir: String,
@@ -59,13 +60,6 @@ enum Cmd {
         /// Output chart file.
         #[arg(short, long, default_value = "charts.txt")]
         out: String,
-    },
-    /// Download public solver-based preflop ranges (heads-up and 6-max,
-    /// 100bb) from GitHub, import them and update the config to use them.
-    FetchCharts {
-        /// Where to store the download and the imported charts.
-        #[arg(long, default_value = "charts")]
-        dir: String,
     },
     /// Headless: play hands with a scripted hero and print the solver review
     /// (useful to check performance on your machine).
@@ -107,10 +101,6 @@ fn main() -> Result<()> {
         }
         Some(Cmd::ImportCharts { dir, format, players, allin_bb, out }) => {
             charts_cmd::import(dir, format, *players, *allin_bb, out)
-        }
-        Some(Cmd::FetchCharts { dir }) => {
-            let path = cli.config.clone().unwrap_or_else(|| DEFAULT_CONFIG.to_string());
-            charts_cmd::fetch(dir, &path)
         }
         Some(Cmd::Selfplay { hands, style }) => {
             let (mut cfg, _) = load_config(&cli)?;

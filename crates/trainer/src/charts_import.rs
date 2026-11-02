@@ -17,8 +17,9 @@
 //! `AKs:0.75,QQ:1`). Any raise size maps to the chart's single raise action
 //! (or all-in), since the trainer's preflop menu has one size per level.
 
-use crate::preflop::{Chart, ChartSet, Freqs};
-use holdem::combo::NUM_CLASSES;
+use crate::preflop::{fallback_freqs, Chart, ChartSet, Freqs};
+use crate::strength;
+use holdem::combo::{HandClass, NUM_CLASSES};
 use holdem::Range;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -81,13 +82,35 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     Ok(())
 }
 
-/// Builds charts from per-decision accumulators: `actions[key][a]` holds
-/// class frequencies; missing folds are the remainder.
-fn finish(actions: HashMap<String, [Option<[f32; NUM_CLASSES]>; 4]>, players: usize) -> ChartSet {
+/// Per-decision accumulators: class frequencies per action (fold, call,
+/// raise, all-in), and which classes the data covers at all.
+type Accum = HashMap<String, ([Option<[f32; NUM_CLASSES]>; 4], [bool; NUM_CLASSES])>;
+
+/// An imported chart set.
+pub struct Import {
+    pub charts: ChartSet,
+    /// Spots left out, with the reason. Spots without a chart use the
+    /// built-in charts or the position-aware rules.
+    pub dropped: Vec<String>,
+}
+
+/// Builds charts from per-decision accumulators. Missing folds are the
+/// remainder. Classes the data doesn't cover (hands that never reach the
+/// spot under the solver's strategy) get the position-aware fallback
+/// rules, so e.g. an AI that slowplayed aces doesn't fold them later.
+///
+/// Spots where aces fold more than 5% are dropped: solver output for
+/// lines that are (almost) never reached can be untrained noise.
+fn finish(actions: Accum, players: usize, mut dropped: Vec<String>) -> Import {
+    let aces = HandClass::from_grid_index(0);
+    debug_assert_eq!(aces.to_string(), "AA");
     let mut charts = HashMap::new();
-    for (key, acts) in actions {
+    for (key, (acts, covered)) in actions {
         let freqs: Vec<Freqs> = (0..NUM_CLASSES)
             .map(|g| {
+                if !covered[g] {
+                    return fallback_freqs(&key, g, players);
+                }
                 let mut f = [0f32; 4];
                 for a in 1..4 {
                     f[a] = acts[a].map_or(0.0, |w| w[g].clamp(0.0, 1.0));
@@ -107,13 +130,18 @@ fn finish(actions: HashMap<String, [Option<[f32; NUM_CLASSES]>; 4]>, players: us
                 f
             })
             .collect();
+        if freqs[aces.grid_index()][0] > 0.05 {
+            dropped.push(format!("{key} (aces fold)"));
+            continue;
+        }
         charts.insert(key, Chart { freqs });
     }
-    ChartSet { charts, players }
+    dropped.sort();
+    Import { charts: ChartSet { charts, players }, dropped }
 }
 
 /// Imports a directory of per-decision line files.
-pub fn import_line_files(dir: &Path, players: usize, allin_bb: f64) -> Result<ChartSet, String> {
+pub fn import_line_files(dir: &Path, players: usize, allin_bb: f64) -> Result<Import, String> {
     let mut files = Vec::new();
     collect_files(dir, &mut files)?;
     if files.is_empty() {
@@ -160,11 +188,37 @@ pub fn import_line_files(dir: &Path, players: usize, allin_bb: f64) -> Result<Ch
     if actions.is_empty() {
         return Err(format!("no usable range files under {} ({skipped} skipped)", dir.display()));
     }
-    Ok(finish(actions, players))
+    // With a fold file, a class missing from every file never reaches the
+    // spot; without one, missing classes are folds.
+    let accum = actions
+        .into_iter()
+        .map(|(key, acts)| {
+            let covered: [bool; NUM_CLASSES] =
+                std::array::from_fn(|g| acts[0].is_none() || acts.iter().flatten().any(|w| w[g] > 1e-6));
+            (key, (acts, covered))
+        })
+        .collect();
+    Ok(finish(accum, players, Vec::new()))
+}
+
+/// Combo-weighted size of a class-weight vector.
+fn mass(w: &[f32; NUM_CLASSES]) -> f32 {
+    (0..NUM_CLASSES).map(|g| w[g] * HandClass::from_grid_index(g).num_combos() as f32).sum()
 }
 
 /// Imports a leaf tree (`SB/2.6bb/BB/Call/SB_range.txt` ...) for heads-up.
-pub fn import_leaf_tree(dir: &Path, allin_bb: f64) -> Result<ChartSet, String> {
+///
+/// A leaf tree only contains the lines somebody exported, usually those
+/// that reach a flop. A decision's frequencies are its child ranges divided
+/// by the range before it, so actions without exported lines (e.g. an
+/// all-in) would silently turn into folds. Spots where the deciding
+/// player's strongest hands aren't (almost) fully accounted for are
+/// therefore dropped, and listed in [`Import::dropped`].
+///
+/// When several histories map to the same spot key (e.g. facing a 5.2bb or
+/// a 7.8bb 3-bet), their frequencies are averaged, weighted by how often
+/// the opponent takes each line and by the decider's range in each.
+pub fn import_leaf_tree(dir: &Path, allin_bb: f64) -> Result<Import, String> {
     let mut leaves: Leaves = BTreeMap::new();
     fn walk(dir: &Path, path: &mut Vec<String>, leaves: &mut Leaves) -> Result<(), String> {
         let mut ranges = HashMap::new();
@@ -202,7 +256,38 @@ pub fn import_leaf_tree(dir: &Path, allin_bb: f64) -> Result<ChartSet, String> {
             .flatten()
         })
     };
-    let mut actions: HashMap<String, [Option<[f32; NUM_CLASSES]>; 4]> = HashMap::new();
+    // The range of the player acting at `line[i]` before that decision.
+    let range_before = |line: &[(String, String)], i: usize| -> Option<[f32; NUM_CLASSES]> {
+        let pos = &line[i].0;
+        match line[..i].iter().rposition(|(p, _)| p == pos) {
+            Some(j) => range_after(&line[..=j]),
+            None => Some([1.0; NUM_CLASSES]),
+        }
+    };
+    // Probability (ignoring card removal) that the opponents of `pos` took
+    // their actions in `hist`.
+    let opponent_weight = |hist: &[(String, String)], pos: &str| -> f32 {
+        let mut w = 1.0f32;
+        for j in 0..hist.len() {
+            if hist[j].0 == pos {
+                continue;
+            }
+            if let (Some(after), Some(before)) = (range_after(&hist[..=j]), range_before(hist, j)) {
+                let b = mass(&before);
+                if b > 0.0 {
+                    w *= mass(&after) / b;
+                }
+            }
+        }
+        w
+    };
+
+    struct Decision {
+        before: [f32; NUM_CLASSES],
+        weight: f32,
+        acts: [Option<[f32; NUM_CLASSES]>; 4],
+    }
+    let mut spots: BTreeMap<String, BTreeMap<Vec<(String, String)>, Decision>> = BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
     for line in leaves.keys() {
         for i in 0..line.len() {
@@ -212,19 +297,7 @@ pub fn import_leaf_tree(dir: &Path, allin_bb: f64) -> Result<ChartSet, String> {
             }
             let (pos, act) = &line[i];
             let Some(code) = action_code(act, allin_bb) else { continue };
-            let Some(after) = range_after(prefix) else { continue };
-            // The player's range before this decision.
-            let before = match line[..i].iter().rposition(|(p, _)| p == pos) {
-                Some(j) => match range_after(&line[..=j]) {
-                    Some(r) => r,
-                    None => continue,
-                },
-                None => [1.0; NUM_CLASSES],
-            };
-            let mut freq = [0f32; NUM_CLASSES];
-            for g in 0..NUM_CLASSES {
-                freq[g] = if before[g] > 1e-6 { (after[g] / before[g]).clamp(0.0, 1.0) } else { 0.0 };
-            }
+            let (Some(after), Some(before)) = (range_after(prefix), range_before(line, i)) else { continue };
             let key = format!(
                 "{}>{}",
                 line[..i]
@@ -234,20 +307,77 @@ pub fn import_leaf_tree(dir: &Path, allin_bb: f64) -> Result<ChartSet, String> {
                     .join(" "),
                 pos
             );
-            let slot = &mut actions.entry(key).or_insert([None; 4])[action_index(code)];
-            *slot = Some(match slot {
-                Some(prev) => {
-                    let mut sum = *prev;
-                    for g in 0..NUM_CLASSES {
-                        sum[g] += freq[g];
-                    }
-                    sum
-                }
-                None => freq,
+            let hist = line[..i].to_vec();
+            let d = spots.entry(key).or_default().entry(hist.clone()).or_insert_with(|| Decision {
+                before,
+                weight: opponent_weight(&hist, pos),
+                acts: [None; 4],
             });
+            // Several sizes of one action at the same decision add up.
+            let slot = d.acts[action_index(code)].get_or_insert([0.0; NUM_CLASSES]);
+            for g in 0..NUM_CLASSES {
+                if before[g] > 1e-6 {
+                    slot[g] += (after[g] / before[g]).clamp(0.0, 1.0);
+                }
+            }
         }
     }
-    Ok(finish(actions, 2))
+
+    let score = strength::class_score();
+    let mut actions: Accum = HashMap::new();
+    let mut dropped = Vec::new();
+    for (key, hists) in spots {
+        // Merge histories: weight each class by P(history) * P(class reaches it).
+        let mut before = [0f32; NUM_CLASSES];
+        let mut acc = [[0f32; NUM_CLASSES]; 4];
+        let mut present = [false; 4];
+        for d in hists.values() {
+            for g in 0..NUM_CLASSES {
+                let w = d.weight * d.before[g];
+                before[g] += w;
+                for a in 0..4 {
+                    if let Some(f) = &d.acts[a] {
+                        acc[a][g] += w * f[g];
+                        present[a] = true;
+                    }
+                }
+            }
+        }
+        let mut merged: [Option<[f32; NUM_CLASSES]>; 4] = [None; 4];
+        for a in 0..4 {
+            if present[a] {
+                let mut f = [0f32; NUM_CLASSES];
+                for g in 0..NUM_CLASSES {
+                    if before[g] > 1e-9 {
+                        f[g] = (acc[a][g] / before[g]).clamp(0.0, 1.0);
+                    }
+                }
+                merged[a] = Some(f);
+            }
+        }
+        // Completeness: the strongest 10% of the decider's range (by
+        // combos) never folds, so its frequencies must add up to ~1.
+        let mut order: Vec<usize> = (0..NUM_CLASSES).filter(|&g| before[g] > 1e-9).collect();
+        order.sort_by(|&x, &y| score[y].total_cmp(&score[x]));
+        let total = mass(&before);
+        let (mut cum, mut covered) = (0f32, 0f32);
+        for &g in &order {
+            if cum >= 0.1 * total {
+                break;
+            }
+            let m = before[g] * HandClass::from_grid_index(g).num_combos() as f32;
+            let known: f32 = (1..4).map(|a| merged[a].map_or(0.0, |f| f[g])).sum();
+            cum += m;
+            covered += m * known.min(1.0);
+        }
+        if cum > 0.0 && covered / cum < 0.9 {
+            dropped.push(format!("{key} (lines missing)"));
+            continue;
+        }
+        let covered = std::array::from_fn(|g| before[g] > 1e-9);
+        actions.insert(key, (merged, covered));
+    }
+    Ok(finish(actions, 2, dropped))
 }
 
 #[cfg(test)]
@@ -274,7 +404,7 @@ mod tests {
         fs::write(d.join("UTG/UTG_FOLD.txt"), "72o:1").unwrap();
         fs::write(d.join("UTG_2.5bb_MP_Call_BB_13.0bb.txt"), "AA:0.5,KK:1").unwrap();
         fs::write(d.join("UTG_2.5bb_MP_Call_BB_Call.txt"), "AA:0.5,QQ:1").unwrap();
-        let cs = import_line_files(&d, 6, 90.0).unwrap();
+        let cs = import_line_files(&d, 6, 90.0).unwrap().charts;
         let open = cs.get(">UTG").unwrap();
         assert_eq!(open.class_freqs(g("AA")), [0.0, 0.0, 1.0, 0.0]);
         assert_eq!(open.class_freqs(g("72o")), [1.0, 0.0, 0.0, 0.0]);
@@ -289,30 +419,61 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    fn leaf(d: &Path, path: &str, sb: &str, bb: &str) {
+        let p = d.join(path);
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("SB_range.txt"), sb).unwrap();
+        fs::write(p.join("BB_range.txt"), bb).unwrap();
+    }
+
+    /// A small but complete tree: SB opens AA, KK and half of QQ and limps
+    /// the rest; BB 3-bets AA to 7.8bb, KK/QQ to 5.2bb and calls a wide
+    /// range; SB calls 3-bets with AA/KK, plus QQ against the small size.
+    fn tree(d: &Path, sb_calls_big_3bet: &str) {
+        let bb_call = "JJ-22, A2s+, A2o+, K2s+, K2o+, Q2s+, Q2o+, J2s+, T2s+";
+        leaf(d, "SB/Call/BB/Check", "any, AA:0, KK:0, QQ:0.5", "any");
+        leaf(d, "SB/2.6bb/BB/Call", "AA, KK, QQ:0.5", bb_call);
+        leaf(d, "SB/2.6bb/BB/7.8bb/SB/Call", sb_calls_big_3bet, "AA");
+        leaf(d, "SB/2.6bb/BB/5.2bb/SB/Call", "AA, KK, QQ:0.5", "KK, QQ");
+    }
+
     #[test]
     fn leaf_tree() {
         let d = tmpdir("leaves");
-        let leaf = |path: &str, sb: &str, bb: &str| {
-            let p = d.join(path);
-            fs::create_dir_all(&p).unwrap();
-            fs::write(p.join("SB_range.txt"), sb).unwrap();
-            fs::write(p.join("BB_range.txt"), bb).unwrap();
-        };
-        // SB opens AA,KK,QQ (QQ half the time); BB calls with QQ, 3-bets AA
-        // (to 7.8bb) and KK (to 5.2bb); SB calls the 3-bet with everything
-        // it opened except QQ.
-        leaf("SB/2.6bb/BB/Call", "AA:1,KK:1,QQ:0.5", "QQ:1,JJ:1");
-        leaf("SB/2.6bb/BB/7.8bb/SB/Call", "AA:1,KK:1", "AA:1");
-        leaf("SB/2.6bb/BB/5.2bb/SB/Call", "AA:1,KK:1", "KK:1");
-        let cs = import_leaf_tree(&d, 90.0).unwrap();
-        assert_eq!(cs.get(">SB").unwrap().class_freqs(g("QQ")), [0.5, 0.0, 0.5, 0.0]);
+        tree(&d, "AA, KK");
+        let imp = import_leaf_tree(&d, 90.0).unwrap();
+        assert!(imp.dropped.is_empty(), "{:?}", imp.dropped);
+        let cs = imp.charts;
+        let close = |a: [f32; 4], b: [f32; 4]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4);
+        assert!(close(cs.get(">SB").unwrap().class_freqs(g("QQ")), [0.0, 0.5, 0.5, 0.0]));
+        assert!(close(cs.get(">SB").unwrap().class_freqs(g("72o")), [0.0, 1.0, 0.0, 0.0]));
         let vs_open = cs.get("SB:R>BB").unwrap();
-        assert_eq!(vs_open.class_freqs(g("AA")), [0.0, 0.0, 1.0, 0.0]);
-        assert_eq!(vs_open.class_freqs(g("KK")), [0.0, 0.0, 1.0, 0.0]);
-        assert_eq!(vs_open.class_freqs(g("QQ")), [0.0, 1.0, 0.0, 0.0]);
-        // SB vs 3-bet: AA/KK always call (range after = range before).
+        assert!(close(vs_open.class_freqs(g("AA")), [0.0, 0.0, 1.0, 0.0]));
+        assert!(close(vs_open.class_freqs(g("QQ")), [0.0, 0.0, 1.0, 0.0]));
+        assert!(close(vs_open.class_freqs(g("JJ")), [0.0, 1.0, 0.0, 0.0]));
+        assert!(close(vs_open.class_freqs(g("72o")), [1.0, 0.0, 0.0, 0.0]));
+        // SB vs a 3-bet: BB uses the small size twice as often (12 combos
+        // vs 6), so QQ (which only calls the small size) calls 2/3.
         let vs3 = cs.get("SB:R BB:R>SB").unwrap();
-        assert_eq!(vs3.class_freqs(g("KK")), [0.0, 1.0, 0.0, 0.0]);
+        assert!(close(vs3.class_freqs(g("KK")), [0.0, 1.0, 0.0, 0.0]));
+        assert!(
+            close(vs3.class_freqs(g("QQ")), [1.0 / 3.0, 2.0 / 3.0, 0.0, 0.0]),
+            "{:?}",
+            vs3.class_freqs(g("QQ"))
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn leaf_tree_drops_spots_with_missing_lines() {
+        // SB's AA goes all-in against the big 3-bet, a line the export
+        // doesn't contain: AA would look like a fold, so the spot is dropped.
+        let d = tmpdir("leaves-missing");
+        tree(&d, "KK");
+        let imp = import_leaf_tree(&d, 90.0).unwrap();
+        assert_eq!(imp.dropped, vec!["SB:R BB:R>SB (lines missing)".to_string()]);
+        assert!(imp.charts.get("SB:R BB:R>SB").is_none());
+        assert!(imp.charts.get("SB:R>BB").is_some());
         let _ = fs::remove_dir_all(&d);
     }
 }

@@ -129,9 +129,9 @@ pub struct TrainerConfig {
     pub rake_pct: f64,
     /// Rake cap in big blinds.
     pub rake_cap_bb: f64,
-    /// Preflop chart files per table size. When unset, built-in charts
-    /// (heads-up) or position-aware fallback rules (6-max, 9-max) are used.
-    /// `poker-trainer fetch-charts` fills these in.
+    /// Optional preflop chart files per table size (see `import-charts`).
+    /// Their spots replace the built-in charts' (solver-based heads-up and
+    /// 6-max charts); spots no chart covers use position-aware rules.
     pub charts_hu: Option<String>,
     pub charts_6max: Option<String>,
     pub charts_9max: Option<String>,

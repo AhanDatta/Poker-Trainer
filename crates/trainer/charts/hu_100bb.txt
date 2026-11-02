@@ -1,10 +1,10 @@
 # Heads-up 100bb preflop charts (no rake).
 #
-# These are hand-written APPROXIMATIONS of solver strategies, used to drive
-# the AI opponents and to build the starting ranges for postflop solves.
-# Replace them with charts you trust (e.g. exported from a preflop solver):
-# keep the same section names and point `charts_file` in the config to your
-# file.
+# These are hand-written APPROXIMATIONS of solver strategies. The built-in
+# heads-up charts use the solver charts in hu_100bb_solver.txt for the spots
+# those cover (SB open, BB vs limp, BB vs open) and these for the rest.
+# To use your own charts, point `charts_hu` in the config to a file in this
+# format: its sections replace the built-in ones.
 #
 # Sections are keyed by the preflop line so far and the deciding position:
 #   [SB:R BB:R>SB]  = SB opened, BB 3-bet, SB to act.

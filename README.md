@@ -32,7 +32,7 @@ against a solver.
 | Flop solving: exact (default) or fast | ✅ |
 | Villain range in review: GTO charts / villain's actual style range / both | ✅ |
 | Rake (no flop, no drop, capped) | ✅ |
-| Solver-based preflop charts (heads-up, 6-max) via `fetch-charts` | ✅ |
+| Solver-based preflop charts (heads-up, 6-max), built in | ✅ |
 | Preflop grading | ❌ not yet (charts drive the AIs and the starting ranges) |
 
 ## Quick start
@@ -44,16 +44,6 @@ cargo run --release
 ```
 
 Always use `--release`: the solver is far slower in a debug build.
-
-For solver-based preflop charts (recommended), run this once. It downloads
-the public range collection of
-[bupticybee/TexasSolverGPU](https://github.com/bupticybee/TexasSolverGPU)
-(only its `ranges/` folder, ~6 MB, via git), converts it, and points your
-config at it:
-
-```bash
-cargo run --release -- fetch-charts
-```
 
 Other commands:
 
@@ -180,19 +170,28 @@ Chart files are plain text sections keyed by the position-labelled preflop
 line and the deciding position, e.g. `[UTG:R BTN:C>BB]`, each with `allin:`,
 `raise:` and `call:` ranges.
 
-* `fetch-charts` imports **solver-based** charts:
-  * heads-up 100bb, reconstructed into per-decision frequencies from leaf
-    ranges;
-  * 6-max 100bb (2.5x opens, 5% rake), 510 spots.
-
-  The data stays on your machine: its repository doesn't state a license for
-  the range files, so check its terms before redistributing them.
-* Without imported charts, heads-up uses hand-written approximations
-  (`crates/trainer/charts/hu_100bb.txt`). 6-max and 9-max use position-aware
-  fallback rules (open percentages by position, defense vs. opens, 3-/4-bets,
-  all-ins), which also cover any spot missing from an imported chart.
-* `import-charts` converts other collections in either supported layout:
-  per-decision line files, or leaf range trees.
+* **Built-in solver charts** (`crates/trainer/charts/`), converted from the
+  ranges of [bupticybee/TexasSolverGPU](https://github.com/bupticybee/TexasSolverGPU)
+  and redistributed with its owner's
+  [permission](https://github.com/bupticybee/TexasSolverGPU/issues/11):
+  * **6-max 100bb** (2.5bb opens, 5% rake): 506 spots. Four spots deep in
+    5-way all-in lines were left out because the data has aces folding
+    there (untrained, practically unreachable nodes).
+  * **Heads-up 100bb**: the export only contains lines that reach a flop, so
+    only the spots it covers completely are used (SB open, BB vs. limp, BB
+    vs. open). 3-bets and beyond use hand-written approximations
+    (`hu_100bb.txt`), since there the export's missing all-in lines would
+    turn into folds.
+  * Hands that never reach a spot under the solver's strategy (e.g. aces
+    after flatting) use position-aware rules there, so an AI that
+    slow-played them doesn't fold them later.
+* **9-max** uses position-aware fallback rules (open percentages by
+  position, defense vs. opens, 3-/4-bets, all-ins), which also cover any
+  spot no chart has.
+* **Your own charts:** `import-charts` converts range collections in either
+  supported layout (per-decision line files, or leaf range trees). Point
+  `charts_hu` / `charts_6max` / `charts_9max` at the result; its spots
+  replace the built-in ones.
 
 ## Performance
 
@@ -265,7 +264,7 @@ hero_position = "alternate"  # alternate (rotate) | random | sb | bb
 stack_bb = 100.0
 rake_pct = 5.0               # 0 = no rake
 rake_cap_bb = 3.0
-charts_6max = "charts/6max_100bb.txt"   # set by fetch-charts (also charts_hu, charts_9max)
+charts_6max = "my_6max.txt"  # optional: your own charts (also charts_hu, charts_9max)
 
 [solver]
 flop_mode = "exact"          # exact | fast

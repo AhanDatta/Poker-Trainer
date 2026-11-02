@@ -139,21 +139,35 @@ pub struct ChartSet {
 }
 
 const HU_100BB: &str = include_str!("../charts/hu_100bb.txt");
+const HU_100BB_SOLVER: &str = include_str!("../charts/hu_100bb_solver.txt");
+const SIX_MAX_100BB_SOLVER: &str = include_str!("../charts/6max_100bb_solver.txt");
 
 impl ChartSet {
-    /// Built-in heads-up 100bb charts.
+    /// The hand-written heads-up 100bb charts.
     pub fn hu_100bb() -> ChartSet {
         ChartSet::parse(HU_100BB, 2).expect("built-in charts parse")
     }
 
-    /// Built-in charts for a table size: heads-up charts for 2 players;
-    /// position-aware fallback rules (no explicit charts) otherwise.
+    /// Built-in charts for a table size:
+    /// * heads-up: solver charts for the first decisions (SB open, BB vs
+    ///   limp, BB vs open), hand-written charts for 3-bets and beyond;
+    /// * 3-6 players: solver-generated 6-max 100bb charts;
+    /// * larger tables: none (position-aware fallback rules).
+    ///
+    /// Spots without a chart always use the fallback rules.
     pub fn builtin(players: usize) -> ChartSet {
-        if players == 2 {
-            ChartSet::hu_100bb()
-        } else {
-            ChartSet { charts: HashMap::new(), players }
+        match players {
+            0..=2 => ChartSet::hu_100bb()
+                .overlay(ChartSet::parse(HU_100BB_SOLVER, 2).expect("built-in charts parse")),
+            3..=6 => ChartSet::parse(SIX_MAX_100BB_SOLVER, players).expect("built-in charts parse"),
+            _ => ChartSet { charts: HashMap::new(), players },
         }
+    }
+
+    /// Adds `other`'s spots, replacing spots that both define.
+    pub fn overlay(mut self, other: ChartSet) -> ChartSet {
+        self.charts.extend(other.charts);
+        self
     }
 
     /// Writes the charts in the text format read by [`ChartSet::parse`].
@@ -500,6 +514,43 @@ mod tests {
         // BB vs open: A5s mixes raise/call.
         let f = cs.get("SB:R>BB").unwrap().class_freqs(class("A5s"));
         assert!((f[2] - 0.5).abs() < 1e-6 && (f[1] - 0.5).abs() < 1e-6, "{f:?}");
+    }
+
+    #[test]
+    fn builtin_solver_charts() {
+        // Heads-up: solver spots for the first decisions, hand-written beyond.
+        let hu = ChartSet::builtin(2);
+        let hand = ChartSet::hu_100bb();
+        let solver = ChartSet::parse(HU_100BB_SOLVER, 2).unwrap();
+        assert_eq!(solver.charts.len(), 3);
+        for key in [">SB", "SB:R>BB", "SB:C>BB"] {
+            let (a, b) = (hu.get(key).unwrap(), solver.get(key).unwrap());
+            assert_eq!(a.freqs, b.freqs, "{key}");
+        }
+        assert_eq!(hu.get("SB:R BB:R>SB").unwrap().freqs, hand.get("SB:R BB:R>SB").unwrap().freqs);
+        // The solver's SB opens (raise or limp) almost every hand.
+        let open = hu.get(">SB").unwrap();
+        let play: f32 = HandClass::all()
+            .map(|c| (1.0 - open.class_freqs(c.grid_index())[0]) * c.num_combos() as f32)
+            .sum::<f32>()
+            / 1326.0;
+        assert!((play - 0.905).abs() < 0.01, "{play}");
+        // 6-max: complete solver charts.
+        let six = ChartSet::builtin(6);
+        assert_eq!(six.charts.len(), 506);
+        assert!(ChartSet::builtin(9).charts.is_empty());
+        // Every built-in spot is a distribution, and aces never fold.
+        for cs in [&hu, &six] {
+            for (key, chart) in &cs.charts {
+                for (g, f) in chart.freqs.iter().enumerate() {
+                    assert!(
+                        f.iter().all(|&x| x >= 0.0) && (f.iter().sum::<f32>() - 1.0).abs() < 1e-4,
+                        "{key} {g}"
+                    );
+                }
+                assert!(chart.class_freqs(class("AA"))[0] <= 0.05, "{key}: AA folds");
+            }
+        }
     }
 
     #[test]
