@@ -16,7 +16,8 @@ pub enum HeroPosition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FlopMode {
-    /// Stratified sample of turn/river cards: seconds, approximate.
+    /// Every turn card but a stratified sample of river cards: ~4x faster
+    /// than exact, slightly approximate.
     Fast,
     /// Every turn and river card: exact, but large and slow.
     Exact,
@@ -73,9 +74,11 @@ impl Default for SolverSettings {
         };
         SolverSettings {
             enabled: true,
-            flop_mode: FlopMode::Fast,
-            flop_turn_samples: 8,
-            flop_river_samples: 6,
+            flop_mode: FlopMode::Exact,
+            // Fast mode: every turn card, a stratified sample of rivers.
+            // (Sampling turns too was measured to be much less accurate.)
+            flop_turn_samples: 49,
+            flop_river_samples: 10,
             villain_range: VillainRange::Gto,
             target_exploitability_pct: 0.5,
             max_iterations: 400,
@@ -110,8 +113,12 @@ pub struct TrainerConfig {
     pub rake_pct: f64,
     /// Rake cap in big blinds.
     pub rake_cap_bb: f64,
-    /// Preflop chart file (built-in heads-up 100bb charts when unset).
-    pub charts_file: Option<String>,
+    /// Preflop chart files per table size. When unset, built-in charts
+    /// (heads-up) or position-aware fallback rules (6-max, 9-max) are used.
+    /// `poker-trainer fetch-charts` fills these in.
+    pub charts_hu: Option<String>,
+    pub charts_6max: Option<String>,
+    pub charts_9max: Option<String>,
     /// Milliseconds between AI actions in the UI.
     pub ai_delay_ms: u64,
     /// Random seed (unset = random).
@@ -133,7 +140,9 @@ impl Default for TrainerConfig {
             hero_position: HeroPosition::Alternate,
             rake_pct: 0.0,
             rake_cap_bb: 3.0,
-            charts_file: None,
+            charts_hu: None,
+            charts_6max: None,
+            charts_9max: None,
             ai_delay_ms: 450,
             seed: None,
             menu: BetMenu::default(),
@@ -173,6 +182,15 @@ impl TrainerConfig {
             return Err(format!("unknown opponent style {:?}", self.opponent));
         }
         Ok(())
+    }
+
+    /// Chart file configured for a table size.
+    pub fn charts_for(&self, players: usize) -> Option<&String> {
+        match players {
+            0..=2 => self.charts_hu.as_ref(),
+            3..=6 => self.charts_6max.as_ref(),
+            _ => self.charts_9max.as_ref(),
+        }
     }
 
     /// All available styles (presets + custom).

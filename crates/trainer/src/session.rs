@@ -58,12 +58,12 @@ impl Stats {
 impl Session {
     pub fn new(config: TrainerConfig) -> Result<Session, String> {
         config.validate()?;
-        let charts = match &config.charts_file {
+        let charts = match config.charts_for(config.players) {
             Some(path) => {
                 let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-                ChartSet::parse(&text).map_err(|e| format!("{path}: {e}"))?
+                ChartSet::parse(&text, config.players).map_err(|e| format!("{path}: {e}"))?
             }
-            None => ChartSet::hu_100bb(),
+            None => ChartSet::builtin(config.players),
         };
         let rng = match config.seed {
             Some(s) => StdRng::seed_from_u64(s),

@@ -12,6 +12,7 @@
 #![allow(clippy::needless_range_loop)]
 
 pub mod ai;
+pub mod charts_import;
 pub mod config;
 pub mod fmt;
 pub mod hand;

@@ -2,7 +2,7 @@
 
 use crate::ai::{concrete_preflop, AiPlayer};
 use crate::fmt::{action_verb, bb, ActionContext};
-use crate::preflop::{availability, chart_policy, line_key, line_range, ChartSet, PreDecision};
+use crate::preflop::{availability, chart_policy, line_range, spot_key, ChartSet, PreDecision};
 use crate::profiles::Profile;
 use crate::review::{Review, ReviewSetup, Snapshot};
 use holdem::game::{Phase, Settlement};
@@ -198,9 +198,11 @@ impl LiveHand {
         let ai = self.ais[p].as_ref().expect("AI seat");
         if self.state.street == Street::Preflop {
             let avail = availability(&self.state, &self.menu).expect("decision");
+            let position = self.state.position_name(p).to_string();
             let d = PreDecision {
                 seat: p,
-                key: line_key(&self.preflop),
+                key: spot_key(&self.preflop, &position),
+                position,
                 avail: avail.clone(),
                 action: crate::preflop::PreAction::Fold,
             };
@@ -217,8 +219,9 @@ impl LiveHand {
         if before.street == Street::Preflop {
             if let Some(avail) = availability(&before, &self.menu) {
                 if let Some(abs) = avail.classify(action) {
-                    let key = line_key(&self.preflop);
-                    self.preflop.push(PreDecision { seat: p, key, avail, action: abs });
+                    let position = before.position_name(p).to_string();
+                    let key = spot_key(&self.preflop, &position);
+                    self.preflop.push(PreDecision { seat: p, position, key, avail, action: abs });
                 }
             }
         }

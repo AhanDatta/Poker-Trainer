@@ -68,7 +68,7 @@ proptest! {
     /// Any style adjustment of any chart spot is a valid distribution over
     /// the available actions.
     #[test]
-    fn style_adjustments_are_distributions(p in profile(), avail in availability(), key in prop::sample::select(vec!["-", "R", "RR", "RRR", "C", "CR", "A", "RRRA", "XYZ"])) {
+    fn style_adjustments_are_distributions(p in profile(), avail in availability(), key in prop::sample::select(vec![">SB", "SB:R>BB", "SB:R BB:R>SB", "SB:R BB:R SB:R>BB", "SB:C>BB", "SB:C BB:R>SB", "SB:A>BB", "UTG:R BTN:C>BB", ">CO", "garbage"])) {
         let charts = ChartSet::hu_100bb();
         let base: Vec<Freqs> = (0..NUM_CLASSES).map(|g| charts.freqs(key, g, &avail).0).collect();
         for f in &base {

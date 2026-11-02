@@ -284,7 +284,7 @@ mod tests {
     fn styles_change_ranges() {
         let charts = ChartSet::hu_100bb();
         let avail = open_avail();
-        let base: Vec<Freqs> = (0..NUM_CLASSES).map(|g| charts.freqs("-", g, &avail).0).collect();
+        let base: Vec<Freqs> = (0..NUM_CLASSES).map(|g| charts.freqs(">SB", g, &avail).0).collect();
         let nit = Profile::nit().adjust_preflop(&base, &avail);
         let station = Profile::station().adjust_preflop(&base, &avail);
         let reg = Profile::reg().adjust_preflop(&base, &avail);

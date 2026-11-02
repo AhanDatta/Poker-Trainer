@@ -1,6 +1,7 @@
 //! `poker-trainer`: terminal NLHE trainer.
 
 mod app;
+mod charts_cmd;
 mod selfplay;
 mod ui;
 
@@ -41,6 +42,31 @@ enum Cmd {
         #[arg(default_value = DEFAULT_CONFIG)]
         path: String,
     },
+    /// Convert a downloaded preflop range collection into a chart file.
+    ImportCharts {
+        /// Directory with the ranges.
+        dir: String,
+        /// "lines" (one file per decision, named by the line) or "tree"
+        /// (leaf directories with *_range.txt files).
+        #[arg(long, default_value = "lines")]
+        format: String,
+        /// Table size the ranges are for.
+        #[arg(long, default_value_t = 6)]
+        players: usize,
+        /// Raises of at least this many big blinds count as all-in.
+        #[arg(long, default_value_t = 90.0)]
+        allin_bb: f64,
+        /// Output chart file.
+        #[arg(short, long, default_value = "charts.txt")]
+        out: String,
+    },
+    /// Download public solver-based preflop ranges (heads-up and 6-max,
+    /// 100bb) from GitHub, import them and update the config to use them.
+    FetchCharts {
+        /// Where to store the download and the imported charts.
+        #[arg(long, default_value = "charts")]
+        dir: String,
+    },
     /// Headless: play hands with a scripted hero and print the solver review
     /// (useful to check performance on your machine).
     Selfplay {
@@ -78,6 +104,13 @@ fn main() -> Result<()> {
             std::fs::write(path, TrainerConfig::default().to_toml())?;
             println!("Wrote {path}");
             Ok(())
+        }
+        Some(Cmd::ImportCharts { dir, format, players, allin_bb, out }) => {
+            charts_cmd::import(dir, format, *players, *allin_bb, out)
+        }
+        Some(Cmd::FetchCharts { dir }) => {
+            let path = cli.config.clone().unwrap_or_else(|| DEFAULT_CONFIG.to_string());
+            charts_cmd::fetch(dir, &path)
         }
         Some(Cmd::Selfplay { hands, style }) => {
             let (mut cfg, _) = load_config(&cli)?;

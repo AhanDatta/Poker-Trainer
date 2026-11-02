@@ -171,7 +171,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
             }
             SetupItem::FlopSolve => match cfg.solver.flop_mode {
                 FlopMode::Fast => format!(
-                    "Fast — {} turn × {} river sampled cards (seconds, approximate)",
+                    "Fast — {} turn × {} sampled river cards (~4x faster, approximate)",
                     cfg.solver.flop_turn_samples, cfg.solver.flop_river_samples
                 ),
                 FlopMode::Exact => {

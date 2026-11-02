@@ -2,8 +2,12 @@
 //!
 //! The preflop menu offers at most four actions per decision: fold,
 //! check/call ("passive"), the single menu raise, and all-in. Charts give a
-//! frequency for each of them per hand class, keyed by the preflop line
-//! (`"-"`, `"R"`, `"RR"`, `"C"`, `"CR"`, ...).
+//! frequency for each of them per hand class, keyed by the *spot*: the
+//! position-labelled line so far and the deciding position, e.g.
+//! `"UTG:R BTN:C>BB"` (UTG opened, BTN called, BB to act) or `">SB"`
+//! (SB first to act heads-up). Folds are only listed for players who had
+//! already put money in voluntarily, so folds "to the opener" don't change
+//! the key. Spots without a chart fall back to position-aware rules.
 
 use crate::strength;
 use holdem::combo::{HandClass, COMBO_CLASS, NUM_CLASSES, NUM_COMBOS};
@@ -126,10 +130,12 @@ impl Chart {
     }
 }
 
-/// A set of charts keyed by preflop line.
+/// A set of charts keyed by spot, for one table size.
 #[derive(Clone, Debug)]
 pub struct ChartSet {
     pub charts: HashMap<String, Chart>,
+    /// Table size the charts are meant for (used by the fallback rules).
+    pub players: usize,
 }
 
 const HU_100BB: &str = include_str!("../charts/hu_100bb.txt");
@@ -137,10 +143,54 @@ const HU_100BB: &str = include_str!("../charts/hu_100bb.txt");
 impl ChartSet {
     /// Built-in heads-up 100bb charts.
     pub fn hu_100bb() -> ChartSet {
-        ChartSet::parse(HU_100BB).expect("built-in charts parse")
+        ChartSet::parse(HU_100BB, 2).expect("built-in charts parse")
     }
 
-    pub fn parse(text: &str) -> Result<ChartSet, String> {
+    /// Built-in charts for a table size: heads-up charts for 2 players;
+    /// position-aware fallback rules (no explicit charts) otherwise.
+    pub fn builtin(players: usize) -> ChartSet {
+        if players == 2 {
+            ChartSet::hu_100bb()
+        } else {
+            ChartSet { charts: HashMap::new(), players }
+        }
+    }
+
+    /// Writes the charts in the text format read by [`ChartSet::parse`].
+    pub fn to_text(&self, header: &str) -> String {
+        let mut out = String::new();
+        for line in header.lines() {
+            out.push_str(&format!("# {line}\n"));
+        }
+        let mut keys: Vec<&String> = self.charts.keys().collect();
+        keys.sort_by_key(|k| (k.matches(':').count(), k.to_string()));
+        for key in keys {
+            let chart = &self.charts[key];
+            out.push_str(&format!("\n[{key}]\n"));
+            for (label, idx) in [("allin", 3), ("raise", 2), ("call", 1)] {
+                let parts: Vec<String> = chart
+                    .freqs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, f)| f[idx] > 1e-4)
+                    .map(|(g, f)| {
+                        let class = HandClass::from_grid_index(g);
+                        if f[idx] > 0.9999 {
+                            class.to_string()
+                        } else {
+                            format!("{class}:{:.4}", f[idx])
+                        }
+                    })
+                    .collect();
+                if !parts.is_empty() {
+                    out.push_str(&format!("{label}: {}\n", parts.join(", ")));
+                }
+            }
+        }
+        out
+    }
+
+    pub fn parse(text: &str, players: usize) -> Result<ChartSet, String> {
         let mut charts = HashMap::new();
         let mut current: Option<(String, [Option<Range>; 3])> = None;
         let finish = |cur: Option<(String, [Option<Range>; 3])>, charts: &mut HashMap<String, Chart>| {
@@ -185,7 +235,7 @@ impl ChartSet {
             slots[slot] = Some(range);
         }
         finish(current.take(), &mut charts);
-        Ok(ChartSet { charts })
+        Ok(ChartSet { charts, players })
     }
 
     pub fn get(&self, key: &str) -> Option<&Chart> {
@@ -198,31 +248,130 @@ impl ChartSet {
     pub fn freqs(&self, key: &str, class: usize, avail: &Availability) -> (Freqs, bool) {
         match self.get(key) {
             Some(chart) => (avail.remap(chart.class_freqs(class)), true),
-            None => (avail.remap(fallback_freqs(key, class)), false),
+            None => (avail.remap(fallback_freqs(key, class, self.players)), false),
         }
     }
 }
 
-/// Strength-threshold strategy for spots without a chart.
-fn fallback_freqs(key: &str, class: usize) -> Freqs {
-    let rank = strength::class_rank()[class];
-    if key.ends_with('A') {
-        // Facing an all-in: call with roughly the top 10%.
-        return if rank > 0.90 { [0.0, 1.0, 0.0, 0.0] } else { [1.0, 0.0, 0.0, 0.0] };
+/// A parsed spot key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spot {
+    /// `(position, action code)` for each action in the line.
+    pub line: Vec<(String, char)>,
+    /// Deciding position.
+    pub position: String,
+}
+
+impl Spot {
+    pub fn parse(key: &str) -> Option<Spot> {
+        let (line, pos) = key.rsplit_once('>')?;
+        let line = line
+            .split_whitespace()
+            .map(|t| {
+                let (p, a) = t.rsplit_once(':')?;
+                Some((p.to_string(), a.chars().next()?))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Spot { line, position: pos.trim().to_string() })
     }
-    let raises = key.chars().filter(|&c| c == 'R').count();
-    let (raise_cut, call_cut) = match raises {
-        0 => (0.75, 0.25),
-        1 => (0.90, 0.45),
-        2 => (0.95, 0.80),
-        _ => (0.97, 0.90),
+}
+
+/// Typical open-raise frequency by position (fallback rules).
+pub fn rfi_pct(players: usize, pos: &str) -> f32 {
+    match players {
+        0..=2 => {
+            if pos == "SB" {
+                0.82
+            } else {
+                0.5
+            }
+        }
+        3..=6 => match pos {
+            "UTG" => 0.17,
+            "HJ" => 0.21,
+            "CO" => 0.28,
+            "BTN" => 0.44,
+            "SB" => 0.40,
+            _ => 0.25,
+        },
+        _ => match pos {
+            "UTG" => 0.11,
+            "UTG+1" => 0.12,
+            "UTG+2" => 0.13,
+            "MP" => 0.14,
+            "LJ" => 0.16,
+            "HJ" => 0.19,
+            "CO" => 0.26,
+            "BTN" => 0.42,
+            "SB" => 0.38,
+            _ => 0.2,
+        },
+    }
+}
+
+/// Smooth 0..1 step: the share of `[threshold - w, threshold + w]` that
+/// `rank` has passed. Mixes hands at the edge of a range.
+fn ramp(rank: f32, threshold: f32) -> f32 {
+    const W: f32 = 0.012;
+    ((rank - (threshold - W)) / (2.0 * W)).clamp(0.0, 1.0)
+}
+
+/// Position-aware rules for spots without a chart: hands are ranked by
+/// preflop strength and each spot type continues with a fraction of hands
+/// that depends on positions and the action so far.
+pub fn fallback_freqs(key: &str, class: usize, players: usize) -> Freqs {
+    let rank = strength::class_rank()[class];
+    let Some(spot) = Spot::parse(key) else {
+        return [1.0, 0.0, 0.0, 0.0];
     };
-    if rank > raise_cut {
-        [0.0, 0.0, 1.0, 0.0]
-    } else if rank > call_cut {
-        [0.0, 1.0, 0.0, 0.0]
+    let aggressive: Vec<&(String, char)> = spot.line.iter().filter(|(_, a)| *a == 'R' || *a == 'A').collect();
+    let n_raises = aggressive.len();
+    let facing_allin = aggressive.last().is_some_and(|(_, a)| *a == 'A');
+    let limpers = spot.line.iter().take_while(|(_, a)| *a == 'C').count();
+    let last_raise = spot.line.iter().rposition(|(_, a)| *a == 'R' || *a == 'A');
+    let callers_after =
+        last_raise.map_or(0, |i| spot.line[i + 1..].iter().filter(|(_, a)| *a == 'C').count());
+    let pos = spot.position.as_str();
+    // (raise share, call share) of all hands, best hands raising.
+    let (raise, call, raise_is_allin) = if facing_allin {
+        let x = match n_raises {
+            1 => 0.10,
+            2 => 0.06,
+            _ => 0.04,
+        };
+        (0.0, x * if callers_after > 0 { 0.7 } else { 1.0 }, false)
     } else {
-        [1.0, 0.0, 0.0, 0.0]
+        match n_raises {
+            0 if limpers == 0 => (rfi_pct(players, pos), 0.0, false),
+            0 if pos == "BB" => (0.25, 1.0, false),
+            0 => (0.10, 0.10, false),
+            1 => {
+                let opener = aggressive[0].0.as_str();
+                let o = rfi_pct(players, opener);
+                let mut t = (0.3 * o + 0.02).clamp(0.03, 0.14);
+                let mut c = match pos {
+                    "BB" => (1.1 * o).clamp(0.10, 0.50),
+                    "SB" => 0.25 * o,
+                    _ => (0.45 * o).clamp(0.03, 0.18),
+                };
+                if callers_after > 0 {
+                    t *= 0.8;
+                    c *= 0.8;
+                }
+                (t, c, false)
+            }
+            2 => (0.025, 0.07, false),
+            3 => (0.02, 0.012, true),
+            _ => (0.015, 0.0, true),
+        }
+    };
+    let r = if raise > 0.0 { ramp(rank, 1.0 - raise) } else { 0.0 };
+    let c = if call > 0.0 { (ramp(rank, 1.0 - raise - call) - r).max(0.0) } else { 0.0 };
+    let f = (1.0 - r - c).max(0.0);
+    if raise_is_allin {
+        [f, c, 0.0, r]
+    } else {
+        [f, c, r, 0.0]
     }
 }
 
@@ -230,19 +379,30 @@ fn fallback_freqs(key: &str, class: usize) -> Freqs {
 #[derive(Clone, Debug)]
 pub struct PreDecision {
     pub seat: usize,
-    /// Line key at the time of the decision.
+    /// Position name of the deciding seat (e.g. "BTN").
+    pub position: String,
+    /// Spot key at the time of the decision.
     pub key: String,
     pub avail: Availability,
     pub action: PreAction,
 }
 
-/// Line key from the abstract actions taken so far.
-pub fn line_key(decisions: &[PreDecision]) -> String {
-    if decisions.is_empty() {
-        "-".to_string()
-    } else {
-        decisions.iter().map(|d| d.action.code()).collect()
+/// Spot key for `position` to act after `decisions`.
+pub fn spot_key(decisions: &[PreDecision], position: &str) -> String {
+    let mut entered: Vec<usize> = Vec::new();
+    let mut tokens = Vec::new();
+    for d in decisions {
+        let was_in = entered.contains(&d.seat);
+        if d.action != PreAction::Fold {
+            if !was_in {
+                entered.push(d.seat);
+            }
+            tokens.push(format!("{}:{}", d.position, d.action.code()));
+        } else if was_in {
+            tokens.push(format!("{}:F", d.position));
+        }
     }
+    format!("{}>{}", tokens.join(" "), position)
 }
 
 /// Availability for the player to act in `state`.
@@ -325,10 +485,12 @@ mod tests {
     #[test]
     fn builtin_charts_parse() {
         let cs = ChartSet::hu_100bb();
-        for key in ["-", "R", "RR", "RRR", "C", "CR", "A"] {
+        for key in
+            [">SB", "SB:R>BB", "SB:R BB:R>SB", "SB:R BB:R SB:R>BB", "SB:C>BB", "SB:C BB:R>SB", "SB:A>BB"]
+        {
             assert!(cs.get(key).is_some(), "{key}");
         }
-        let open = cs.get("-").unwrap();
+        let open = cs.get(">SB").unwrap();
         assert_eq!(open.class_freqs(class("AA"))[2], 1.0);
         assert_eq!(open.class_freqs(class("72o"))[0], 1.0);
         // Open frequency ~82%.
@@ -336,7 +498,7 @@ mod tests {
             HandClass::all().map(|c| open.class_freqs(c.grid_index())[2] * c.num_combos() as f32).sum();
         assert!((total / 1326.0 - 0.82).abs() < 0.02, "{}", total / 1326.0);
         // BB vs open: A5s mixes raise/call.
-        let f = cs.get("R").unwrap().class_freqs(class("A5s"));
+        let f = cs.get("SB:R>BB").unwrap().class_freqs(class("A5s"));
         assert!((f[2] - 0.5).abs() < 1e-6 && (f[1] - 0.5).abs() < 1e-6, "{f:?}");
     }
 
@@ -351,7 +513,13 @@ mod tests {
                 Some(Action::Raise(10000)),
             ],
         };
-        let d = PreDecision { seat: 0, key: "-".into(), avail, action: PreAction::Passive };
+        let d = PreDecision {
+            seat: 0,
+            position: "SB".into(),
+            key: ">SB".into(),
+            avail,
+            action: PreAction::Passive,
+        };
         let (r, uncovered) = line_range(&[d], 0, |d| chart_policy(&cs, d));
         assert_eq!(uncovered, vec![0]);
         // Limping is never in the chart, so the range is the SB's opening range.
@@ -360,6 +528,56 @@ mod tests {
         let class = |s: &str| s.parse::<HandClass>().unwrap();
         assert_eq!(r.class_weights()[class("72o").grid_index()], 0.0);
         assert_eq!(r.class_weights()[class("AA").grid_index()], 1.0);
+    }
+
+    #[test]
+    fn spot_keys() {
+        let avail = Availability {
+            actions: [Some(Action::Fold), Some(Action::Call), Some(Action::Raise(250)), None],
+        };
+        let d = |seat: usize, pos: &str, a: PreAction| PreDecision {
+            seat,
+            position: pos.into(),
+            key: String::new(),
+            avail: avail.clone(),
+            action: a,
+        };
+        // UTG folds, HJ opens, CO folds, BTN calls -> SB to act.
+        let line = vec![
+            d(3, "UTG", PreAction::Fold),
+            d(4, "HJ", PreAction::Raise),
+            d(5, "CO", PreAction::Fold),
+            d(0, "BTN", PreAction::Passive),
+        ];
+        assert_eq!(spot_key(&line, "SB"), "HJ:R BTN:C>SB");
+        // ... SB 3-bets, BB folds, HJ folds: BTN to act.
+        let mut more = line.clone();
+        more.push(d(1, "SB", PreAction::Raise));
+        more.push(d(2, "BB", PreAction::Fold));
+        more.push(d(4, "HJ", PreAction::Fold));
+        assert_eq!(spot_key(&more, "BTN"), "HJ:R BTN:C SB:R HJ:F>BTN");
+        assert_eq!(spot_key(&[], "SB"), ">SB");
+        let spot = Spot::parse("HJ:R BTN:C>SB").unwrap();
+        assert_eq!(spot.position, "SB");
+        assert_eq!(spot.line, vec![("HJ".to_string(), 'R'), ("BTN".to_string(), 'C')]);
+    }
+
+    #[test]
+    fn fallback_rules_are_positional() {
+        let total = |key: &str, players: usize, idx: usize| -> f32 {
+            HandClass::all()
+                .map(|c| fallback_freqs(key, c.grid_index(), players)[idx] * c.num_combos() as f32)
+                .sum::<f32>()
+                / 1326.0
+        };
+        let utg = total(">UTG", 6, 2);
+        let btn = total(">BTN", 6, 2);
+        assert!((utg - 0.17).abs() < 0.02 && (btn - 0.44).abs() < 0.02, "{utg} {btn}");
+        assert!(total(">UTG", 9, 2) < utg);
+        // BB defends wider against a BTN open than against UTG.
+        assert!(total("BTN:R>BB", 6, 1) > total("UTG:R>BB", 6, 1));
+        // Facing an all-in nobody raises.
+        assert_eq!(total("UTG:A>BB", 6, 2), 0.0);
     }
 
     #[test]
