@@ -179,7 +179,7 @@ pub fn import_leaf_tree(dir: &Path, allin_bb: f64) -> Result<ChartSet, String> {
                 ranges.insert(pos.to_ascii_uppercase(), read_class_weights(&p)?);
             }
         }
-        if !ranges.is_empty() && path.len() % 2 == 0 {
+        if !ranges.is_empty() && path.len().is_multiple_of(2) {
             let line = path.chunks(2).map(|c| (c[0].to_ascii_uppercase(), c[1].clone())).collect();
             leaves.insert(line, ranges);
         }
