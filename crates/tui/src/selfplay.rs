@@ -41,8 +41,18 @@ pub fn run(cfg: TrainerConfig, hands: usize) -> Result<()> {
             println!("   {}", l.text);
         }
         let t = Instant::now();
+        let mut last_report = Instant::now();
         while !review.is_finished() {
             std::thread::sleep(Duration::from_millis(100));
+            if last_report.elapsed() >= Duration::from_secs(30) {
+                last_report = Instant::now();
+                let st = review.status();
+                let progress = st
+                    .progress
+                    .map(|p| format!(" (iteration {}, {:.2}% pot)", p.iteration, p.exploitability_pct))
+                    .unwrap_or_default();
+                println!("   … {:.0}s: {}{progress}", t.elapsed().as_secs_f64(), st.stage);
+            }
         }
         let st = review.status();
         println!("   review finished {:.1}s after the hand ({})", t.elapsed().as_secs_f64(), st.stage);

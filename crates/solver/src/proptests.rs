@@ -239,18 +239,47 @@ proptest! {
         }
     }
 
-    /// The batched river evaluator equals plain recursion on random spots.
+    /// From identical solver states, a batched traversal and a plain
+    /// recursive one give the same values and leave the same regrets and
+    /// strategy sums. (Whole multi-iteration runs can't be compared: a
+    /// regret that is 1e-7 in one summation order and exactly 0 in the
+    /// other flips regret matching, and CFR amplifies the difference.)
     #[test]
     fn batched_equals_recursive(board in cards(5), r0 in range(), r1 in range(), pot in 200i64..3000, stack in 100i64..6000) {
         let cfg = river_config(board, r0, r1, pot, stack, true, true);
         let (Ok(mut a), Ok(mut b)) = (Solver::new(cfg.clone()), Solver::new(cfg)) else { return Ok(()) };
         b.set_batch_river(false);
-        let opts = SolveOptions { max_iterations: 3, target_exploitability_pct: 0.0, check_every: 3 };
-        let pa = a.solve(&opts, |_| true);
-        let pb = b.solve(&opts, |_| true);
-        prop_assert!((pa.exploitability - pb.exploitability).abs() <= 1e-3 * (1.0 + pb.exploitability.abs()));
-        let (qa, qb) = (a.query(&[]).unwrap(), b.query(&[]).unwrap());
-        prop_assert!(qa.strategy.iter().zip(&qb.strategy).all(|(x, y)| (x - y).abs() < 1e-4));
+        a.solve(&SolveOptions { max_iterations: 2, target_exploitability_pct: 0.0, check_every: 2 }, |_| true);
+        let d = crate::cfr::Discount::new(3, &a.config.dcfr);
+        let close = |x: &[f32], y: &[f32]| {
+            let scale = x.iter().chain(y).fold(0f32, |m, v| m.max(v.abs()));
+            x.iter().zip(y).all(|(u, v)| (u - v).abs() <= 1e-4 * (1.0 + scale))
+        };
+        for p in 0..2 {
+            b.store.copy_from(&a.store);
+            for mode in [Mode::Average, Mode::BestResponse, Mode::Cfr(d)] {
+                let mut va = vec![0f32; a.hands.len(p)];
+                let mut vb = vec![0f32; b.hands.len(p)];
+                crate::cfr::traverse(&a.ctx(), 0, p, &a.hands.weights[p ^ 1], mode, &mut va);
+                crate::cfr::traverse(&b.ctx(), 0, p, &b.hands.weights[p ^ 1], mode, &mut vb);
+                prop_assert!(close(&va, &vb), "{:?} values differ for player {}", mode, p);
+            }
+            for id in 0..a.tree.nodes.len() {
+                let node = a.tree.nodes[id];
+                let crate::tree::Kind::Player(q) = node.kind else { continue };
+                let blk = node.block(a.hands.len(q as usize));
+                let (mut ra, mut rb) = (vec![0f32; blk.len], vec![0f32; blk.len]);
+                let (mut sa, mut sb) = (vec![0f32; blk.len], vec![0f32; blk.len]);
+                unsafe {
+                    a.store.load_regrets(blk, &mut ra);
+                    b.store.load_regrets(blk, &mut rb);
+                    a.store.load_strat(blk, &mut sa);
+                    b.store.load_strat(blk, &mut sb);
+                }
+                prop_assert!(close(&ra, &rb), "regrets differ at node {}", id);
+                prop_assert!(close(&sa, &sb), "strategy sums differ at node {}", id);
+            }
+        }
     }
 
     /// Suit isomorphism is lossless on random monotone/two-tone turns.

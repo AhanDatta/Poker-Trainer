@@ -67,7 +67,8 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
 
     // Phase 0: items in breadth-first order (parents before children).
     items.clear();
-    items.push(Item { id: root as u32, first_child: 0, reach: 0, dead: false });
+    let root_dead = opp_reach.iter().all(|&w| w == 0.0);
+    items.push(Item { id: root as u32, first_child: 0, reach: 0, dead: root_dead });
     let mut k = 0;
     let mut reach_slots = 1usize;
     while k < items.len() {
@@ -117,10 +118,17 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
                     regret_match(strat, na, nq);
                     let r = &reach[it.reach as usize * nq..(it.reach as usize + 1) * nq];
                     let g = d.strat;
+                    let weighted = d.reach_weighted;
                     ctx.store.update_strat(b, |ss| {
                         for (ss_row, s_row) in ss.chunks_exact_mut(nq).zip(strat.chunks_exact(nq)) {
-                            for ((x, &y), &w) in ss_row.iter_mut().zip(s_row).zip(r) {
-                                *x = *x * g + y * w;
+                            if weighted {
+                                for ((x, &y), &w) in ss_row.iter_mut().zip(s_row).zip(r) {
+                                    *x = *x * g + y * w;
+                                }
+                            } else {
+                                for (x, &y) in ss_row.iter_mut().zip(s_row) {
+                                    *x = *x * g + y;
+                                }
                             }
                         }
                     });

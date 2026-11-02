@@ -148,6 +148,10 @@ impl Session {
     /// The hero sits in seat 0; the button position decides the hero's
     /// position (rotating, random, or pinned to a blind).
     pub fn new_hand(&mut self) -> LiveHand {
+        // Moving on abandons the solves of earlier hands: they would
+        // otherwise keep the CPU (and the solve queue) busy while this hand
+        // is played.
+        self.cancel_pending_reviews();
         let n = self.config.players;
         let hero = 0;
         let button = match self.config.hero_position {
@@ -205,6 +209,17 @@ impl Session {
     }
 
     /// Stores a finished (or abandoned) hand in the history.
+    /// Cancels every review of a finished hand that is still running.
+    pub fn cancel_pending_reviews(&self) {
+        for h in &self.history {
+            if let Some(r) = h.review() {
+                if !r.is_finished() {
+                    r.cancel();
+                }
+            }
+        }
+    }
+
     pub fn finish_hand(&mut self, hand: LiveHand) {
         if hand.is_finished() {
             self.history.push(hand);

@@ -62,6 +62,8 @@ fn run(name: &str, board: &str, chance: ChanceMode, future_menu: Option<Postflop
             alpha: v[0].parse().unwrap(),
             beta: if v[1] == "clip" { None } else { Some(v[1].parse().unwrap()) },
             gamma: v[2].parse().unwrap(),
+            restart_average: v.get(3).is_some_and(|x| x.contains('r')),
+            unweighted_average: v.get(3).is_some_and(|x| x.contains('u')),
         };
     }
     let est = Solver::estimate(&cfg).unwrap();

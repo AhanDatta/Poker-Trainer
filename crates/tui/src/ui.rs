@@ -517,6 +517,8 @@ fn draw_review(f: &mut Frame, app: &App) {
         second.push_str(&elapsed(&status));
     } else if let Some(e) = &status.error {
         second = format!("Review error: {e}");
+    } else if status.cancelled {
+        second = "Review cancelled: you moved on to the next hand before it finished.".into();
     }
     let header = vec![Line::from(head), Line::from(Span::styled(second, Style::default().fg(Color::Yellow)))];
     f.render_widget(Paragraph::new(header).block(Block::default().borders(Borders::BOTTOM)), rows[1]);
@@ -688,10 +690,34 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
     draw_grid(f, parts[1], d);
 }
 
-/// 13x13 grid colored by each class's most frequent action.
+/// Splits `width` character cells among actions in proportion to `strategy`
+/// (largest remainders), so a cell shows its mix rather than one action.
+fn mix_slots(strategy: &[f32], width: usize) -> Vec<usize> {
+    let total: f32 = strategy.iter().sum();
+    if total <= 0.0 {
+        return vec![0; strategy.len()];
+    }
+    let exact: Vec<f32> = strategy.iter().map(|&v| v / total * width as f32).collect();
+    let mut slots: Vec<usize> = exact.iter().map(|&x| x.floor() as usize).collect();
+    let mut left = width - slots.iter().sum::<usize>();
+    let mut order: Vec<usize> = (0..exact.len()).collect();
+    order.sort_by(|&a, &b| (exact[b] - exact[b].floor()).total_cmp(&(exact[a] - exact[a].floor())));
+    for &i in &order {
+        if left == 0 {
+            break;
+        }
+        slots[i] += 1;
+        left -= 1;
+    }
+    slots
+}
+
+/// 13x13 grid; each class's 4-character cell is colored by its action mix
+/// (in quarters). Coloring by the single most frequent action would hide
+/// low-frequency bluffs and make betting ranges look value-heavy.
 fn draw_grid(f: &mut Frame, area: Rect, d: &DecisionReview) {
     let mut lines = vec![Line::from(Span::styled(
-        "Your range at this spot (most frequent action):",
+        "Your range at this spot (each cell colored by its action mix):",
         Style::default().fg(ACCENT),
     ))];
     for row in 0..13 {
@@ -699,19 +725,28 @@ fn draw_grid(f: &mut Frame, area: Rect, d: &DecisionReview) {
         for col in 0..13 {
             let g = row * 13 + col;
             let class = HandClass::from_grid_index(g);
-            let label = format!("{:<4}", class.to_string());
-            let style = match &d.grid[g] {
+            let label: Vec<char> = format!("{:<4}", class.to_string()).chars().collect();
+            match &d.grid[g] {
                 Some(ClassCell { strategy, .. }) => {
-                    let (best, _) =
-                        strategy
-                            .iter()
-                            .enumerate()
-                            .fold((0, -1.0f32), |acc, (i, &v)| if v > acc.1 { (i, v) } else { acc });
-                    Style::default().fg(Color::Black).bg(action_color(&d.actions, best))
+                    let slots = mix_slots(strategy, label.len());
+                    let mut k = 0;
+                    for (a, &n) in slots.iter().enumerate() {
+                        if n == 0 {
+                            continue;
+                        }
+                        let text: String = label[k..k + n].iter().collect();
+                        k += n;
+                        spans.push(Span::styled(
+                            text,
+                            Style::default().fg(Color::Black).bg(action_color(&d.actions, a)),
+                        ));
+                    }
                 }
-                None => Style::default().fg(Color::DarkGray),
-            };
-            spans.push(Span::styled(label, style));
+                None => {
+                    let text: String = label.iter().collect();
+                    spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
+                }
+            }
         }
         lines.push(Line::from(spans));
     }
@@ -751,6 +786,8 @@ fn draw_history(f: &mut Frame, app: &App) {
                     let st = r.status();
                     if !st.finished {
                         spans.push(Span::styled("solving…", Style::default().fg(Color::Yellow)));
+                    } else if st.cancelled {
+                        spans.push(Span::styled("cancelled ", Style::default().fg(Color::DarkGray)));
                     }
                     let first = st.decisions.first().map(|d| d.variant);
                     for d in st.decisions.iter().filter(|d| Some(d.variant) == first) {
@@ -800,4 +837,22 @@ fn draw_help(f: &mut Frame) {
             .wrap(Wrap { trim: false }),
         f.area(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mix_slots;
+
+    #[test]
+    fn grid_cells_show_mixes() {
+        assert_eq!(mix_slots(&[1.0, 0.0], 4), vec![4, 0]);
+        assert_eq!(mix_slots(&[0.75, 0.25], 4), vec![3, 1]);
+        // A 14% bluff still shows up as one quarter of the cell.
+        assert_eq!(mix_slots(&[0.86, 0.14], 4), vec![3, 1]);
+        assert_eq!(mix_slots(&[0.5, 0.3, 0.2], 4), vec![2, 1, 1]);
+        assert_eq!(mix_slots(&[0.0, 0.0], 4), vec![0, 0]);
+        for s in [[0.1f32, 0.2, 0.7], [0.33, 0.33, 0.34], [0.05, 0.05, 0.9]] {
+            assert_eq!(mix_slots(&s, 4).iter().sum::<usize>(), 4);
+        }
+    }
 }

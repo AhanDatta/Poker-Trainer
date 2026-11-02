@@ -39,6 +39,9 @@ pub(crate) struct Discount {
     pub pos: f32,
     pub neg: f32,
     pub strat: f32,
+    /// Weight strategy-sum updates by the player's own reach (textbook
+    /// CFR) or add the current strategy unweighted (postflop-solver).
+    pub reach_weighted: bool,
 }
 
 /// DCFR hyper-parameters.
@@ -49,11 +52,31 @@ pub struct DcfrParams {
     /// clips them to zero every iteration (DCFR+).
     pub beta: Option<f64>,
     pub gamma: f64,
+    /// Restart the strategy average at iterations 4, 16, 64, 256, ... so
+    /// the early, poor iterations drop out of it (as b-inary/postflop-solver
+    /// does).
+    pub restart_average: bool,
+    /// Add the current strategy to the average without weighting it by
+    /// the player's own reach, so every hand has a defined average strategy
+    /// at every node it could reach (as b-inary/postflop-solver does).
+    pub unweighted_average: bool,
 }
 
 impl Default for DcfrParams {
+    /// The averaging scheme of b-inary/postflop-solver: unweighted strategy
+    /// sums, gamma 3, restarts at powers of 4. With reach-weighted sums in
+    /// 16-bit storage, a rarely reached hand's per-iteration increment can
+    /// be smaller than half a quantization step and is rounded away every
+    /// time, freezing its average strategy: big flop trees then stalled
+    /// between 1% and 0.5% of the pot (600+ iterations instead of ~340).
     fn default() -> Self {
-        DcfrParams { alpha: 1.5, beta: Some(0.0), gamma: 2.0 }
+        DcfrParams {
+            alpha: 1.5,
+            beta: Some(0.0),
+            gamma: 3.0,
+            restart_average: true,
+            unweighted_average: true,
+        }
     }
 }
 
@@ -71,7 +94,15 @@ impl Discount {
             }
             None => 0.0,
         };
-        Discount { pos: (pa / (pa + 1.0)) as f32, neg, strat: ((tf - 1.0) / tf).powf(params.gamma) as f32 }
+        // Iterations since the average was (re)started, 0-based.
+        let mut since = tf - 1.0;
+        if params.restart_average {
+            let t0 = t.max(1) - 1;
+            let p4 = if t0 == 0 { 0 } else { 1u32 << ((31 - t0.leading_zeros()) & !1) };
+            since = (t0 - p4) as f64;
+        }
+        let strat = (since / (since + 1.0)).powf(params.gamma) as f32;
+        Discount { pos: (pa / (pa + 1.0)) as f32, neg, strat, reach_weighted: !params.unweighted_average }
     }
 }
 
@@ -165,6 +196,14 @@ pub(crate) fn traverse(ctx: &Ctx, id: usize, p: usize, opp_reach: &[f32], mode: 
 fn traverse_inner(ctx: &Ctx, id: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mut [f32]) {
     debug_assert!(opp_reach.iter().all(|&r| r >= 0.0 && r.is_finite()), "invalid reach at node {id}");
     let node = &ctx.tree.nodes[id];
+    // A decision node the opponent can't reach is worth 0 and isn't
+    // updated, exactly as the batched river evaluator treats "dead"
+    // subtrees (with unweighted strategy sums, visiting it would add a full
+    // strategy to the opponent's average).
+    if matches!(node.kind, Kind::Player(_)) && opp_reach.iter().all(|&r| r == 0.0) {
+        out.fill(0.0);
+        return;
+    }
     match node.kind {
         Kind::Fold(_) => eval_fold(ctx.hands, p, opp_reach, fold_payoff(ctx, node, p), out),
         Kind::Showdown => {
@@ -254,8 +293,14 @@ fn opponent_node(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode
                     regret_match(&mut s, na, nq);
                     ctx.store.update_strat(b, |ss| {
                         for (ss_row, s_row) in ss.chunks_exact_mut(nq).zip(s.chunks_exact(nq)) {
-                            for ((x, &y), &w) in ss_row.iter_mut().zip(s_row).zip(opp_reach) {
-                                *x = *x * d.strat + y * w;
+                            if d.reach_weighted {
+                                for ((x, &y), &w) in ss_row.iter_mut().zip(s_row).zip(opp_reach) {
+                                    *x = *x * d.strat + y * w;
+                                }
+                            } else {
+                                for (x, &y) in ss_row.iter_mut().zip(s_row) {
+                                    *x = *x * d.strat + y;
+                                }
                             }
                         }
                     });

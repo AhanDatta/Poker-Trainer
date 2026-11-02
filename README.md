@@ -121,10 +121,17 @@ and grades never depend on mapping an off-tree bet size.
 
 ### Heads-up solver
 
-Our own implementation of Discounted CFR (α = 1.5, β = 0, γ = 2, alternating
+Our own implementation of Discounted CFR (α = 1.5, β = 0, γ = 3, alternating
 updates), informed by reading
 [b-inary/postflop-solver](https://github.com/b-inary/postflop-solver); no code
-from it was copied.
+from it was copied. Like postflop-solver, the average strategy adds each
+iteration's strategy without weighting it by the player's own reach, and
+restarts at iterations 4, 16, 64 and 256. With reach-weighted averages, rarely
+reached hands' contributions rounded away in 16-bit storage, so big flop
+solves stalled between 1% and 0.5% of the pot.
+
+River solutions were cross-checked against postflop-solver on the same games
+(strategies within ~1.5 points, per-hand EVs within ~0.5% of the pot).
 
 * **Range vs. range.** Each decision node stores regrets and strategy sums
   per (action, hand). One traversal handles every hand at once by passing the
@@ -224,10 +231,10 @@ scales almost linearly with cores (3.8× on 4 threads).
 |---|---|---|
 | River, full menu | tiny | ~0.03 s |
 | Turn, full menu, exact rivers | ~0.1 GB | ~6–8 s |
-| Flop **exact**, two-tone board (isomorphism) | ~1.9 GB | ~1.8 s/iteration, ~5–7 min to 0.5% pot |
+| Flop **exact**, two-tone board (isomorphism) | ~1.9 GB | ~1.7 s/iteration, ~4.5 min to 0.5% pot |
 | Flop **exact**, rainbow board | ~3.1 GB | ~8–12 min to 0.5% pot |
 | Flop **fast** (49 turns × 10 rivers) | ~0.4–0.7 GB | ~1.5–4 min |
-| Heads-up **limped** pot, flop exact (~890 × 860 combos) | ~2.7 GB | ~15–20 min |
+| Heads-up **limped** pot, flop exact (~880 × 860 combos) | ~2.7 GB | ~11–12 min |
 | 6-max single-raised pot, flop exact (~290 × 220 combos) | <1 GB | a few minutes |
 
 Exact flop trees use one bet size on the turn and river, with all-in as the
