@@ -1,9 +1,10 @@
 # Poker Trainer
 
 A No-Limit Hold'em trainer for the terminal, written in Rust. Think chess
-puzzles, but for NLHE. You're dealt into a hand, play it from preflop to the
-river against an AI opponent with a recognizable style, and afterwards check
-every postflop decision you made against a solver.
+puzzles, but for NLHE. You're dealt into a hand at a heads-up, 6-max or 9-max
+table, play it from preflop to the river against AI opponents with
+recognizable styles, and afterwards check every postflop decision you made
+against a solver.
 
 ```
 ┌ Your decisions ───────────────┐┌ Flop — GTO ranges ──────────────────────────────────────────┐
@@ -22,14 +23,17 @@ every postflop decision you made against a solver.
 
 | Feature | State |
 |---|---|
-| Heads-up (SB/button vs BB), 100bb default | ✅ |
+| Heads-up, 6-max and 9-max tables, 100bb default | ✅ |
 | Full hands from preflop to river vs. AI | ✅ |
-| AI styles: Reg, Nit, TAG, LAG, Calling Station, Maniac, or random | ✅ |
-| Postflop solver review of every hero decision (EV per action, mix, grade) | ✅ |
+| AI styles per seat: Reg, Nit, TAG, LAG, Calling Station, Maniac, or random | ✅ |
+| Heads-up pots: exact solver review of every hero decision (EV per action, mix, grade) | ✅ (at any table size) |
+| 3-way pots: approximate 3-player CFR review | ✅ approximate |
+| 4+-way pots | ❌ not analyzed (analysis resumes once ≤3 players remain) |
+| Flop solving: exact (default) or fast | ✅ |
 | Villain range in review: GTO charts / villain's actual style range / both | ✅ |
-| Flop solving: fast (sampled runouts) or exact | ✅ |
+| Rake (no flop, no drop, capped) | ✅ |
+| Solver-based preflop charts (heads-up, 6-max) via `fetch-charts` | ✅ |
 | Preflop grading | ❌ not yet (charts drive the AIs and the starting ranges) |
-| 3–9 players | ❌ planned. The engine already handles N players and side pots; the AI, charts and review are heads-up only |
 
 ## Quick start
 
@@ -41,6 +45,16 @@ cargo run --release
 
 Always use `--release`: the solver is far slower in a debug build.
 
+For solver-based preflop charts (recommended), run this once. It downloads
+the public range collection of
+[bupticybee/TexasSolverGPU](https://github.com/bupticybee/TexasSolverGPU)
+(only its `ranges/` folder, ~6 MB, via git), converts it, and points your
+config at it:
+
+```bash
+cargo run --release -- fetch-charts
+```
+
 Other commands:
 
 ```bash
@@ -48,17 +62,21 @@ cargo run --release -- init-config            # writes poker-trainer.toml with e
 cargo run --release -- --config my.toml       # use a specific config
 cargo run --release -- --seed 42              # reproducible hands
 cargo run --release -- selfplay --hands 3     # headless: scripted hero + printed reviews (speed check)
-cargo test --workspace                        # unit + end-to-end tests
-cargo run --release -p solver --example bench -- turn   # solver benchmarks (river|turn|flop-fast|flop-fast-simple|flop-exact)
+cargo run --release -- import-charts DIR --format lines --players 6 -o charts.txt   # convert your own ranges
+cargo test --workspace                        # unit, property and end-to-end tests
+cargo run --release -p solver --example bench -- flop-exact-lean Ks7s2d   # solver benchmarks
+cargo run --release -p solver --example compare -- Ks7s2d                 # fast vs exact accuracy
 ```
 
 ### Keys
 
 | Where | Keys |
 |---|---|
-| Setup | ↑/↓ select · ←/→ change · Enter play · W save settings · Q quit |
+| Setup | ↑/↓ select · ←/→ change (table size, styles, position, stacks, rake, solver) · Enter play · W save settings · Q quit |
 | Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** solver review · **H** history · **S** settings |
 | Review | ↑/↓ choose decision · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · Esc back |
+
+After you fold, the rest of the hand plays out instantly.
 
 ### Grades
 
@@ -77,93 +95,161 @@ either choice grades as Best.
 
 ```
 crates/
-  holdem/   cards, 7-card evaluator, 1326 combos / 169 classes, ranges, bet menu, N-player game engine
-  solver/   heads-up postflop Discounted-CFR solver
-  trainer/  preflop charts, AI styles, hand controller, background review pipeline, config
+  holdem/   cards, 7-card evaluator, ranges, bet menu, N-player engine (side pots, rake)
+  solver/   heads-up postflop DCFR solver + approximate 3-player solver (solver::multi)
+  trainer/  preflop charts + importers, AI styles, hand controller, review pipeline, config
   tui/      the `poker-trainer` binary (ratatui)
 ```
 
 ### One bet menu for the table and the solver
 
 `holdem::menu` turns a betting situation into the list of allowed actions.
-Both the live game and the solver's tree builder call the same function, so
+Both the live game and the solvers' tree builders call the same function, so
 every action played at the table, by you or the AI, exists in the solved tree,
-and grades never depend on mapping an off-tree bet size. Sizes are
-configurable per street, including pot-fraction bets, ×-multiplier raises, the
-all-in threshold, a raise cap and merging of near-identical sizes.
+and grades never depend on mapping an off-tree bet size.
 
-### Solver
+### Heads-up solver
 
-Our own implementation. The approach follows the published DCFR algorithm and
-was informed by reading
+Our own implementation of Discounted CFR (α = 1.5, β = 0, γ = 2, alternating
+updates), informed by reading
 [b-inary/postflop-solver](https://github.com/b-inary/postflop-solver); no code
 from it was copied.
 
-* **Range vs. range DCFR** (α = 1.5, β = 0, γ = 2, alternating updates).
-  Each node stores regrets and strategy sums per (action, hand). One recursive
-  pass passes the opponent's reach vector down and returns the traverser's
-  counterfactual values for every hand at once.
-* **O(n) terminal evaluation.** Showdowns sweep both players' hands sorted by
-  strength. Card removal is exact, by inclusion–exclusion over the 52 cards.
-* **Chance nodes.** Hands containing a dealt card are zeroed, and reach is
-  scaled by 1/45 (turn) or 1/44 (river). Fast mode uses a stratified sample of
-  turn/river cards (suits in proportion, ranks spread) with a matching scale
-  factor. All-in runouts are always enumerated exactly.
-* **Mid-street roots.** These handle unequal commitments and ties, which the
-  off-equilibrium re-solves need.
-* **Queries** return the average strategy and the EV of every action for every
-  hand at any node, plus range narrowing along a path.
-* Tests cover a polarized river toy game (it converges to the textbook 50%
-  bluff / 50% call equilibrium with bluff EV = 0), an exact 2-outer all-in
-  equity, ties, convergence on a real turn spot, and fast mode.
+* **Range vs. range.** Each decision node stores regrets and strategy sums
+  per (action, hand). One traversal handles every hand at once by passing the
+  opponent's reach vector down the tree.
+* **Flat arena with optional 16-bit compressed storage.** Regrets are stored
+  as `i16` and strategy sums as `u16`, each with one scale per node. This
+  halves memory and memory traffic. It switches on automatically for trees
+  over 1 GB.
+* **Suit isomorphism.** On two-tone and monotone boards, mirror-image
+  turn/river cards are solved once. The hero-hand floor is applied to the
+  hand's whole suit orbit so ranges stay symmetric.
+* **O(n) showdowns.** Strength-sorted sweeps with exact card removal by
+  inclusion–exclusion. River subtrees are evaluated breadth-first, with their
+  showdowns and folds swept in batches.
+* **Exactness.** All-in runouts are always enumerated. Mid-street roots
+  (needed for off-equilibrium re-solves) and rake are supported.
+
+### Approximate 3-player solver (`solver::multi`)
+
+Exact multiway solving is far beyond a desktop machine, so 3-way pots use
+DCFR on a three-player game with deliberate approximations:
+
+* The two opponents are treated as independent. Card removal against each
+  opponent is exact, but their hands aren't checked against each other. This
+  lets showdowns factor into per-opponent sweeps (P(win) = P(beat A) × P(beat B)).
+  Ties count half.
+* Sampled turn/river cards, and no raises on later streets.
+* No equilibrium guarantee: CFR with 3 players has none, though in practice
+  it's sensible, as in Pluribus. Convergence is reported as the average
+  best-response gain.
+
+A regression test checks that, with the third player already folded, it
+reproduces the exact heads-up solver.
 
 ### Review pipeline (runs on a background thread while you play)
 
-1. **Flop dealt.** Both ranges are built from the preflop line: the GTO
-   variant uses the charts; the "villain's actual range" variant uses the AI
-   style's own preflop frequencies. Your actual hand always gets a small
-   weight so the solver has a strategy for it, then the flop solve starts.
-2. **A street's betting ends.** Each of your decisions on that street is
-   graded. Both ranges are narrowed by the solver's strategy along the actual
-   line, and the next street is solved as soon as it's dealt (re-solving with
-   the full bet menu).
-3. **Off-equilibrium lines.** If you or the villain take a line the solver
+1. **Flop dealt.** Ranges of everyone in the pot are built from the preflop
+   line: charts for the GTO variant, each AI style's own preflop frequencies
+   for the "villain's actual range" variant. Your actual hand always gets a
+   small weight so the solver has a strategy for it.
+2. **Each street.** Depending on how many players are still in, the street
+   gets the exact heads-up solver (2 players), the approximate 3-way solver
+   (3), or a note (4+). Your decisions are graded once the street's betting
+   ends. Ranges are narrowed by the solver's strategy along the actual line
+   and carried to the next street, which is re-solved as soon as it's dealt.
+3. **Off-equilibrium lines (heads-up).** If someone takes a line the solver
    almost never takes, the node is re-solved from that point with floored
-   ranges, so the advice stays meaningful against a non-GTO opponent.
+   ranges, so the advice stays meaningful against non-GTO opponents.
 
 ### AI opponents
 
-* **Preflop:** chart frequencies adjusted by the style. *Looseness* widens or
-  narrows the continuing range along a preflop strength order, and
-  *aggression* turns calls into raises or raises into calls (limping).
-* **Postflop:** Monte-Carlo equity against a read of your range (your chart
-  range, narrowed after each of your postflop actions with hand-strength and
-  draw heuristics), then style thresholds for value-betting, bluffing (more
-  with draws), calling down, raising, slow-playing and bet sizing.
+* **Preflop:** chart frequencies for the position and line, adjusted by the
+  style. *Looseness* widens or narrows the continuing range along a
+  playability order; *aggression* turns calls into raises, or raises into
+  calls (limping).
+* **Postflop:** Monte-Carlo equity against reads of every opponent's range,
+  narrowed after each of their actions. Style thresholds then decide
+  value-betting, bluffing (more with draws), calling down, raising,
+  slow-playing and sizing.
 
 ### Preflop charts
 
-`crates/trainer/charts/hu_100bb.txt` holds **hand-written approximations** of
-heads-up 100bb strategies. They are not solver output. The format is plain
-text sections keyed by the preflop line (`[-]`, `[R]`, `[RR]`, `[C]`, …) with
-`allin:` / `raise:` / `call:` ranges. Point `charts_file` in the config at your
-own file to use charts you trust.
+Chart files are plain text sections keyed by the position-labelled preflop
+line and the deciding position, e.g. `[UTG:R BTN:C>BB]`, each with `allin:`,
+`raise:` and `call:` ranges.
+
+* `fetch-charts` imports **solver-based** charts:
+  * heads-up 100bb, reconstructed into per-decision frequencies from leaf
+    ranges;
+  * 6-max 100bb (2.5x opens, 5% rake), 510 spots.
+
+  The data stays on your machine: its repository doesn't state a license for
+  the range files, so check its terms before redistributing them.
+* Without imported charts, heads-up uses hand-written approximations
+  (`crates/trainer/charts/hu_100bb.txt`). 6-max and 9-max use position-aware
+  fallback rules (open percentages by position, defense vs. opens, 3-/4-bets,
+  all-ins), which also cover any spot missing from an imported chart.
+* `import-charts` converts other collections in either supported layout:
+  per-decision line files, or leaf range trees.
 
 ## Performance
 
-Measured on the 4-core / 2.1 GHz cloud container used for development. Your
-machine is likely faster; use `selfplay` or the `bench` example to check.
+Measured on the 4-core / 2.1 GHz cloud VM used for development (no
+hardware performance counters; your machine is likely faster). The solver
+scales almost linearly with cores (3.8× on 4 threads).
 
-| Solve (heads-up single-raised pot, ~550 × 920 combos) | Time to 0.3–0.5% pot | Memory |
+| Heads-up single-raised pot (~560 × 970 combos) | Memory | Time |
 |---|---|---|
-| River, full menu | ~0.03 s | tiny |
-| Turn, full menu, exact rivers | ~6–8 s | ~0.1 GB |
-| Flop, **fast**: 8 turns × 6 rivers, 1 size on later streets | ~10–13 s | ~0.2 GB |
-| Flop, **exact**: every runout, 1 size on later streets | ~5–7 min | **~9 GB** |
+| River, full menu | tiny | ~0.03 s |
+| Turn, full menu, exact rivers | ~0.1 GB | ~6–8 s |
+| Flop **exact**, two-tone board (isomorphism) | ~1.9 GB | ~1.8 s/iteration, ~5–7 min to 0.5% pot |
+| Flop **exact**, rainbow board | ~3.1 GB | ~8–12 min to 0.5% pot |
+| Flop **fast** (49 turns × 10 rivers) | ~0.4–0.7 GB | ~1.5–4 min |
 
-Ranges after real preflop lines are often narrower (3-bet pots, narrowed
-weights, pruning), which makes solves faster. Exact flop solves bigger than
-`max_memory_gb` fall back to fast mode automatically, and the review says so.
+Exact flop trees use one bet size on the turn and river, with all-in as the
+only raise there. The flop itself always uses the full menu. Before this
+round's optimizations, exact flop solves needed ~9 GB. Trees larger than
+`max_memory_gb` (default 5) fall back to fast mode.
+
+### Is fast mode trustworthy?
+
+The `compare` example solves the same flop exactly and in fast mode. It then
+measures, at several decision nodes, how much EV a hand loses by following
+fast mode's best action, judged by the exact solve:
+
+| Fast-mode sampling | Avg EV lost | Worst hand | Hands with a different best action |
+|---|---|---|---|
+| 8 turns × 6 rivers (old default) | 1.2–1.5% pot | 25–60% pot | 20–34% |
+| 24 turns × 12 rivers | 0.2–0.9% pot | 13–31% pot | 5–26% |
+| **49 turns × 10 rivers (current fast mode)** | **0.0–0.2% pot** | 0.4–24% pot | 0–8% |
+
+Sampling turn cards is the main error source, so fast mode deals every turn
+and samples only rivers. Exact mode is the default.
+
+## Testing
+
+* **Unit and end-to-end tests:** whole hands at 2/6/9-max tables, including
+  background solver reviews.
+* **Property-based tests (`proptest`)** check invariants on random inputs and
+  shrink failures to a minimal case:
+  * evaluator: best-5-of-7, suit-relabeling and monotonicity invariants;
+  * range notation round-trips;
+  * engine (400 random 2–9-player hands with random stacks and rake): chip
+    conservation, legality of every menu action, side-pot and rake
+    accounting;
+  * solver evaluators against O(n²) brute force;
+  * batched vs. recursive and isomorphic vs. full trees give the same
+    results;
+  * random river solutions are well-formed;
+  * AI style adjustments always produce valid frequencies.
+* **Debug-build sentinels.** The engine re-checks its invariants after every
+  action. The solver checks strategies, reach and values for validity at
+  every node. They're free in release builds.
+
+Profiling: `cargo build --profile profiling` (release + debug symbols), then
+e.g. `perf record -g target/profiling/examples/bench turn`.
 
 ## Configuration
 
@@ -171,22 +257,24 @@ weights, pruning), which makes solves faster. Exact flop solves bigger than
 useful ones:
 
 ```toml
+players = 6                  # 2 (heads-up), 6, 9
 opponent = "random"          # Reg | Nit | TAG | LAG | Calling Station | Maniac | random
-random_each_hand = true
-show_opponent_style = false  # reveal the style during the hand (always shown in the review)
-hero_position = "alternate"  # alternate | random | sb | bb
+random_each_hand = true      # with "random": new style per seat each hand (else per session)
+show_opponent_style = false  # reveal styles during the hand (always shown in the review)
+hero_position = "alternate"  # alternate (rotate) | random | sb | bb
 stack_bb = 100.0
-ai_delay_ms = 450
+rake_pct = 5.0               # 0 = no rake
+rake_cap_bb = 3.0
+charts_6max = "charts/6max_100bb.txt"   # set by fetch-charts (also charts_hu, charts_9max)
 
 [solver]
-flop_mode = "fast"           # fast | exact
-flop_turn_samples = 8
-flop_river_samples = 6
+flop_mode = "exact"          # exact | fast
 villain_range = "gto"        # gto | actual | both
 target_exploitability_pct = 0.5
-max_iterations = 400
-max_memory_gb = 6.0
+max_memory_gb = 5.0
 threads = 0                  # 0 = all cores
+multiway_turn_samples = 8    # 3-way pots
+multiway_river_samples = 4
 
 [menu.postflop.flop]
 bet = ["33%", "75%"]
@@ -202,12 +290,16 @@ the presets in `crates/trainer/src/profiles.rs`.
 
 ## Known limitations / next steps
 
-* **More players (3–9).** Needs per-position charts, a multiway-aware AI, and
-  a policy for multiway postflop review (heads-up solvers can't grade
-  multiway pots).
-* **Preflop grading** against charts, or against a preflop solve.
-* **Solver speed:** suit isomorphism, 16-bit compressed storage, and SIMD in
-  the showdown sweeps.
-* **Exploitative review.** Node-lock the villain to its AI style's postflop
-  tendencies and show the max-EV play against that specific opponent.
-* Grade thresholds are fixed constants (`trainer::review::Verdict`).
+* **4+-way pots** aren't analyzed.
+* **3-way review is approximate:** it ignores card removal between the two
+  opponents and uses simplified later streets.
+* **Preflop grading** isn't implemented.
+* **9-max charts** use fallback rules; no public solver set was found.
+* **Exact flop solves still take minutes** on a 4-core machine. The next
+  steps would be SIMD-friendlier showdown sweeps and a predictive
+  (PDCFR+-style) update.
+* **Exploitative review:** node-lock the villain to its AI style's postflop
+  tendencies to show the max-EV play against that specific opponent.
+* The preflop menu has one raise size per level, while imported charts may
+  use slightly different sizes (e.g. 2.6bb opens). Their frequencies are
+  used as-is.
