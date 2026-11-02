@@ -1,0 +1,15 @@
+[package]
+name = "solver"
+description = "Discounted-CFR heads-up postflop solver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+holdem.workspace = true
+rand.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

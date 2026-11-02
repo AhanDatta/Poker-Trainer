@@ -1,0 +1,84 @@
+# Heads-up 100bb preflop charts (no rake).
+#
+# These are hand-written APPROXIMATIONS of solver strategies. The built-in
+# heads-up charts use the solver charts in hu_100bb_solver.txt for the spots
+# those cover (SB open, BB vs limp, BB vs open) and these for the rest.
+# To use your own charts, point `charts_hu` in the config to a file in this
+# format: its sections replace the built-in ones.
+#
+# Sections are keyed by the preflop line so far and the deciding position:
+#   [SB:R BB:R>SB]  = SB opened, BB 3-bet, SB to act.
+# Actions: R = raise (the menu's raise size), C = call/limp/check,
+#   A = all-in, F = fold (only listed for players who had entered the pot).
+#   [>SB] is the first decision (SB/button first to act).
+# In each section list "allin:", "raise:" and "call:" ranges; weights are
+# frequencies. Actions are applied in that order and each is capped by what
+# is left; the remainder folds (or checks when folding isn't possible).
+#
+# Default menu: open 2.5bb, iso 3.5bb, 3-bet 3.5x, 4-bet 2.3x, then all-in.
+
+[>SB]
+# SB first in: raise or fold (no limps), ~82% of hands.
+raise: 22+, A2+, K2+, Q2+, J2+, T2s+, T5o+, 92s+, 96o+, 82s+, 85o+, 72s+, 75o+, 62s+, 64o+, 52s+, 54o, 42s+, 32s
+
+[SB:R>BB]
+# BB vs SB open.
+raise: TT+, AJs+, AQo+, KQs, 99:0.5, ATs:0.5, KJs:0.5, AJo:0.5, A5s-A2s:0.5, K9s:0.35, Q9s:0.35, J9s:0.35, T8s:0.35, 97s:0.35, 86s:0.35, 75s:0.35, 64s:0.35, 54s:0.3, K8s-K5s:0.25, Q8s:0.25, J8s:0.25, K9o:0.15, QTo:0.15, JTo:0.15
+call: 22+, A2+, K2+, Q2+, J2s+, J5o+, T2s+, T6o+, 92s+, 96o+, 82s+, 85o+, 72s+, 75o+, 62s+, 64o+, 52s+, 54o, 42s+, 32s
+
+[SB:R BB:R>SB]
+# SB vs BB 3-bet.
+raise: QQ+, AKs, AKo, JJ:0.4, AQs:0.3, A5s:0.5, A4s:0.4
+call: 22-JJ, A2s-AQs, A8o-AQo, A2o-A7o:0.4, K7s+, KTo+, Q8s+, QJo, J8s+, T7s+, 96s+, 86s+, 75s+, 64s+, 54s, 43s:0.5
+
+[SB:R BB:R SB:R>BB]
+# BB vs SB 4-bet.
+allin: QQ+, AKs, AKo:0.85, A5s:0.35, A4s:0.25
+call: JJ, TT, 99:0.6, 88:0.4, 77:0.3, AQs, AJs:0.6, ATs:0.3, AQo:0.6, KQs:0.6, KJs:0.3, QJs:0.3, JTs:0.3, A5s, A4s:0.5
+
+[SB:R BB:R SB:R BB:A>SB]
+# SB facing BB 5-bet jam.
+call: JJ+, AKs, AKo, AQs:0.6, TT:0.5, A5s:0.2
+
+[SB:R BB:A>SB]
+# SB facing BB 3-bet jam.
+call: 88+, A9s+, ATo+, KJs+, KQo, 77:0.6, A8s:0.5
+
+[SB:R BB:R SB:A>BB]
+# BB facing SB 4-bet jam.
+call: TT+, AQs+, AKo, AQo:0.6, 99:0.6, AJs:0.5, KQs:0.4, A5s:0.3
+
+[SB:A>BB]
+# BB facing SB open jam.
+call: 88+, ATs+, AJo+, KQs, 77:0.6, A9s:0.5, KJs:0.3
+
+[SB:C>BB]
+# BB vs SB limp (remainder checks).
+raise: 66+, A2s+, A8o+, K7s+, KTo+, Q9s+, QJo, J9s+, T9s, 98s:0.5, 87s:0.5, 76s:0.5, A2o-A7o:0.4, K2s-K6s:0.3, 55:0.5, 44:0.3
+
+[SB:C BB:R>SB]
+# SB limped, BB iso-raised.
+raise: QQ+, AKs, AKo, JJ:0.5, A5s:0.3
+call: 22-JJ, A2s+, A7o+, K7s+, K9o+, Q8s+, QTo+, J8s+, JTo, T7s+, 97s+, 86s+, 75s+, 64s+, 54s, 43s
+
+[SB:C BB:R SB:R>BB]
+# BB vs SB limp/3-bet.
+allin: QQ+, AKs, AKo:0.7
+call: 88-JJ, AQs, AJs, KQs, AQo, ATs:0.5, 77:0.5
+
+[SB:C BB:R SB:R BB:R>SB]
+# SB facing BB 4-bet in the limp/3-bet line.
+allin: QQ+, AK
+call: JJ, TT:0.5
+
+[SB:C BB:A>SB]
+# SB facing BB jam over a limp.
+call: 99+, AJs+, AQo+, KQs:0.5
+
+[SB:C BB:R SB:A>BB]
+# BB facing SB jam over an iso-raise.
+call: TT+, AQs+, AKo, AJs:0.5, 99:0.5
+
+[SB:C BB:R SB:R BB:A>SB]
+# SB facing BB jam over a limp/3-bet.
+call: QQ+, AK, JJ:0.6

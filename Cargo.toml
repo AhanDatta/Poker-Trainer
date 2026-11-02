@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["crates/holdem", "crates/solver", "crates/trainer", "crates/tui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+holdem = { path = "crates/holdem" }
+solver = { path = "crates/solver" }
+trainer = { path = "crates/trainer" }
+rand = "0.9"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+ratatui = "0.29"
+crossterm = "0.28"
+proptest = "1.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+# The solver is unusably slow without optimizations, so optimize it (and the
+# hand evaluator) even in debug/test builds.
+[profile.dev.package.holdem]
+opt-level = 3
+[profile.dev.package.solver]
+opt-level = 3
+[profile.dev.package."*"]
+opt-level = 2
+
+# `cargo build --profile profiling` = release + debug symbols (for perf/valgrind).
+[profile.profiling]
+inherits = "release"
+debug = true

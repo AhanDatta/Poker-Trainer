@@ -1,0 +1,20 @@
+[package]
+name = "poker-trainer"
+description = "Terminal NLHE trainer: play hands against AI styles and check your decisions with a solver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "poker-trainer"
+path = "src/main.rs"
+
+[dependencies]
+holdem.workspace = true
+solver.workspace = true
+trainer.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
