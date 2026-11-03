@@ -29,7 +29,7 @@ preflop charts and the solver's strategy in any spot, GTO Wizard style.
 | 8 AI styles, tuned to typical tracker stats (Reg, TAG, LAG, Nit, Rock, Fish, Calling Station, Maniac) | ✅ |
 | Game types (Tough, Typical, Soft, Wild, Custom counts) with session lineups | ✅ |
 | Heads-up pots: exact solver review of every hero decision (EV per action, mix, grade) | ✅ (at any table size) |
-| 3-way pots: approximate 3-player CFR review | ✅ approximate |
+| 3-way pots: 3-player CFR review with exact card removal (sampled runouts) | ✅ approximate |
 | 4+-way pots | ❌ not analyzed (analysis resumes once ≤3 players remain) |
 | Flop solving: exact (default) or fast | ✅ |
 | Villain range in review: GTO charts / villain's actual style range / both | ✅ |
@@ -205,46 +205,58 @@ River solutions were cross-checked against postflop-solver on the same games
 Exact multiway solving of a whole flop is beyond a desktop machine, so 3-way
 pots use DCFR on a three-player game with some approximations:
 
-* **Card removal between the two opponents** is a setting ("3-way pots" on
-  the setup screen, `multiway_exact_removal` in the config):
-  * *Approximate* (default): the opponents' hands are treated as
-    independent. Removal against each opponent is exact, and showdowns
-    factor into per-opponent sweeps (P(win) = P(beat A) × P(beat B)).
-  * *Exact*: terminal values sum over pairs of opponent hands that don't
-    share a card, using an inclusion–exclusion identity over shared cards.
-    Per-card sums and sparse per-card hand lists are kept as hands enter
-    the sweep, so a query costs about as much as the ranges are dense.
-    With exact removal and no rake the game is exactly zero-sum (a test
-    checks this), and terminal values match a brute force over all hand
-    triples.
-* Sampled turn/river cards, and no raises on later streets.
-* No equilibrium guarantee: CFR with 3 players has none, though in practice
-  it's sensible, as in Pluribus. Convergence is reported as the average
-  best-response gain.
+* **Sampled runouts and simplified later streets.** All-in runouts are
+  sampled like the rest of the tree (they held 72% of a sampled flop tree's
+  showdowns when every card was dealt). A 3-way turn with every river card
+  is small (~0.2 GB), but a 3-way flop with every runout needs well over
+  14 GB, so flops stay sampled; study mode re-solves each street when it's
+  dealt.
+* **No equilibrium guarantee:** CFR with 3 players has none, though in
+  practice it's sensible, as in Pluribus. Convergence is reported as the
+  average best-response gain.
+
+**Card removal between the two opponents** is exact by default ("3-way
+pots" on the setup screen, `multiway_exact_removal` in the config).
+Terminal values sum over pairs of opponent hands that share no card, using
+an inclusion–exclusion identity over shared cards. Per-card sums and sparse
+per-card hand lists are kept as hands enter the strength sweep, so a query
+costs about as much as the ranges are dense, and showdowns on the same board
+share sweeps (4 at a time). With exact removal and no rake the game is
+exactly zero-sum (a test checks this), and terminal values match a brute
+force over all hand triples. *Approximate* treats the opponents' hands as
+independent: removal against each opponent is exact and showdowns factor
+into per-opponent sweeps (P(win) = P(beat A) × P(beat B)).
 
 How much the independence approximation costs, judged in the exact game
 (average best-response gain, % of the pot; 3-way turns with every river
 card, measured with `cargo run --release -p trainer --example multibench`):
 
-| Spot | Independent strategy | Exact strategy | Time with exact removal |
+| Spot | Independent strategy | Exact strategy | Exact removal's time |
 |---|---|---|---|
-| CO open, BTN + BB call (chart ranges), J♠9♠4♦2♣ | 0.39 | 0.23 | ×2.0 |
-| Three wide ranges (~600 combos), J♠9♠4♦2♣ | 0.34 | 0.22 | ×2.6 |
-| Narrow overlapping ranges (AA–QQ/AK vs AK/AQ/KK–JJ vs AQ/AJ/TT–88), A♥7♣2♦5♠ | **3.43** | 0.05 | ×1.7 |
+| CO open, BTN + BB call (chart ranges), J♠9♠4♦2♣ | 0.40 | 0.13 | ×2.0 |
+| Three wide ranges (~600 combos), J♠9♠4♦2♣ | 0.32 | 0.15 | ×3.1 |
+| Narrow overlapping ranges (AA–QQ/AK vs AK/AQ/KK–JJ vs AQ/AJ/TT–88), A♥7♣2♦5♠ | **3.40** | 0.04 | ×2.2 |
 
-(150–300 iterations each; 3-player CFR doesn't converge monotonically, so
-the exact column moves by ±0.1 between runs.)
+(150–300 iterations; on the narrow spot the first player's root strategy
+moves from 25% check / 67% small bet / 8% big bet to 32% / 65% / 3%.)
 
 With wide or lopsided ranges the opponents rarely collide and the
 approximation is close; when narrow ranges compete for the same cards
-(squeeze and 3-bet multiway pots) it can be off by several % of the pot and
-the strategy visibly changes. On a chart-range 3-way flop exact removal
-currently costs about ×3.3 per iteration.
+(squeeze and 3-bet multiway pots) it's off by several % of the pot and the
+strategy visibly changes.
 
-Exact runouts: a 3-way turn with every river card is small (~0.2 GB for the
-chart spot above), but a 3-way flop with every turn and river card needs
-over 14 GB, so flops stay sampled (study mode re-solves each street when
-it's dealt).
+Design (as in the heads-up solver): a flat node arena, regrets and strategy
+sums in the shared storage (16-bit for big trees), pooled buffers, and a
+memory check before allocating. A traversal skips the subtrees after its
+player folded (its payoff there is fixed). Each player's average strategy is
+reach-weighted and accumulated at its nodes during the next active player's
+traversal; DCFR uses α 1.5, β 0, γ 3 without average restarts (restarts
+left 3-player averages stuck or bouncing).
+
+| Chart-range 3-way flop (J♠9♠4♦, 8 turns × 4 rivers) to 1.5% of the pot | Before the rebuild | Now |
+|---|---|---|
+| Independent opponents | ~57 s | 19 s |
+| Exact card removal | ~190 s | 47 s |
 
 A regression test checks that, with the third player already folded, it
 reproduces the exact heads-up solver.
@@ -441,9 +453,8 @@ the presets in `crates/trainer/src/profiles.rs`.
   the slowest.
 
 * **4+-way pots** aren't analyzed.
-* **3-way solves are approximate:** sampled runouts and simplified later
-  streets, and by default no card removal between the two opponents (see
-  the "3-way pots" setting).
+* **3-way solves are approximate:** sampled runouts (including all-in
+  runouts) and simplified later streets, and no equilibrium guarantee.
 * **Preflop grading** isn't implemented.
 * **Study mode** uses the bet menu from the config (`[menu]`); there's no
   per-spot size editor yet. Its 3-way solves have the same limits as the

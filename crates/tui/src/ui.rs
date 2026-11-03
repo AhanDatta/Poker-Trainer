@@ -189,7 +189,8 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
             if cfg.solver.multiway_exact_removal {
                 s(
                     "Exact card removal",
-                    "3-way pots account for the two opponents blocking each other's cards. About 2-3x slower.",
+                    "3-way pots account for the two opponents blocking each other's cards (about 2.5x slower \
+                     than approximate; a 3-way flop takes under a minute on a 4-core machine).",
                 )
             } else {
                 s(
@@ -304,7 +305,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "Heads-up and 3-way pots (3-way solves are approximate; see the 3-way row). Fast flop solving is recommended here.",
+                "Heads-up and 3-way pots (3-way solves sample runouts and have no equilibrium guarantee). Fast flop solving is recommended here.",
                 Style::default().fg(Color::DarkGray),
             )),
         ],
