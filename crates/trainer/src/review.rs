@@ -18,7 +18,9 @@ use crate::preflop::{chart_policy, describe, line_range, ChartSet, PreDecision};
 use crate::profiles::Profile;
 use holdem::combo::{combo_index, COMBO_CLASS, NUM_CLASSES};
 use holdem::game::Phase;
-use holdem::{Action, BetMenu, Card, HandState, Street};
+use holdem::menu::postflop_categorized;
+use holdem::{Action, BetMenu, Card, Category, HandState, Street};
+use serde::{Deserialize, Serialize};
 use solver::multi::{MultiConfig, MultiSolver, MultiState};
 use solver::{
     BettingState, ChanceMode, NodeInfo, Progress, SolveConfig, SolveOptions, Solver, SolverError, Step,
@@ -92,7 +94,7 @@ fn wait_solve_turn(hand: u64, cancel: &AtomicBool, mut on_wait: impl FnMut(usize
 pub(crate) const CANCELLED: &str = "cancelled";
 
 /// Which villain range a solve used.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Variant {
     Gto,
     Actual,
@@ -108,7 +110,7 @@ impl Variant {
 }
 
 /// Chess-style classification of a decision by EV loss (% of the pot).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Verdict {
     Best,
     Good,
@@ -157,16 +159,32 @@ impl Verdict {
 }
 
 /// Strategy of one hand class at a node (for the 13x13 grid).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClassCell {
     /// Total reach weight of the class's combos at this node.
     pub weight: f32,
-    /// Weighted average strategy over the class's combos.
+    /// Weighted average strategy over the class's combos (saved to 4
+    /// decimals: it is only displayed).
+    #[serde(with = "quantized")]
     pub strategy: Vec<f32>,
 }
 
+/// Serializes frequencies in 1/10000ths, which keeps saved grids small.
+mod quantized {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[f32], s: S) -> Result<S::Ok, S::Error> {
+        let q: Vec<u16> = v.iter().map(|&x| (x.clamp(0.0, 1.0) * 10000.0).round() as u16).collect();
+        q.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
+        Ok(Vec::<u16>::deserialize(d)?.into_iter().map(|x| x as f32 / 10000.0).collect())
+    }
+}
+
 /// The solver's verdict on one hero decision.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DecisionReview {
     pub variant: Variant,
     pub street: Street,
@@ -193,6 +211,57 @@ pub struct DecisionReview {
     pub grid: Vec<Option<ClassCell>>,
     pub exploitability_pct: f64,
     pub notes: Vec<String>,
+    /// Where the decision was made (for the session's frequency score).
+    #[serde(default)]
+    pub spot: SpotInfo,
+}
+
+/// The kind of spot a decision was made in, and the frequency category of
+/// each of its actions.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpotInfo {
+    /// Players in the pot (2 or 3).
+    pub players: u8,
+    /// Last to act on the street.
+    pub in_position: bool,
+    /// Bets and raises already made on this street (0 = none, 1 = facing a
+    /// bet, 2+ = facing a raise).
+    pub facing: u8,
+    /// Index of the decision in the hand's action history.
+    pub history_index: usize,
+    /// Category of each action (see [`holdem::Category`]).
+    pub categories: Vec<String>,
+}
+
+impl SpotInfo {
+    fn new(
+        players: usize,
+        in_position: bool,
+        sit: &holdem::Situation,
+        menu: &holdem::PostflopMenu,
+        actions: &[Action],
+        history_index: usize,
+    ) -> SpotInfo {
+        let cats = postflop_categorized(sit, menu);
+        let categories = actions
+            .iter()
+            .map(|a| match cats.iter().find(|(x, _)| x == a) {
+                Some((_, c)) => c.to_string(),
+                // Not from the menu (can't happen for the street's root menu).
+                None => match a {
+                    Action::Raise(to) if *to >= sit.max_to => Category::AllIn.to_string(),
+                    other => format!("{other:?}"),
+                },
+            })
+            .collect();
+        SpotInfo {
+            players: players as u8,
+            in_position,
+            facing: sit.num_raises.min(u8::MAX as u32) as u8,
+            history_index,
+            categories,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -320,6 +389,23 @@ impl Review {
             })
             .expect("spawn review thread");
         Review { shared, handle: Some(handle) }
+    }
+
+    /// A review read back from a save: finished, with no thread.
+    pub fn finished(snap: Snapshot, status: ReviewStatus) -> Review {
+        let status = ReviewStatus { finished: true, progress: None, stage_since: None, ..status };
+        let shared = Arc::new(Shared {
+            snap: Mutex::new(snap),
+            cv: Condvar::new(),
+            status: Mutex::new(status),
+            cancel: AtomicBool::new(false),
+        });
+        Review { shared, handle: None }
+    }
+
+    /// Runs `f` on the current status without copying it.
+    pub fn with_status<R>(&self, f: impl FnOnce(&ReviewStatus) -> R) -> R {
+        f(&self.shared.status.lock().unwrap())
     }
 
     /// Pushes the latest state of the hand.
@@ -545,6 +631,8 @@ impl<'a> Worker<'a> {
         let state = &snap.state;
         let actions: Vec<(usize, Action)> =
             state.history.iter().filter(|r| r.street == street).map(|r| (r.player, r.action)).collect();
+        let history_index: Vec<usize> =
+            state.history.iter().enumerate().filter(|(_, r)| r.street == street).map(|(i, _)| i).collect();
         // Betting state before each action.
         let mut states = vec![root];
         for &(_, a) in &actions {
@@ -612,6 +700,14 @@ impl<'a> Worker<'a> {
                 if street == Street::Flop && setup.settings.flop_mode == FlopMode::Fast {
                     notes.push("Flop solved with sampled river cards (fast mode): approximate.".into());
                 }
+                let spot = SpotInfo::new(
+                    2,
+                    hero_p == 1,
+                    &states[k].situation(BB),
+                    &setup.menu.postflop,
+                    &info.actions,
+                    history_index[k],
+                );
                 let review = grade(
                     &info,
                     &context(&states[k]),
@@ -624,6 +720,7 @@ impl<'a> Worker<'a> {
                     history,
                     expl,
                     notes,
+                    spot,
                 )?;
                 self.shared.with_status(|st| st.decisions.push(review));
             }
@@ -710,6 +807,8 @@ impl<'a> Worker<'a> {
         let state = &snap.state;
         let actions: Vec<(usize, Action)> =
             state.history.iter().filter(|r| r.street == street).map(|r| (r.player, r.action)).collect();
+        let history_index: Vec<usize> =
+            state.history.iter().enumerate().filter(|(_, r)| r.street == street).map(|(i, _)| i).collect();
         let mut states = vec![root];
         for &(seat, a) in &actions {
             debug_assert_eq!(seats[states.last().unwrap().to_act], seat, "3-way state out of sync");
@@ -745,6 +844,14 @@ impl<'a> Worker<'a> {
                     .collect::<Vec<_>>()
                     .join(" · ");
                 let notes = vec![multiway_note(s.multiway_exact_removal)];
+                let spot = SpotInfo::new(
+                    3,
+                    hero_p == 2,
+                    &states[k].situation(BB),
+                    &setup.menu.postflop,
+                    &info.actions,
+                    history_index[k],
+                );
                 let review = grade(
                     &info,
                     &context_multi(&states[k]),
@@ -757,6 +864,7 @@ impl<'a> Worker<'a> {
                     history,
                     *conv,
                     notes,
+                    spot,
                 )?;
                 self.shared.with_status(|st| st.decisions.push(review));
             }
@@ -1168,6 +1276,7 @@ fn grade(
     history: String,
     exploitability_pct: f64,
     notes: Vec<String>,
+    spot: SpotInfo,
 ) -> Result<DecisionReview, String> {
     let i = info.hand_index(hero_combo).ok_or_else(|| "your hand isn't in the solved range".to_string())?;
     let strat = info.hand_strategy(i);
@@ -1210,5 +1319,6 @@ fn grade(
         grid,
         exploitability_pct,
         notes,
+        spot,
     })
 }

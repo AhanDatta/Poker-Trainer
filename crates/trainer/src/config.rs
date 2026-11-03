@@ -115,6 +115,23 @@ impl Default for SolverSettings {
     }
 }
 
+/// The session's frequency score (see [`crate::scoring`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScoringSettings {
+    /// Weight each decision by the pot (in big blinds), so frequency leaks
+    /// in big pots count more.
+    pub pot_weighted: bool,
+    /// Monte Carlo samples of a perfect mixer used to tell leaks from luck.
+    pub simulations: usize,
+}
+
+impl Default for ScoringSettings {
+    fn default() -> Self {
+        ScoringSettings { pot_weighted: true, simulations: 1000 }
+    }
+}
+
 /// Kind of game: how likely each opponent style is to sit at the table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -229,6 +246,15 @@ pub struct TrainerConfig {
     pub seed: Option<u64>,
     pub menu: BetMenu,
     pub solver: SolverSettings,
+    pub scoring: ScoringSettings,
+    /// Show a random number (0-99) at each of your decisions, to help you
+    /// play mixed strategies (e.g. bet when it's below 30).
+    pub show_rng: bool,
+    /// Save finished hands so the session can be continued later.
+    pub save_sessions: bool,
+    /// Where sessions are saved (default: the user data directory, e.g.
+    /// ~/.local/share/poker-trainer/sessions).
+    pub sessions_dir: Option<String>,
     /// Extra opponent styles.
     pub custom_profiles: Vec<Profile>,
 }
@@ -256,6 +282,10 @@ impl Default for TrainerConfig {
             seed: None,
             menu: BetMenu::default(),
             solver: SolverSettings::default(),
+            scoring: ScoringSettings::default(),
+            show_rng: true,
+            save_sessions: true,
+            sessions_dir: None,
             custom_profiles: Vec::new(),
         }
     }
@@ -308,6 +338,23 @@ impl TrainerConfig {
             3..=6 => self.charts_6max.as_ref(),
             _ => self.charts_9max.as_ref(),
         }
+    }
+
+    /// Directory of saved sessions: `sessions_dir`, or the platform's data
+    /// directory (`None` when there's no home directory to put it in).
+    pub fn sessions_root(&self) -> Option<std::path::PathBuf> {
+        if let Some(d) = &self.sessions_dir {
+            return Some(d.into());
+        }
+        let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let base = if cfg!(windows) {
+            env("APPDATA")
+        } else if cfg!(target_os = "macos") {
+            env("HOME").map(|h| h.join("Library/Application Support"))
+        } else {
+            env("XDG_DATA_HOME").or_else(|| env("HOME").map(|h| h.join(".local/share")))
+        };
+        base.map(|b| b.join("poker-trainer").join("sessions"))
     }
 
     /// All available styles (presets + custom).

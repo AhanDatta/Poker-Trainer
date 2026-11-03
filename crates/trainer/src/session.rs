@@ -5,13 +5,17 @@ use crate::fmt::BB;
 use crate::hand::{HandSetup, LiveHand};
 use crate::preflop::ChartSet;
 use crate::profiles::Profile;
-use crate::review::{ReviewStatus, Verdict};
+use crate::review::{ReviewStatus, Variant, Verdict};
+use crate::save::{self, LoadedSession, SessionMeta, SessionStore, SessionSummary};
+use crate::scoring::{self, FrequencyReport, ScoreOptions, ScoredDecision};
 use holdem::{Chips, TableConfig};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct Session {
     pub config: TrainerConfig,
@@ -24,7 +28,27 @@ pub struct Session {
     button: usize,
     /// Finished hands (most recent last).
     pub history: Vec<LiveHand>,
+    /// `history[..settled]` are final (their reviews are over) and counted
+    /// in `settled_stats` and `scored`, so stats don't rescan every hand.
+    settled: usize,
+    settled_stats: Stats,
+    /// Decisions of the settled hands as the frequency score sees them.
+    scored: Vec<ScoredDecision>,
+    /// Pot weighting `scored` was built with.
+    scored_weighted: bool,
+    report: Option<FrequencyReport>,
+    /// Saving: where sessions go, this session's directory (made when the
+    /// first hand is saved) and how many hands of `history` are saved.
+    save_root: Option<PathBuf>,
+    store: Option<SessionStore>,
+    saved: usize,
+    created: u64,
+    save_error: Option<String>,
 }
+
+/// Seed of the frequency score's simulations (fixed: the score of a
+/// session doesn't change between looks).
+const SCORE_SEED: u64 = 0x5c0e_5eed;
 
 /// Aggregate statistics over finished hands.
 #[derive(Clone, Debug, Default)]
@@ -39,6 +63,42 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Adds a finished hand (and its review so far).
+    fn add_hand(&mut self, h: &LiveHand) {
+        self.hands += 1;
+        self.net_chips += h.hero_net().unwrap_or(0);
+        if let Some(r) = h.review() {
+            r.with_status(|st| self.add_review(st));
+        }
+    }
+
+    fn add_review(&mut self, st: &ReviewStatus) {
+        if !st.finished {
+            self.reviews_pending += 1;
+        }
+        let has_gto = st.decisions.iter().any(|x| x.variant == Variant::Gto);
+        for d in &st.decisions {
+            // Count each decision once (the GTO variant when both exist).
+            if d.variant == Variant::Actual && has_gto {
+                continue;
+            }
+            self.decisions += 1;
+            *self.verdicts.entry(d.verdict).or_default() += 1;
+            self.total_loss_pct += d.ev_loss_pct as f64;
+        }
+    }
+
+    fn merge(&mut self, o: &Stats) {
+        self.hands += o.hands;
+        self.net_chips += o.net_chips;
+        self.decisions += o.decisions;
+        for (v, n) in &o.verdicts {
+            *self.verdicts.entry(*v).or_default() += n;
+        }
+        self.total_loss_pct += o.total_loss_pct;
+        self.reviews_pending += o.reviews_pending;
+    }
+
     pub fn avg_loss_pct(&self) -> f64 {
         if self.decisions == 0 {
             0.0
@@ -92,7 +152,18 @@ impl Session {
             lineup: Vec::new(),
             button: 0,
             history: Vec::new(),
+            settled: 0,
+            settled_stats: Stats::default(),
+            scored: Vec::new(),
+            scored_weighted: true,
+            report: None,
+            save_root: None,
+            store: None,
+            saved: 0,
+            created: save::now_secs(),
+            save_error: None,
         };
+        s.scored_weighted = s.config.scoring.pot_weighted;
         s.button = s.rng.random_range(0..s.config.players);
         s.reset_lineup();
         Ok(s)
@@ -266,6 +337,7 @@ impl Session {
         self.next_id += 1;
         let seed: u64 = self.rng.random();
         let mut hand = LiveHand::new(setup, StdRng::seed_from_u64(seed));
+        hand.set_roll_seed(crate::hand::mix64(seed ^ 0x0d1c_e5ee_d000_0001));
         for seat in new_players {
             hand.note(format!("Player {} left; a new player sat down.", seat + 1));
         }
@@ -290,29 +362,179 @@ impl Session {
         }
     }
 
+    /// Totals over every finished hand.
     pub fn stats(&self) -> Stats {
-        let mut s = Stats::default();
-        for h in &self.history {
-            s.hands += 1;
-            s.net_chips += h.hero_net().unwrap_or(0);
-            if let Some(r) = h.review() {
-                let st: ReviewStatus = r.status();
-                if !st.finished {
-                    s.reviews_pending += 1;
+        let mut s = self.settled_stats.clone();
+        for h in &self.history[self.settled..] {
+            s.add_hand(h);
+        }
+        s
+    }
+
+    /// The frequency score of the settled hands' heads-up decisions.
+    pub fn report(&self) -> Option<&FrequencyReport> {
+        self.report.as_ref()
+    }
+
+    /// Counts hands whose reviews are over (in order), saves them, and
+    /// updates the frequency score. Cheap when nothing changed; call it
+    /// regularly (e.g. every UI tick).
+    pub fn refresh(&mut self) {
+        self.settle(false);
+    }
+
+    /// Settles hands from `self.settled` on; `force` also settles hands
+    /// whose review is still running, as they are now.
+    fn settle(&mut self, force: bool) {
+        let weighted = self.config.scoring.pot_weighted;
+        if weighted != self.scored_weighted {
+            self.scored_weighted = weighted;
+            self.scored.clear();
+            for h in &self.history[..self.settled] {
+                if let Some(r) = h.review() {
+                    r.with_status(|st| self.scored.extend(scoring::hand_decisions(&st.decisions, weighted)));
                 }
-                for d in &st.decisions {
-                    // Count each decision once (the GTO variant when both exist).
-                    if d.variant == crate::review::Variant::Actual
-                        && st.decisions.iter().any(|x| x.variant == crate::review::Variant::Gto)
-                    {
-                        continue;
-                    }
-                    s.decisions += 1;
-                    *s.verdicts.entry(d.verdict).or_default() += 1;
-                    s.total_loss_pct += d.ev_loss_pct as f64;
+            }
+            self.update_report();
+        }
+        let start = self.settled;
+        while self.settled < self.history.len() {
+            let h = &self.history[self.settled];
+            if !force && h.review().is_some_and(|r| !r.is_finished()) {
+                break;
+            }
+            let mut st = Stats::default();
+            st.add_hand(h);
+            st.reviews_pending = 0;
+            self.settled_stats.merge(&st);
+            if let Some(r) = h.review() {
+                r.with_status(|st| self.scored.extend(scoring::hand_decisions(&st.decisions, weighted)));
+            }
+            self.settled += 1;
+        }
+        if self.settled > start {
+            self.update_report();
+        }
+        if self.saved < self.settled {
+            self.save_settled();
+        }
+    }
+
+    fn update_report(&mut self) {
+        let opts = ScoreOptions { simulations: self.config.scoring.simulations, seed: SCORE_SEED };
+        self.report = FrequencyReport::compute(&self.scored, opts);
+    }
+
+    /// Saves finished hands to the session's directory (from now on).
+    pub fn start_saving(&mut self, root: PathBuf) {
+        self.save_root = Some(root);
+        self.settle(false);
+    }
+
+    /// Directory name of the saved session (once a hand was saved).
+    pub fn save_id(&self) -> Option<&str> {
+        self.store.as_ref().map(|s| s.id.as_str())
+    }
+
+    pub fn is_saving(&self) -> bool {
+        self.save_root.is_some()
+    }
+
+    /// The last saving error (once).
+    pub fn take_save_error(&mut self) -> Option<String> {
+        self.save_error.take()
+    }
+
+    fn save_settled(&mut self) {
+        let Some(root) = self.save_root.clone() else { return };
+        if self.store.is_none() {
+            match SessionStore::create(&root, self.created) {
+                Ok(st) => self.store = Some(st),
+                Err(e) => {
+                    self.save_error = Some(format!("Couldn't save the session in {}: {e}", root.display()));
+                    self.save_root = None;
+                    return;
                 }
             }
         }
-        s
+        let hands: Vec<_> = self.history[self.saved..self.settled].iter().map(|h| h.to_saved()).collect();
+        let store = self.store.as_ref().unwrap();
+        let res = store.append_hands(&hands).and_then(|()| store.write_meta(&self.meta()));
+        match res {
+            Ok(()) => self.saved = self.settled,
+            Err(e) => {
+                self.save_error = Some(format!("Couldn't save to {}: {e}", store.dir().display()));
+                self.save_root = None;
+            }
+        }
+    }
+
+    /// The session's saved header.
+    pub fn meta(&self) -> SessionMeta {
+        let st = &self.settled_stats;
+        SessionMeta {
+            version: save::FORMAT_VERSION,
+            id: self.save_id().unwrap_or_default().to_string(),
+            created: self.created,
+            updated: save::now_secs(),
+            config: self.config.clone(),
+            lineup: self.lineup.clone(),
+            button: self.button,
+            next_id: self.next_id,
+            summary: SessionSummary {
+                hands: st.hands,
+                net_chips: st.net_chips,
+                decisions: st.decisions,
+                score: self.report.as_ref().map(|r| r.calibration.score()),
+            },
+        }
+    }
+
+    /// Before quitting or switching sessions: stops running reviews (waiting
+    /// up to `wait` for them to wind down), then saves every finished hand
+    /// and the current settings.
+    pub fn flush(&mut self, wait: Duration) {
+        self.cancel_pending_reviews();
+        let t = Instant::now();
+        while t.elapsed() < wait && self.history.iter().any(|h| h.review().is_some_and(|r| !r.is_finished()))
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.settle(true);
+        if let (Some(store), Some(_)) = (&self.store, &self.save_root) {
+            if let Err(e) = store.write_meta(&self.meta()) {
+                self.save_error = Some(format!("Couldn't save to {}: {e}", store.dir().display()));
+            }
+        }
+    }
+
+    /// Continues a saved session. Settings come from the save, except where
+    /// sessions are kept and the seed, which come from `base`.
+    pub fn resume(loaded: LoadedSession, root: PathBuf, base: &TrainerConfig) -> Result<Session, String> {
+        let meta = loaded.meta;
+        let mut config = meta.config.clone();
+        config.save_sessions = base.save_sessions;
+        config.sessions_dir = base.sessions_dir.clone();
+        // A seeded session continues with new deals, not the first ones again.
+        config.seed = base.seed.map(|s| crate::hand::mix64(s ^ meta.next_id));
+        let mut s = Session::new(config)?;
+        let n = s.config.players;
+        if meta.lineup.len() == n && meta.lineup.iter().filter(|p| p.is_none()).count() == 1 {
+            s.lineup = meta.lineup.clone();
+        }
+        s.button = meta.button % n;
+        s.next_id = meta.next_id.max(1);
+        s.created = meta.created;
+        let (menu, charts) = (s.config.menu.clone(), Arc::clone(&s.charts));
+        s.history = loaded
+            .hands
+            .into_iter()
+            .map(|h| LiveHand::from_saved(h, menu.clone(), Arc::clone(&charts)))
+            .collect();
+        s.saved = s.history.len();
+        s.store = Some(SessionStore::open(&root, &meta.id).map_err(|e| e.to_string())?);
+        s.save_root = Some(root);
+        s.settle(false);
+        Ok(s)
     }
 }

@@ -21,12 +21,17 @@ pub mod population;
 pub mod preflop;
 pub mod profiles;
 pub mod review;
+pub mod save;
+pub mod scoring;
 pub mod session;
 pub mod strength;
 pub mod study;
 
-pub use config::{FlopMode, GameType, HeroPosition, SolverSettings, TrainerConfig, VillainRange};
+pub use config::{
+    FlopMode, GameType, HeroPosition, ScoringSettings, SolverSettings, TrainerConfig, VillainRange,
+};
 pub use hand::{LiveHand, LogEntry, StepResult};
 pub use profiles::Profile;
-pub use review::{DecisionReview, Review, ReviewStatus, Variant, Verdict};
+pub use review::{DecisionReview, Review, ReviewStatus, SpotInfo, Variant, Verdict};
+pub use scoring::{FrequencyReport, ScoreOptions, ScoredDecision};
 pub use session::{Session, Stats};

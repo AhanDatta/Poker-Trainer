@@ -192,3 +192,70 @@ fn parse_cards_rejects_garbage() {
     assert!(parse_cards("Xx").is_err());
     assert_eq!(combo_index(Card::new(0, 0), Card::new(0, 1)), 0);
 }
+
+fn bet_size() -> impl Strategy<Value = holdem::BetSize> {
+    prop_oneof![
+        (10u32..300).prop_map(|p| holdem::BetSize::Pot(p as f64 / 100.0)),
+        (21u32..60).prop_map(|m| holdem::BetSize::Mult(m as f64 / 10.0)),
+        Just(holdem::BetSize::AllIn),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1000))]
+
+    /// Every postflop action gets one category: all-in exactly for the
+    /// shove, otherwise the menu size it came from (each at most once).
+    #[test]
+    fn postflop_categories_are_consistent(
+        street in prop_oneof![Just(Street::Flop), Just(Street::Turn), Just(Street::River)],
+        pot in 100i64..20_000,
+        bet_frac in prop_oneof![Just(0u32), 10u32..300],
+        behind in 0i64..40_000,
+        num_raises in 0u32..4,
+        bets in prop::collection::vec(bet_size(), 0..4),
+        raises in prop::collection::vec(bet_size(), 0..4),
+        add_allin in prop_oneof![Just(0.0f64), 0.5f64..3.0],
+        merge in prop_oneof![Just(0.0f64), 0.05f64..0.3],
+    ) {
+        let current_bet = (pot as f64 * bet_frac as f64 / 100.0) as Chips;
+        let num_raises = if current_bet == 0 { 0 } else { num_raises.max(1) };
+        let sit = holdem::Situation {
+            street,
+            pot: pot + current_bet,
+            to_call: current_bet,
+            current_bet,
+            max_to: current_bet + behind,
+            min_raise_to: if current_bet == 0 { 100 } else { 2 * current_bet },
+            num_raises,
+            limpers: 0,
+            big_blind: 100,
+        };
+        let mut menu = holdem::PostflopMenu {
+            add_allin_threshold: add_allin,
+            merge_threshold: merge,
+            ..Default::default()
+        };
+        *menu.street_mut(street) = holdem::StreetSizes { bet: bets.clone(), raise: raises.clone() };
+        let cat = holdem::menu::postflop_categorized(&sit, &menu);
+        let plain = holdem::menu::postflop_actions(&sit, &menu);
+        prop_assert_eq!(cat.iter().map(|x| x.0).collect::<Vec<_>>(), plain);
+        let list = if current_bet == 0 { &bets } else { &raises };
+        let mut seen = Vec::new();
+        for &(a, c) in &cat {
+            match (a, c) {
+                (Action::Fold, holdem::Category::Fold) => prop_assert!(sit.to_call > 0),
+                (Action::Call, holdem::Category::Call) => prop_assert!(sit.to_call > 0),
+                (Action::Check, holdem::Category::Check) => prop_assert_eq!(sit.to_call, 0),
+                (Action::Raise(to), holdem::Category::AllIn) => prop_assert_eq!(to, sit.max_to),
+                (Action::Raise(to), holdem::Category::Size(s)) => {
+                    prop_assert!(to < sit.max_to);
+                    prop_assert!(list.contains(&s), "{s} isn't a menu size");
+                    prop_assert!(!seen.contains(&s.to_string()), "{s} names two actions");
+                    seen.push(s.to_string());
+                }
+                other => prop_assert!(false, "inconsistent {other:?}"),
+            }
+        }
+    }
+}

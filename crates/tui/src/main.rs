@@ -2,7 +2,9 @@
 
 mod app;
 mod charts_cmd;
+mod score_ui;
 mod selfplay;
+mod sizes;
 mod study_app;
 mod study_ui;
 mod ui;
@@ -32,6 +34,9 @@ struct Cli {
     /// Random seed for reproducible hands.
     #[arg(long, global = true)]
     seed: Option<u64>,
+    /// Don't save this session (or offer to continue saved ones).
+    #[arg(long, global = true)]
+    no_save: bool,
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -117,16 +122,32 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Play) | None => {
             let (cfg, path) = load_config(&cli)?;
-            let session = Session::new(cfg).map_err(|e| anyhow!(e))?;
-            run_tui(App::new(session, path))
+            let mut app = App::new(Session::new(cfg).map_err(|e| anyhow!(e))?, path);
+            setup_saving(&mut app, cli.no_save);
+            // Offer to continue a saved session.
+            if !app.sessions.is_empty() {
+                app.open_sessions();
+            }
+            run_tui(app)
         }
         Some(Cmd::Study) => {
             let (cfg, path) = load_config(&cli)?;
-            let session = Session::new(cfg).map_err(|e| anyhow!(e))?;
-            let mut app = App::new(session, path);
+            let mut app = App::new(Session::new(cfg).map_err(|e| anyhow!(e))?, path);
+            setup_saving(&mut app, cli.no_save);
             app.open_study();
             run_tui(app)
         }
+    }
+}
+
+/// Saves sessions where the config says (unless turned off).
+fn setup_saving(app: &mut App, no_save: bool) {
+    let cfg = &app.session.config;
+    if no_save || !cfg.save_sessions {
+        return;
+    }
+    if let Some(root) = cfg.sessions_root() {
+        app.enable_saving(root);
     }
 }
 
@@ -150,6 +171,15 @@ fn run_tui(mut app: App) -> Result<()> {
     })();
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
+    // Save every finished hand (cutting running reviews short).
+    if app.session.is_saving() {
+        app.session.flush(Duration::from_secs(3));
+        if let Some(e) = app.session.take_save_error() {
+            eprintln!("{e}");
+        } else if let Some(id) = app.session.save_id() {
+            eprintln!("Session saved ({id}): run poker-trainer again to continue it.");
+        }
+    }
     result
 }
 
@@ -441,5 +471,284 @@ mod tests {
         assert_eq!(app.screen, app::Screen::Study);
         study_settle(&mut app);
         assert!(render_at(&app, 120, 34).contains("BB to act"));
+    }
+
+    /// Q quits only when pressed twice in a row.
+    #[test]
+    fn quit_needs_two_presses() {
+        let mut app = App::new(Session::new(TrainerConfig::default()).unwrap(), "/nonexistent/x.toml".into());
+        app.on_key(key('q'));
+        assert!(!app.quit);
+        assert!(render_at(&app, 120, 34).contains("Press Q again to quit"));
+        // Another key in between cancels it.
+        press(&mut app, KeyCode::Down);
+        app.on_key(key('q'));
+        assert!(!app.quit);
+        app.on_key(key('q'));
+        assert!(app.quit);
+    }
+
+    fn quick_cfg(seed: u64) -> TrainerConfig {
+        let mut cfg = TrainerConfig::default();
+        cfg.seed = Some(seed);
+        cfg.ai_delay_ms = 0;
+        cfg.opponent = "Calling Station".into();
+        cfg.solver.flop_mode = trainer::FlopMode::Fast;
+        cfg.solver.flop_turn_samples = 3;
+        cfg.solver.flop_river_samples = 2;
+        cfg.solver.max_iterations = 30;
+        cfg.solver.target_exploitability_pct = 5.0;
+        cfg
+    }
+
+    /// Plays hands through the UI (betting when the RNG is low) until
+    /// `reviewed` hands have graded decisions and are settled.
+    fn play_reviewed(app: &mut App, reviewed: usize) {
+        let mut done = 0;
+        for _ in 0..20_000 {
+            app.tick();
+            let Some(hand) = app.current() else { panic!("no hand") };
+            if hand.hero_to_act() {
+                let roll = hand.current_roll().unwrap();
+                let s = render(app);
+                assert!(s.contains(&format!("RNG {roll:02}")), "{s}");
+                let bet = hand.state.street != holdem::Street::Preflop && roll < 35;
+                let k = if bet && app.action_keys().iter().any(|(k, _)| *k == '1') { '1' } else { 'c' };
+                app.on_key(key(k));
+            } else if hand.is_finished() {
+                if let Some(r) = hand.review() {
+                    while !r.is_finished() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    if !r.status().decisions.is_empty() {
+                        done += 1;
+                    }
+                }
+                app.tick();
+                if done >= reviewed {
+                    return;
+                }
+                app.on_key(key('n'));
+            }
+        }
+        panic!("not enough reviewed hands");
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("poker-trainer-tui-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// Hands are saved; the sessions screen continues, starts and deletes
+    /// sessions; the score screen and the review's RNG line render.
+    #[test]
+    fn sessions_and_score_screens() {
+        let root = scratch("sessions");
+        let mut app = App::new(Session::new(quick_cfg(4)).unwrap(), "/nonexistent/x.toml".into());
+        app.enable_saving(root.clone());
+        assert!(app.sessions.is_empty());
+        press(&mut app, KeyCode::Enter);
+        play_reviewed(&mut app, 2);
+        let first = app.session.save_id().expect("saved after the first hand").to_string();
+        let hands = app.session.history.len();
+
+        // Review: the RNG line maps the number to the solver's mix.
+        app.on_key(key('r'));
+        let s = render(&app);
+        assert!(s.contains("the solver's mix plays"), "{s}");
+        // Score screen.
+        app.on_key(key('g'));
+        let s = render(&app);
+        assert!(s.contains("Frequency score") && s.contains("By spot") && s.contains("Aggression"), "{s}");
+        let small = render_at(&app, 100, 30);
+        assert!(small.contains("Frequency score"), "{small}");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, app::Screen::Review);
+        press(&mut app, KeyCode::Esc);
+
+        // Sessions: start a new one, then continue the first.
+        app.on_key(key('s'));
+        app.on_key(key('o'));
+        assert_eq!(app.screen, app::Screen::Sessions);
+        let s = render(&app);
+        assert!(s.contains("Start a new session") && s.contains("playing now"), "{s}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, app::Screen::Setup);
+        assert!(app.session.history.is_empty() && app.session.save_id().is_none());
+        app.on_key(key('o'));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].summary.hands, hands);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.session.save_id(), Some(first.as_str()));
+        assert_eq!(app.session.history.len(), hands);
+        assert!(app.session.report().is_some(), "the score survives");
+        let s = render(&app);
+        assert!(s.contains(&format!("Saved · {hands} hands")), "{s}");
+
+        // The session in use can't be deleted; another one can.
+        app.on_key(key('o'));
+        press(&mut app, KeyCode::Down);
+        app.on_key(key('d'));
+        assert!(app.confirm_delete.is_none());
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter); // new session
+        press(&mut app, KeyCode::Enter); // play a hand in it
+        play_reviewed(&mut app, 1);
+        app.on_key(key('s'));
+        app.on_key(key('o'));
+        assert_eq!(
+            app.sessions.len(),
+            2,
+            "{:?} now {:?} hist {}",
+            app.sessions.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            app.session.save_id(),
+            app.session.history.len()
+        );
+        let row = 1 + app.sessions.iter().position(|m| m.id == first).unwrap();
+        for _ in 0..row {
+            press(&mut app, KeyCode::Down);
+        }
+        app.on_key(key('d'));
+        assert!(render(&app).contains("Press Y to delete"));
+        app.on_key(key('y'));
+        assert_eq!(app.sessions.len(), 1);
+        assert_ne!(app.sessions[0].id, first);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Prints the score, sessions, setup and review screens (run with
+    /// --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn print_score_screens() {
+        let root = scratch("print");
+        let mut app = App::new(Session::new(quick_cfg(9)).unwrap(), "/nonexistent/x.toml".into());
+        app.enable_saving(root.clone());
+        press(&mut app, KeyCode::Enter);
+        play_reviewed(&mut app, 6);
+        app.on_key(key('r'));
+        println!("{}", render_at(&app, 150, 40));
+        println!("{}", render_at(&app, 100, 30));
+        app.on_key(key('g'));
+        println!("{}", render_at(&app, 150, 40));
+        println!("{}", render_at(&app, 100, 30));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Esc);
+        app.on_key(key('s'));
+        println!("{}", render_at(&app, 100, 30));
+        app.on_key(key('o'));
+        println!("{}", render_at(&app, 150, 40));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Times drawing the screens of a 2000-hand session (run with
+    /// --ignored --nocapture, in release mode for real numbers).
+    #[test]
+    #[ignore]
+    fn bench_large_session_render() {
+        use trainer::save::{SavedReview, SessionStore};
+        let root = scratch("bench");
+        let mut cfg = TrainerConfig::default();
+        cfg.seed = Some(1);
+        cfg.solver.enabled = false;
+        let mut s = Session::new(cfg.clone()).unwrap();
+        let mut saved = Vec::new();
+        for _ in 0..2000 {
+            let mut h = s.new_hand();
+            while h.run_until_hero() == trainer::StepResult::HeroToAct {
+                let a = h.hero_actions();
+                h.hero_act(
+                    *a.iter()
+                        .find(|x| matches!(x, holdem::Action::Check | holdem::Action::Call))
+                        .unwrap_or(&a[0]),
+                )
+                .unwrap();
+            }
+            let mut sh = h.to_saved();
+            let d = trainer::DecisionReview {
+                variant: trainer::Variant::Gto,
+                street: holdem::Street::Flop,
+                board: Vec::new(),
+                history: String::new(),
+                pot: 600,
+                to_call: 0,
+                hero_combo: 0,
+                actions: vec![holdem::Action::Check, holdem::Action::Raise(200)],
+                labels: vec!["Check".into(), "Bet".into()],
+                chosen: 0,
+                best: 0,
+                hero_strategy: vec![0.6, 0.4],
+                hero_ev: vec![1.0, 1.0],
+                ev_loss: 0.0,
+                ev_loss_pct: 0.0,
+                verdict: trainer::Verdict::Best,
+                range_strategy: vec![0.5, 0.5],
+                grid: vec![None; 169],
+                exploitability_pct: 0.3,
+                notes: Vec::new(),
+                spot: trainer::SpotInfo {
+                    players: 2,
+                    in_position: false,
+                    facing: 0,
+                    history_index: 0,
+                    categories: vec!["Check".into(), "33%".into()],
+                },
+            };
+            sh.review = Some(SavedReview {
+                stage: "done".into(),
+                decisions: vec![d.clone(), d.clone(), d],
+                notes: Vec::new(),
+                cancelled: false,
+                error: None,
+            });
+            saved.push(sh);
+        }
+        let store = SessionStore::create(&root, 0).unwrap();
+        let mut meta = s.meta();
+        meta.id = store.id.clone();
+        store.write_meta(&meta).unwrap();
+        store.append_hands(&saved).unwrap();
+        let loaded = store.load().unwrap();
+        let session = Session::resume(loaded, root.clone(), &cfg).unwrap();
+        let mut app = App::new(session, "/nonexistent/x.toml".into());
+        app.sessions_root = Some(root.clone());
+        let time = |app: &App, label: &str| {
+            let mut term = Terminal::new(TestBackend::new(150, 40)).unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                term.draw(|f| ui::draw(f, app)).unwrap();
+            }
+            println!("{label:<12} {:?} per frame", t.elapsed() / 20);
+        };
+        time(&app, "setup");
+        app.on_key(key('h'));
+        app.screen = app::Screen::History;
+        app.history_selected = 1999;
+        time(&app, "history");
+        app.screen = app::Screen::Score;
+        time(&app, "score");
+        app.open_sessions();
+        time(&app, "sessions");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Prints the bet-size editor (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn print_sizes_screen() {
+        let mut app = App::new(Session::new(TrainerConfig::default()).unwrap(), "/nonexistent/x.toml".into());
+        while app.setup_items()[app.setup_cursor] != app::SetupItem::BetSizes {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        let t = std::time::Instant::now();
+        println!("{}", render_at(&app, 120, 34));
+        println!("first draw {:?}", t.elapsed());
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Down);
+        }
+        println!("{}", render_at(&app, 120, 34));
     }
 }
