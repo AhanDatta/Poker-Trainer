@@ -169,6 +169,7 @@ thread_local! {
 
 /// Fold terminals evaluated together: `outs[t][h] = payoffs[t] * compat(h)`
 /// under `reaches[t]` (at most [`LANES`] terminals).
+#[inline(never)]
 pub(crate) fn fold_batch(
     hs: &HandSet,
     p: usize,
@@ -205,7 +206,10 @@ pub(crate) fn fold_batch(
 }
 
 /// Showdown terminals on the same board evaluated together (at most
-/// [`LANES`]). `outs` must be zero-initialized.
+/// [`LANES`]). `outs` must be zero-initialized. `folds[t]` optionally gives
+/// a fold terminal with the same opponent reach as showdown `t` (its payoff
+/// and output), which is read off the first pass.
+#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn showdown_batch(
     hs: &HandSet,
@@ -216,9 +220,11 @@ pub(crate) fn showdown_batch(
     lose: &[f64],
     tie: &[f64],
     outs: &mut [&mut [f32]],
+    folds: &mut [Option<(f64, &mut [f32])>],
 ) {
     let k = reaches.len();
     debug_assert!(k <= LANES && win.len() == k && lose.len() == k && tie.len() == k && outs.len() == k);
+    debug_assert!(folds.len() == k);
     let o = p ^ 1;
     let mine: &[Entry] = &table.lists[p];
     let theirs: &[Entry] = &table.lists[o];
@@ -265,6 +271,32 @@ pub(crate) fn showdown_batch(
                     r[t] = wv[t] * (sum[t] - ma[t] - mb[t]);
                 }
                 i += 1;
+            }
+        }
+
+        // A fold terminal with the same opponent reach as a showdown is
+        // worth `payoff * (all compatible reach)`: finish this pass over the
+        // stronger opponent hands and read it off, instead of a separate
+        // fold sweep.
+        if folds.iter().any(|f| f.is_some()) {
+            while j < theirs.len() {
+                let w = &inter[j];
+                if nonzero(w) {
+                    let e = &theirs[j];
+                    vadd(&mut sum, w);
+                    vadd(&mut minus[e.c1 as usize], w);
+                    vadd(&mut minus[e.c2 as usize], w);
+                }
+                j += 1;
+            }
+            let same = &hs.same[p];
+            for (t, f) in folds.iter_mut().enumerate() {
+                let Some((pay, out)) = f else { continue };
+                let reach = reaches[t];
+                for ((o, &(a, b)), &sm) in out.iter_mut().zip(&hs.cards[p]).zip(same) {
+                    let sw = if sm == NONE { 0.0 } else { reach[sm as usize] as f64 };
+                    *o = (*pay * (sum[t] - minus[a as usize][t] - minus[b as usize][t] + sw)) as f32;
+                }
             }
         }
 

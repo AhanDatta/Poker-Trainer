@@ -111,25 +111,84 @@ pub(crate) fn normalize_in_place(s: &mut [f32], num_actions: usize, n: usize) {
     if n == 0 {
         return;
     }
-    let mut denom = Buf::from_slice(&s[..n]);
+    let mut inv = Buf::from_slice(&s[..n]);
     for row in s.chunks_exact(n).skip(1) {
-        for (d, &v) in denom.iter_mut().zip(row) {
+        for (d, &v) in inv.iter_mut().zip(row) {
             *d += v;
         }
     }
-    // One division per hand instead of one per (action, hand).
-    for d in denom.iter_mut() {
+    // One division per hand instead of one per (action, hand); branch-free
+    // scaling, then the (rare) hands without weight are made uniform.
+    let mut any_zero = false;
+    for d in inv.iter_mut() {
+        any_zero |= *d <= 0.0;
         *d = if *d > 0.0 { 1.0 / *d } else { 0.0 };
     }
-    let uniform = 1.0 / num_actions as f32;
     for row in s.chunks_exact_mut(n) {
-        for (v, &inv) in row.iter_mut().zip(denom.iter()) {
-            *v = if inv > 0.0 { *v * inv } else { uniform };
+        for (v, &i) in row.iter_mut().zip(inv.iter()) {
+            *v *= i;
+        }
+    }
+    if any_zero {
+        let uniform = 1.0 / num_actions as f32;
+        for h in (0..n).filter(|&h| inv[h] == 0.0) {
+            for a in 0..num_actions {
+                s[a * n + h] = uniform;
+            }
+        }
+    }
+}
+
+/// Regret matching from `regrets` into `out` (two reads of the regrets, one
+/// write): strategy proportional to positive regrets, uniform where none
+/// is positive. Any positive scale of the regrets gives the same strategy,
+/// so compressed regrets can be passed undecoded.
+#[inline]
+pub(crate) fn regret_match_into<T: Copy + Into<f32>>(regrets: &[T], num_actions: usize, n: usize, out: &mut [f32]) {
+    if n == 0 {
+        return;
+    }
+    let mut inv = Buf::uninit(n);
+    positive_sums(regrets, n, &mut inv);
+    let mut any_zero = false;
+    for d in inv.iter_mut() {
+        any_zero |= *d <= 0.0;
+        *d = if *d > 0.0 { 1.0 / *d } else { 0.0 };
+    }
+    for (orow, rrow) in out.chunks_exact_mut(n).zip(regrets.chunks_exact(n)) {
+        for ((o, &r), &i) in orow.iter_mut().zip(rrow).zip(inv.iter()) {
+            *o = r.into().max(0.0) * i;
+        }
+    }
+    // Hands without a positive regret play uniformly (rare).
+    if any_zero {
+        let uniform = 1.0 / num_actions as f32;
+        for h in (0..n).filter(|&h| inv[h] == 0.0) {
+            for a in 0..num_actions {
+                out[a * n + h] = uniform;
+            }
+        }
+    }
+    debug_assert!(is_distribution(out, num_actions, n), "regret matching produced an invalid strategy");
+}
+
+/// `sums[h] = sum over actions of max(regret, 0)`.
+#[inline]
+fn positive_sums<T: Copy + Into<f32>>(regrets: &[T], n: usize, sums: &mut [f32]) {
+    let mut rows = regrets.chunks_exact(n);
+    let first = rows.next().expect("at least one action");
+    for (d, &r) in sums.iter_mut().zip(first) {
+        *d = r.into().max(0.0);
+    }
+    for row in rows {
+        for (d, &r) in sums.iter_mut().zip(row) {
+            *d += r.into().max(0.0);
         }
     }
 }
 
 /// Regret matching in place: strategy proportional to positive regrets.
+#[cfg(test)]
 pub(crate) fn regret_match(s: &mut [f32], num_actions: usize, n: usize) {
     for x in s.iter_mut() {
         *x = x.max(0.0);
@@ -264,9 +323,28 @@ pub(crate) fn own_node_combine(ctx: &Ctx, node: &Node, n: usize, cfv: &[f32], mo
         }
         Mode::Cfr(d) => unsafe {
             ctx.store.update_regrets(b, |r| {
-                let mut s = Buf::from_slice(r);
-                regret_match(&mut s, na, n);
-                combine(&s, out);
+                // Value under regret matching without materializing the
+                // strategy: sum(max(r, 0) * cfv) / sum(max(r, 0)), or the
+                // mean over actions when no regret is positive.
+                let mut inv = Buf::uninit(n);
+                positive_sums(r, n, &mut inv);
+                out.fill(0.0);
+                for (rrow, crow) in r.chunks_exact(n).zip(cfv.chunks_exact(n)) {
+                    for ((o, &x), &v) in out.iter_mut().zip(rrow).zip(crow) {
+                        *o += x.max(0.0) * v;
+                    }
+                }
+                let mut any_zero = false;
+                for (o, &dn) in out.iter_mut().zip(inv.iter()) {
+                    any_zero |= dn <= 0.0;
+                    *o *= if dn > 0.0 { 1.0 / dn } else { 0.0 };
+                }
+                if any_zero {
+                    let mean = 1.0 / na as f32;
+                    for h in (0..n).filter(|&h| inv[h] <= 0.0) {
+                        out[h] = (0..na).map(|a| cfv[a * n + h]).sum::<f32>() * mean;
+                    }
+                }
                 let out: &[f32] = out;
                 for (rrow, crow) in r.chunks_exact_mut(n).zip(cfv.chunks_exact(n)) {
                     for ((x, &c), &o) in rrow.iter_mut().zip(crow).zip(out) {
@@ -289,8 +367,7 @@ fn opponent_node(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode
         unsafe {
             match mode {
                 Mode::Cfr(d) => {
-                    ctx.store.load_regrets(b, &mut s);
-                    regret_match(&mut s, na, nq);
+                    ctx.store.load_current_strategy(b, na, nq, &mut s);
                     ctx.store.update_strat(b, |ss| {
                         for (ss_row, s_row) in ss.chunks_exact_mut(nq).zip(s.chunks_exact(nq)) {
                             if d.reach_weighted {
