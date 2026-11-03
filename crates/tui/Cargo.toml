@@ -18,3 +18,4 @@ anyhow.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+rand.workspace = true

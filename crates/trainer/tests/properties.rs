@@ -26,6 +26,7 @@ fn profile() -> impl Strategy<Value = Profile> {
             description: String::new(),
             looseness: l,
             aggression: a,
+            three_bet: a * 0.8,
             bet_freq: b,
             bluff_freq: bl,
             call_down: c,
@@ -33,6 +34,8 @@ fn profile() -> impl Strategy<Value = Profile> {
             raise_threshold: r,
             size_bias: sz,
             slowplay: sp,
+            cbet: b * 0.8,
+            barrel: bl,
         })
 }
 
@@ -74,7 +77,7 @@ proptest! {
         for f in &base {
             prop_assert!(valid(f, &avail), "chart {:?}", f);
         }
-        let adj = p.adjust_preflop(&base, &avail);
+        let adj = p.adjust_preflop(&base, &avail, false);
         for (g, f) in adj.iter().enumerate() {
             prop_assert!(valid(f, &avail), "{} {:?}", HandClass::from_grid_index(g), f);
         }

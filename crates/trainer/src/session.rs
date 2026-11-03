@@ -1,6 +1,6 @@
 //! A training session: deals hands, picks opponents, keeps history and stats.
 
-use crate::config::{HeroPosition, TrainerConfig};
+use crate::config::{GameType, HeroPosition, TrainerConfig};
 use crate::fmt::BB;
 use crate::hand::{HandSetup, LiveHand};
 use crate::preflop::ChartSet;
@@ -8,6 +8,7 @@ use crate::profiles::Profile;
 use crate::review::{ReviewStatus, Verdict};
 use holdem::{Chips, TableConfig};
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,10 +18,9 @@ pub struct Session {
     charts: Arc<ChartSet>,
     rng: StdRng,
     next_id: u64,
-    /// Fixed style for every opponent (when one was chosen).
-    session_profile: Option<Profile>,
-    /// Per-seat styles kept for the whole session (random, not per hand).
-    seat_profiles: Vec<Profile>,
+    /// The opponent in each seat (`None` for the hero's seat). Players stay
+    /// for the session; now and then one leaves and a new one sits down.
+    lineup: Vec<Option<Profile>>,
     button: usize,
     /// Finished hands (most recent last).
     pub history: Vec<LiveHand>,
@@ -89,29 +89,85 @@ impl Session {
             charts: Arc::new(charts),
             rng,
             next_id: 1,
-            session_profile: None,
-            seat_profiles: Vec::new(),
+            lineup: Vec::new(),
             button: 0,
             history: Vec::new(),
         };
-        if !s.config.opponent.eq_ignore_ascii_case("random") {
-            s.session_profile = s.config.profile_by_name(&s.config.opponent);
-        }
         s.button = s.rng.random_range(0..s.config.players);
-        s.reset_seat_profiles();
+        s.reset_lineup();
         Ok(s)
     }
 
-    fn random_profile(&mut self) -> Profile {
-        let all = self.config.profiles();
-        all[self.rng.random_range(0..all.len())].clone()
+    /// A style drawn for a new player: the chosen style, or a draw weighted
+    /// by the game type (custom tables fill extra seats as a typical game).
+    fn draw_style(&mut self) -> Profile {
+        if !self.config.opponent.eq_ignore_ascii_case("random") {
+            if let Some(p) = self.config.profile_by_name(&self.config.opponent) {
+                return p;
+            }
+        }
+        let game = match self.config.game {
+            GameType::Custom => GameType::Typical,
+            g => g,
+        };
+        let weights = game.weights();
+        let total: f64 = weights.iter().map(|w| w.1).sum();
+        let mut x = self.rng.random::<f64>() * total;
+        for &(name, w) in weights {
+            if x < w {
+                return self.config.profile_by_name(name).expect("preset style");
+            }
+            x -= w;
+        }
+        self.config.profile_by_name(weights[0].0).expect("preset style")
     }
 
-    /// New random styles for every seat (used when styles are random per
-    /// session rather than per hand).
-    fn reset_seat_profiles(&mut self) {
+    /// Seats a whole new lineup.
+    fn reset_lineup(&mut self) {
         let n = self.config.players;
-        self.seat_profiles = (0..n).map(|_| self.random_profile()).collect();
+        let hero = 0;
+        let custom =
+            self.config.opponent.eq_ignore_ascii_case("random") && self.config.game == GameType::Custom;
+        let mut players: Vec<Profile> = Vec::new();
+        if custom {
+            for (name, &count) in &self.config.custom_table {
+                if let Some(p) = self.config.profile_by_name(name) {
+                    players.extend(std::iter::repeat_n(p, count));
+                }
+            }
+            players.shuffle(&mut self.rng);
+            players.truncate(n - 1);
+        }
+        while players.len() < n - 1 {
+            let p = self.draw_style();
+            players.push(p);
+        }
+        let mut it = players.into_iter();
+        self.lineup = (0..n).map(|s| if s == hero { None } else { it.next() }).collect();
+    }
+
+    /// The opponent in each seat (`None` for the hero).
+    pub fn lineup(&self) -> &[Option<Profile>] {
+        &self.lineup
+    }
+
+    /// Changes the kind of game and seats a new lineup.
+    pub fn set_game(&mut self, game: GameType) {
+        self.config.opponent = "random".into();
+        self.config.game = game;
+        self.reset_lineup();
+    }
+
+    /// Sets how many players of `style` sit at a custom table.
+    pub fn set_custom_count(&mut self, style: &str, count: usize) {
+        if count == 0 {
+            self.config.custom_table.remove(style);
+        } else {
+            self.config.custom_table.insert(style.to_string(), count);
+        }
+        if self.config.game == GameType::Custom {
+            self.reset_lineup();
+        }
     }
 
     /// Changes the table size (2..=9 players) and reloads the matching charts.
@@ -122,21 +178,20 @@ impl Session {
         self.charts = Arc::new(load_charts(&cfg)?);
         self.config = cfg;
         self.button = self.rng.random_range(0..players);
-        self.reset_seat_profiles();
+        self.reset_lineup();
         Ok(())
     }
 
-    /// Changes the opponent style ("random" or a style name).
+    /// Changes the opponent style ("random" = by game type, or a style name
+    /// for every opponent) and seats a new lineup.
     pub fn set_opponent(&mut self, name: &str) -> Result<(), String> {
         if name.eq_ignore_ascii_case("random") {
             self.config.opponent = "random".into();
-            self.session_profile = None;
-            self.reset_seat_profiles();
-            return Ok(());
+        } else {
+            let p = self.config.profile_by_name(name).ok_or_else(|| format!("unknown style {name:?}"))?;
+            self.config.opponent = p.name.clone();
         }
-        let p = self.config.profile_by_name(name).ok_or_else(|| format!("unknown style {name:?}"))?;
-        self.config.opponent = p.name.clone();
-        self.session_profile = Some(p);
+        self.reset_lineup();
         Ok(())
     }
 
@@ -174,20 +229,25 @@ impl Session {
             HeroPosition::Alternate => (self.button + 1) % n,
         };
         self.button = button;
-        let per_hand_random = self.session_profile.is_none() && self.config.random_each_hand;
-        let profiles: Vec<Option<Profile>> = (0..n)
-            .map(|s| {
-                if s == hero {
-                    None
-                } else if let Some(p) = &self.session_profile {
-                    Some(p.clone())
-                } else if per_hand_random {
-                    Some(self.random_profile())
-                } else {
-                    Some(self.seat_profiles[s].clone())
+        // Table changes: now and then a player leaves and a new one (drawn
+        // from the game type) sits down.
+        let mut new_players = Vec::new();
+        if self.lineup.len() != n || self.config.seat_change_pct >= 100.0 {
+            self.reset_lineup();
+        } else if self.config.seat_change_pct > 0.0 {
+            for seat in (0..n).filter(|&s| s != hero) {
+                if self.rng.random::<f64>() * 100.0 < self.config.seat_change_pct {
+                    let custom = self.config.opponent.eq_ignore_ascii_case("random")
+                        && self.config.game == GameType::Custom;
+                    // A custom table keeps its exact mix.
+                    if !custom {
+                        self.lineup[seat] = Some(self.draw_style());
+                    }
+                    new_players.push(seat);
                 }
-            })
-            .collect();
+            }
+        }
+        let profiles: Vec<Option<Profile>> = self.lineup.clone();
         let stack = (self.config.stack_bb * BB as f64).round() as Chips;
         let setup = HandSetup {
             id: self.next_id,
@@ -205,7 +265,11 @@ impl Session {
         };
         self.next_id += 1;
         let seed: u64 = self.rng.random();
-        LiveHand::new(setup, StdRng::seed_from_u64(seed))
+        let mut hand = LiveHand::new(setup, StdRng::seed_from_u64(seed));
+        for seat in new_players {
+            hand.note(format!("Player {} left; a new player sat down.", seat + 1));
+        }
+        hand
     }
 
     /// Stores a finished (or abandoned) hand in the history.

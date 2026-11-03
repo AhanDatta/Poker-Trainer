@@ -16,7 +16,11 @@ use rand::Rng;
 /// Probabilities for the 169 classes at a preflop decision under a profile.
 pub fn profile_policy(charts: &ChartSet, profile: &Profile, d: &PreDecision) -> Vec<Freqs> {
     let base = chart_policy(charts, d);
-    profile.adjust_preflop(&base, &d.avail)
+    // Someone raised already: the line before the deciding position has a
+    // raise or all-in ("UTG:R BTN:C>BB").
+    let line = d.key.split('>').next().unwrap_or("");
+    let facing_raise = line.contains(":R") || line.contains(":A");
+    profile.adjust_preflop(&base, &d.avail, facing_raise)
 }
 
 fn sample_freqs<R: Rng>(f: &Freqs, rng: &mut R) -> PreAction {
@@ -111,15 +115,26 @@ impl AiPlayer {
             .filter(|&q| q != p)
             .map(|q| self.reads[q].as_slice())
             .collect();
+        let n_opps = opps.len().max(1);
         // `eq` is the chance of beating every opponent: right for pot odds,
         // but in multiway pots it understates hand strength (top pair is
         // well ahead of the 1/n fair share). The style thresholds are
         // heads-up equities, so compare them with a heads-up equivalent:
         // with independent opponents P(beat all) ≈ P(beat one)^n.
         let eq = equity_vs_ranges(hole, &state.board, &opps, 600, rng);
-        let strength = if opps.len() > 1 { eq.powf(1.0 / opps.len() as f32) } else { eq };
+        let strength = if n_opps > 1 { eq.powf(1.0 / n_opps as f32) } else { eq };
         let draw = draw_strength(hole, &state.board);
+        // A pair or better that uses a hole card (what "sticky" players
+        // call down with).
+        let made = {
+            let board = EvalMask::from_cards(&state.board).evaluate();
+            let mine = EvalMask::from_cards(&state.board).add(hole[0]).add(hole[1]).evaluate();
+            holdem::HandCategory::of(mine) > holdem::HandCategory::of(board)
+        };
         let prof = &self.profile;
+        // Bluffs and continuation bets work far less often into several
+        // players.
+        let multi = 0.5f32.powi(n_opps as i32 - 1);
         let street_factor = match state.street {
             Street::Flop => 1.0,
             Street::Turn => 0.8,
@@ -135,22 +150,36 @@ impl AiPlayer {
         };
 
         if sit.to_call == 0 {
-            if !raises.is_empty() {
-                if strength >= prof.value_threshold {
-                    if rng.random::<f32>() >= prof.slowplay && rng.random::<f32>() < prof.bet_freq {
-                        let s = (strength - prof.value_threshold) * 3.0;
-                        return Action::Raise(size(s, rng));
-                    }
-                    return Action::Check;
+            if raises.is_empty() {
+                return Action::Check;
+            }
+            if strength >= prof.value_threshold {
+                if rng.random::<f32>() >= prof.slowplay && rng.random::<f32>() < prof.bet_freq {
+                    let s = (strength - prof.value_threshold) * 3.0;
+                    return Action::Raise(size(s, rng));
                 }
-                if strength >= prof.value_threshold - 0.12 && rng.random::<f32>() < prof.bet_freq * 0.25 {
-                    return Action::Raise(size(-0.6, rng));
+                return Action::Check;
+            }
+            // The last aggressor keeps the initiative: c-bets the flop and
+            // barrels later streets (more with draws), independent of its
+            // exact hand.
+            if self.has_initiative(state) {
+                let freq = if state.street == Street::Flop {
+                    prof.cbet
+                } else {
+                    prof.barrel * (0.6 + 0.8 * draw).min(1.4) * if made { 1.0 } else { street_factor }
+                };
+                if rng.random::<f32>() < freq * multi {
+                    return Action::Raise(size(-0.7, rng));
                 }
-                if strength < 0.42 {
-                    let p_bluff = prof.bluff_freq * street_factor * (0.45 + draw);
-                    if rng.random::<f32>() < p_bluff {
-                        return Action::Raise(size(0.0, rng));
-                    }
+            }
+            if strength >= prof.value_threshold - 0.12 && rng.random::<f32>() < prof.bet_freq * 0.25 {
+                return Action::Raise(size(-0.6, rng));
+            }
+            if strength < 0.42 {
+                let p_bluff = prof.bluff_freq * street_factor * (0.45 + draw) * multi;
+                if rng.random::<f32>() < p_bluff {
+                    return Action::Raise(size(0.0, rng));
                 }
             }
             return Action::Check;
@@ -173,19 +202,47 @@ impl AiPlayer {
         if eq >= need {
             if !raises.is_empty()
                 && draw > 0.3
-                && rng.random::<f32>() < prof.bluff_freq * 0.25 * street_factor
+                && rng.random::<f32>() < prof.bluff_freq * 0.25 * street_factor * multi
             {
                 return Action::Raise(raises[0]);
             }
             return Action::Call;
         }
-        if !raises.is_empty() && rng.random::<f32>() < prof.bluff_freq * 0.12 * (0.3 + draw) * street_factor {
+        if !raises.is_empty()
+            && rng.random::<f32>() < prof.bluff_freq * 0.12 * (0.3 + draw) * street_factor * multi
+        {
             return Action::Raise(raises[0]);
+        }
+        // Sticky players call down with any pair or draw (less so when
+        // the bet is big or it's for their stack).
+        let sticky = prof.call_down.powi(3) * (1.0 - required).max(0.0);
+        if (made || draw > 0.0) && !all_in_call && rng.random::<f32>() < sticky {
+            return Action::Call;
         }
         if eq >= need * 0.7 && rng.random::<f32>() < prof.call_down * 0.35 {
             return Action::Call;
         }
         Action::Fold
+    }
+
+    /// Whether this seat made the last bet or raise of the previous street
+    /// (the preflop raiser on the flop), with nobody betting yet on this one.
+    fn has_initiative(&self, state: &HandState) -> bool {
+        let prev = match state.street {
+            Street::Flop => Street::Preflop,
+            Street::Turn => Street::Flop,
+            Street::River => Street::Turn,
+            Street::Preflop => return false,
+        };
+        let last_aggressor = state
+            .history
+            .iter()
+            .filter(|r| r.street == prev && matches!(r.action, Action::Raise(_)))
+            .map(|r| r.player)
+            .next_back();
+        let bet_this_street =
+            state.history.iter().any(|r| r.street == state.street && matches!(r.action, Action::Raise(_)));
+        last_aggressor == Some(self.seat) && !bet_this_street
     }
 }
 

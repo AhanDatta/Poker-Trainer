@@ -104,6 +104,11 @@ impl LiveHand {
         hand
     }
 
+    /// Adds a table note (not tied to a seat) to the hand log.
+    pub fn note(&mut self, text: String) {
+        self.push_log(None, text);
+    }
+
     pub fn menu(&self) -> &BetMenu {
         &self.menu
     }
@@ -184,6 +189,20 @@ impl LiveHand {
     }
 
     /// Applies the hero's action.
+    /// Lets an AI play the hero's seat (when the setup gave the hero a
+    /// profile): used for all-AI simulations. Returns the action taken.
+    pub fn autoplay_hero(&mut self) -> Result<Action, GameError> {
+        if !self.hero_to_act() {
+            return Err(GameError::NotBetting);
+        }
+        if self.ais[self.hero].is_none() {
+            return Err(GameError::IllegalAction("the hero seat has no AI profile".into()));
+        }
+        let action = self.ai_decision(self.hero);
+        self.apply(self.hero, action)?;
+        Ok(action)
+    }
+
     pub fn hero_act(&mut self, action: Action) -> Result<(), GameError> {
         if !self.hero_to_act() {
             return Err(GameError::NotBetting);

@@ -1,8 +1,10 @@
 //! Rendering.
 
-use crate::app::{App, Screen, SetupItem, SETUP_ITEMS};
-use holdem::combo::{combo_cards, HandClass, NUM_CLASSES};
-use holdem::{Action, Card, Street};
+use crate::app::{App, Mode, OpponentChoice, Screen, SetupItem, SEAT_CHANGE_PRESETS};
+use crate::widgets::{
+    action_color, bar, big_cards, card_span, cards_spans, combo_spans, draw_grid, legend, truncate, GridCell, Hit, ACCENT,
+};
+use holdem::{Card, Street};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -10,17 +12,16 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use trainer::config::{FlopMode, HeroPosition, VillainRange};
 use trainer::fmt::bb;
-use trainer::review::ClassCell;
 use trainer::{DecisionReview, LiveHand, Variant, Verdict};
 
-const ACCENT: Color = Color::Cyan;
-
 pub fn draw(f: &mut Frame, app: &App) {
+    app.hits.clear();
     match app.screen {
         Screen::Setup => draw_setup(f, app),
         Screen::Table => draw_table(f, app),
         Screen::Review => draw_review(f, app),
         Screen::History => draw_history(f, app),
+        Screen::Study => crate::study_ui::draw_study(f, app),
         Screen::Help => draw_help(f),
     }
     if let Some((msg, _)) = &app.message {
@@ -42,36 +43,6 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-fn suit_style(c: Card) -> (char, Color) {
-    match c.suit() {
-        0 => ('♣', Color::Green),
-        1 => ('♦', Color::LightBlue),
-        2 => ('♥', Color::LightRed),
-        _ => ('♠', Color::White),
-    }
-}
-
-fn card_span(c: Card) -> Span<'static> {
-    let (sym, color) = suit_style(c);
-    Span::styled(format!("{}{}", c.rank_char(), sym), Style::default().fg(color).add_modifier(Modifier::BOLD))
-}
-
-fn cards_spans(cards: &[Card]) -> Vec<Span<'static>> {
-    let mut v = Vec::new();
-    for (i, &c) in cards.iter().enumerate() {
-        if i > 0 {
-            v.push(Span::raw(" "));
-        }
-        v.push(card_span(c));
-    }
-    v
-}
-
-fn combo_spans(combo: usize) -> Vec<Span<'static>> {
-    let (a, b) = combo_cards(combo);
-    cards_spans(&[a, b])
-}
-
 fn verdict_color(v: Verdict) -> Color {
     match v {
         Verdict::Best => Color::Green,
@@ -82,26 +53,7 @@ fn verdict_color(v: Verdict) -> Color {
     }
 }
 
-/// Color of the `i`-th action in a node's action list.
-fn action_color(actions: &[Action], i: usize) -> Color {
-    match actions[i] {
-        Action::Fold => Color::DarkGray,
-        Action::Check | Action::Call => Color::Green,
-        Action::Raise(_) => {
-            let raises: Vec<usize> =
-                (0..actions.len()).filter(|&j| matches!(actions[j], Action::Raise(_))).collect();
-            let k = raises.iter().position(|&j| j == i).unwrap_or(0);
-            let palette = [Color::Yellow, Color::LightRed, Color::Red, Color::Magenta];
-            if k + 1 == raises.len() && raises.len() > 1 {
-                palette[(raises.len() - 1).min(3)]
-            } else {
-                palette[k.min(3)]
-            }
-        }
-    }
-}
-
-fn title_bar(app: &App, extra: &str) -> Paragraph<'static> {
+pub(crate) fn title_bar(app: &App, extra: &str) -> Paragraph<'static> {
     let st = app.session.stats();
     let mut spans = vec![
         Span::styled(
@@ -133,123 +85,222 @@ fn title_bar(app: &App, extra: &str) -> Paragraph<'static> {
     Paragraph::new(Line::from(spans))
 }
 
+/// Short value of a setup row and a longer explanation (shown for the
+/// selected row).
+fn setup_value(app: &App, item: SetupItem) -> (String, String) {
+    let cfg = &app.session.config;
+    let s = |a: &str, b: &str| (a.to_string(), b.to_string());
+    match item {
+        SetupItem::Mode => match app.mode {
+            Mode::Play => s("Play hands", "Play against the AI; after each hand the solver grades your postflop decisions."),
+            Mode::Study => s(
+                "Solver study",
+                "Browse the preflop charts and the solver's postflop strategy in any spot, GTO Wizard style.",
+            ),
+        },
+        SetupItem::Table if app.mode == Mode::Study => match cfg.players {
+            2 => s("Heads-up", "Preflop lines come from the heads-up solver charts."),
+            6 => s("6-max", "Preflop lines come from the 6-max solver charts."),
+            9 => s("9-max", "9-max preflop lines use position-aware rules (no 9-max solver charts)."),
+            n => (format!("{n} players"), String::new()),
+        },
+        SetupItem::Table => match cfg.players {
+            2 => s("Heads-up", "Two players."),
+            6 => s("6-max", "Six players."),
+            9 => s("9-max", "Full ring; preflop uses position-aware rules (no 9-max solver charts)."),
+            n => (format!("{n} players"), String::new()),
+        },
+        SetupItem::Opponent => match app.current_opponent_choice() {
+            OpponentChoice::Game(g) if cfg.players == 2 => {
+                (g.label().to_string(), format!("Your opponent is drawn from: {}.", g.description()))
+            }
+            OpponentChoice::Game(g) => (g.label().to_string(), format!("Seats are filled with {}.", g.description())),
+            OpponentChoice::Style(name) => {
+                let d = cfg.profile_by_name(&name).map(|p| p.description).unwrap_or_default();
+                (format!("All {name}"), d)
+            }
+        },
+        SetupItem::Count(i) => {
+            let name = cfg.profiles().get(i).map(|p| p.name.clone()).unwrap_or_default();
+            let n = cfg.custom_table.get(&name).copied().unwrap_or(0);
+            let d = cfg.profile_by_name(&name).map(|p| p.description).unwrap_or_default();
+            (format!("{n} at the table"), format!("{name}: {d}"))
+        }
+        SetupItem::SeatChanges => {
+            let label = SEAT_CHANGE_PRESETS
+                .iter()
+                .find(|&&(p, _)| (p - cfg.seat_change_pct).abs() < 1e-9)
+                .map(|&(_, l)| l.to_string())
+                .unwrap_or_else(|| format!("{}% chance per player and hand", cfg.seat_change_pct));
+            match label.split_once(": ") {
+                Some((a, b)) => (a.to_string(), format!("{b}.")),
+                None => (label, String::new()),
+            }
+        }
+        SetupItem::Position => match (cfg.hero_position, cfg.players) {
+            (HeroPosition::Alternate, 2) => s("Alternate", "Alternate between SB (button) and BB."),
+            (HeroPosition::Alternate, _) => s("Rotate", "The button moves every hand."),
+            (HeroPosition::Random, _) => s("Random", "A random seat every hand."),
+            (HeroPosition::Sb, 2) => s("Always SB", "Always the small blind (the button heads-up)."),
+            (HeroPosition::Sb, _) => s("Always SB", "Always the small blind."),
+            (HeroPosition::Bb, _) => s("Always BB", "Always the big blind."),
+        },
+        SetupItem::Stack => (
+            format!("{}bb", cfg.stack_bb),
+            if (cfg.stack_bb - 100.0).abs() > 1e-9 {
+                "The built-in preflop charts assume 100bb stacks.".into()
+            } else {
+                "Starting stacks.".into()
+            },
+        ),
+        SetupItem::Rake => {
+            if cfg.rake_pct <= 0.0 {
+                s("None", "No rake.")
+            } else {
+                (
+                    format!("{}%, cap {}bb", cfg.rake_pct, cfg.rake_cap_bb),
+                    format!("{}% of the pot, capped at {}bb (no flop, no drop).", cfg.rake_pct, cfg.rake_cap_bb),
+                )
+            }
+        }
+        SetupItem::FlopSolve => match cfg.solver.flop_mode {
+            FlopMode::Fast => (
+                "Fast".into(),
+                format!(
+                    "Every turn card and {} sampled river cards per turn: ~4x faster, close to exact.",
+                    cfg.solver.flop_river_samples
+                ),
+            ),
+            FlopMode::Exact => (
+                "Exact".into(),
+                format!("Every runout: up to {} GB of RAM and minutes per flop.", cfg.solver.max_memory_gb),
+            ),
+        },
+        SetupItem::VillainRange => match cfg.solver.villain_range {
+            VillainRange::Gto => s("GTO ranges", "The review assumes villains play the charts preflop."),
+            VillainRange::Actual => {
+                s("Actual range", "The review uses each villain style's own preflop range.")
+            }
+            VillainRange::Both => s("Both", "Both solves side by side (twice the solving time)."),
+        },
+        SetupItem::RevealStyle => {
+            if cfg.show_opponent_style {
+                s("On", "Opponents' styles are shown during the hand.")
+            } else {
+                s("Off", "Opponents' styles are shown in the review.")
+            }
+        }
+    }
+}
+
 fn draw_setup(f: &mut Frame, app: &App) {
     let area = f.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(10), Constraint::Length(3)])
+        .constraints([Constraint::Length(1), Constraint::Min(10), Constraint::Length(2)])
         .split(area);
     f.render_widget(title_bar(app, "Setup"), rows[0]);
     let cfg = &app.session.config;
-    let value = |item: SetupItem| -> String {
+    let label = |item: SetupItem| -> String {
         match item {
-            SetupItem::Table => match cfg.players {
-                2 => "Heads-up (2 players)".into(),
-                6 => "6-max".into(),
-                9 => "9-max (full ring)".into(),
-                n => format!("{n} players"),
-            },
+            SetupItem::Mode => "Mode",
+            SetupItem::Table => "Table",
             SetupItem::Opponent => {
-                if cfg.opponent.eq_ignore_ascii_case("random") {
-                    "Random style each hand".into()
+                if cfg.players == 2 {
+                    "Opponent"
                 } else {
-                    let d = cfg.profile_by_name(&cfg.opponent).map(|p| p.description).unwrap_or_default();
-                    format!("{} — {d}", cfg.opponent)
+                    "Opponents"
                 }
             }
-            SetupItem::Position => match (cfg.hero_position, cfg.players) {
-                (HeroPosition::Alternate, 2) => "Alternate SB / BB".into(),
-                (HeroPosition::Alternate, _) => "Rotate (the button moves every hand)".into(),
-                (HeroPosition::Random, _) => "Random".into(),
-                (HeroPosition::Sb, 2) => "Always SB (button)".into(),
-                (HeroPosition::Sb, _) => "Always SB".into(),
-                (HeroPosition::Bb, _) => "Always BB".into(),
-            },
-            SetupItem::Stack => format!("{}bb", cfg.stack_bb),
-            SetupItem::Rake => {
-                if cfg.rake_pct <= 0.0 {
-                    "None".into()
-                } else {
-                    format!(
-                        "{}% of the pot, capped at {}bb (no flop, no drop)",
-                        cfg.rake_pct, cfg.rake_cap_bb
-                    )
-                }
+            SetupItem::Count(i) => {
+                return format!("  {}", cfg.profiles().get(i).map(|p| p.name.clone()).unwrap_or_default())
             }
-            SetupItem::FlopSolve => match cfg.solver.flop_mode {
-                FlopMode::Fast => format!(
-                    "Fast — {} turn × {} sampled river cards (~4x faster, approximate)",
-                    cfg.solver.flop_turn_samples, cfg.solver.flop_river_samples
-                ),
-                FlopMode::Exact => {
-                    format!("Exact — every runout (up to {} GB of RAM, minutes)", cfg.solver.max_memory_gb)
-                }
-            },
-            SetupItem::VillainRange => match cfg.solver.villain_range {
-                VillainRange::Gto => "GTO ranges (villain plays the charts)".into(),
-                VillainRange::Actual => "Villain's actual range (its style's preflop range)".into(),
-                VillainRange::Both => "Both, side by side (2× solving time)".into(),
-            },
-            SetupItem::RevealStyle => {
-                if cfg.show_opponent_style { "On" } else { "Off (shown in the review)" }.into()
-            }
+            SetupItem::SeatChanges => "New players sit down",
+            SetupItem::Position => "Your position",
+            SetupItem::Stack => "Stacks",
+            SetupItem::Rake => "Rake",
+            SetupItem::FlopSolve => "Flop solving",
+            SetupItem::VillainRange => "Villain range in review",
+            SetupItem::RevealStyle => "Reveal style during hand",
         }
+        .to_string()
     };
-    let label = |item: SetupItem| match item {
-        SetupItem::Table => "Table",
-        SetupItem::Opponent => "Opponent style",
-        SetupItem::Position => "Your position",
-        SetupItem::Stack => "Stacks",
-        SetupItem::Rake => "Rake",
-        SetupItem::FlopSolve => "Flop solving",
-        SetupItem::VillainRange => "Villain range in review",
-        SetupItem::RevealStyle => "Reveal style during hand",
-    };
-    let items: Vec<ListItem> = SETUP_ITEMS
+    let setup_items = app.setup_items();
+    let label_w = 26;
+    let items: Vec<ListItem> = setup_items
         .iter()
         .map(|&it| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<26}", label(it)), Style::default().fg(ACCENT)),
+                Span::styled(format!("{:<label_w$}", label(it)), Style::default().fg(ACCENT)),
                 Span::raw("◂ "),
-                Span::styled(value(it), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(setup_value(app, it).0, Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(" ▸"),
             ]))
         })
         .collect();
-    let mut state = ListState::default().with_selected(Some(app.setup_cursor));
+    let cursor = app.setup_cursor.min(setup_items.len() - 1);
+    let mut state = ListState::default().with_selected(Some(cursor));
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(" Settings "))
         .highlight_style(Style::default().bg(Color::DarkGray))
         .highlight_symbol("▶ ");
     let mid = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(SETUP_ITEMS.len() as u16 + 2), Constraint::Min(4)])
+        .constraints([Constraint::Length(setup_items.len() as u16 + 2), Constraint::Min(4)])
         .split(rows[1]);
     f.render_stateful_widget(list, mid[0], &mut state);
-    let about = vec![
-        Line::from("Play NLHE hands (heads-up, 6-max or 9-max) from preflop to the river against AI"),
-        Line::from("opponents with different styles. After each hand, press R to see what the solver"),
-        Line::from("would have done in every postflop spot you played, with the EV of each option."),
+    let (_, detail) = setup_value(app, setup_items[cursor]);
+    let mut about = vec![
+        Line::from(vec![
+            Span::styled(format!("{}: ", label(setup_items[cursor]).trim()), Style::default().fg(ACCENT)),
+            Span::raw(detail),
+        ]),
         Line::from(""),
-        Line::from(Span::styled(
-            "Preflop decisions are not graded yet; the charts set the AIs' play and the starting ranges.",
-            Style::default().fg(Color::DarkGray),
-        )),
     ];
+    about.extend(match app.mode {
+        Mode::Play => vec![
+            Line::from(
+                "Play NLHE hands (heads-up, 6-max or 9-max) from preflop to the river against AI \
+                 opponents with different styles. After each hand, press R to see what the solver \
+                 would have done in every postflop spot you played, with the EV of each option.",
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Preflop decisions are not graded yet; the charts set the AIs' play and the starting ranges. \
+                 Text too small? Zoom your terminal (Ctrl/Cmd +): every screen adapts down to about 100×30.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+        Mode::Study => vec![
+            Line::from(
+                "Click through a preflop line in the charts (seeing each player's range), deal a flop, \
+                 and browse the solver's strategy: every hand's mix and EV, both ranges, any bet or \
+                 raise. Turn and river are solved when you deal them. Press E there to type your own \
+                 ranges, pot and board instead.",
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Heads-up and 3-way pots (3-way solves are approximate). Fast flop solving is recommended here.",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ],
+    });
     f.render_widget(
-        Paragraph::new(about)
-            .block(Block::default().borders(Borders::ALL).title(" About "))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(about).block(Block::default().borders(Borders::ALL).title(" About ")).wrap(Wrap { trim: true }),
         mid[1],
     );
+    let keys = match app.mode {
+        Mode::Play => "↑/↓ select · ←/→ change · Enter play · W save settings · ? help · Q quit",
+        Mode::Study => "↑/↓ select · ←/→ change · Enter study · W save settings · ? help · Q quit",
+    };
     f.render_widget(
-        Paragraph::new("↑/↓ select · ←/→ change · Enter play · W save settings · ? help · Q quit")
-            .block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(truncate(keys, area.width as usize)).block(Block::default().borders(Borders::TOP)),
         rows[2],
     );
 }
 
-fn seat_line(hand: &LiveHand, seat: usize, show_cards: bool, app: &App) -> Line<'static> {
+/// One seat on the felt; `width` is the felt's inner width.
+fn seat_line(hand: &LiveHand, seat: usize, show_cards: bool, app: &App, width: u16) -> Line<'static> {
     let st = &hand.state;
     let mut spans = Vec::new();
     let is_hero = seat == hand.hero;
@@ -264,14 +315,14 @@ fn seat_line(hand: &LiveHand, seat: usize, show_cards: bool, app: &App) -> Line<
             who
         }
     };
+    let name_w = (width as usize).saturating_sub(44).clamp(10, 26);
     let to_act = st.to_act == Some(seat);
     spans.push(Span::styled(
-        format!("{} {:<20}", if to_act { "▶" } else { " " }, name),
+        format!("{} {:<name_w$} ", if to_act { "▶" } else { " " }, truncate(&name, name_w)),
         Style::default().fg(if is_hero { ACCENT } else { Color::White }).add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(format!("{:<4}", st.position_name(seat)), Style::default().fg(Color::Yellow)));
-    spans.push(Span::raw(format!(" stack {:<9}", bb(st.stacks[seat]))));
-    spans.push(Span::raw("  "));
+    spans.push(Span::raw(format!(" {:>8}  ", bb(st.stacks[seat]))));
     if st.folded[seat] {
         spans.push(Span::styled("folded", Style::default().fg(Color::DarkGray)));
     } else if show_cards {
@@ -281,67 +332,119 @@ fn seat_line(hand: &LiveHand, seat: usize, show_cards: bool, app: &App) -> Line<
     }
     if st.street_commit[seat] > 0 {
         spans.push(Span::styled(
-            format!("   bet {}", bb(st.street_commit[seat])),
+            format!("  bet {}", bb(st.street_commit[seat])),
             Style::default().fg(Color::LightYellow),
         ));
     }
     if st.is_all_in(seat) {
-        spans.push(Span::styled("  ALL-IN", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" ALL-IN", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
     }
     Line::from(spans)
+}
+
+/// Action buttons laid out in lines of at most `width` columns; returns the
+/// lines and each button's (line, column, width).
+fn action_buttons(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<(u16, u16, u16)>) {
+    let Some(hand) = app.current() else { return (Vec::new(), Vec::new()) };
+    let Some(ctx) = hand.action_context() else { return (Vec::new(), Vec::new()) };
+    let mut lines: Vec<Vec<Span>> = vec![Vec::new()];
+    let mut boxes = Vec::new();
+    let mut x = 0u16;
+    for (key, a) in app.action_keys() {
+        let k = format!(" [{}] ", key.to_ascii_uppercase());
+        let l = format!(" {}  ", trainer::fmt::action_label(a, &ctx));
+        let w = (k.chars().count() + l.chars().count()) as u16;
+        if x > 0 && x + w > width {
+            lines.push(Vec::new());
+            x = 0;
+        }
+        boxes.push(((lines.len() - 1) as u16, x, w));
+        let line = lines.last_mut().unwrap();
+        line.push(Span::styled(k, Style::default().fg(Color::Black).bg(ACCENT).add_modifier(Modifier::BOLD)));
+        line.push(Span::styled(l, Style::default().add_modifier(Modifier::BOLD)));
+        line.push(Span::raw(" "));
+        x += w + 1;
+    }
+    (lines.into_iter().map(Line::from).collect(), boxes)
 }
 
 fn draw_table(f: &mut Frame, app: &App) {
     let area = f.area();
     let Some(hand) = app.current() else { return };
+    let (buttons, boxes) =
+        if hand.hero_to_act() { action_buttons(app, area.width.saturating_sub(2)) } else { (Vec::new(), Vec::new()) };
+    let actions_h = 3 + buttons.len().max(1) as u16;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(10),
-            Constraint::Length(4),
-            Constraint::Length(3),
+            Constraint::Length(actions_h),
+            Constraint::Length(2),
         ])
         .split(area);
     f.render_widget(title_bar(app, &format!("Hand #{}", hand.id)), rows[0]);
+    let log_w = (area.width * 38 / 100).clamp(30, 60);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([Constraint::Min(50), Constraint::Length(log_w)])
         .split(rows[1]);
 
-    // Felt.
+    // Felt: opponents in seating order starting left of the hero (their
+    // cards are shown at showdown), the board and pot, then the hero.
     let st = &hand.state;
     let n = st.num_players();
     let showdown = hand.is_finished() && hand.settlement().is_some_and(|s| s.showdown);
-    let mut board_spans = vec![Span::raw("      Board  ")];
-    for i in 0..5 {
-        if i > 0 {
-            board_spans.push(Span::raw(" "));
-        }
-        match st.board.get(i) {
-            Some(&c) => board_spans.push(card_span(c)),
-            None => board_spans.push(Span::styled("··", Style::default().fg(Color::DarkGray))),
-        }
-    }
-    // Opponents in seating order starting left of the hero; cards are shown
-    // at showdown for players still in the hand.
-    let mut felt = vec![Line::from("")];
+    let inner_w = cols[0].width.saturating_sub(2);
+    let inner_h = cols[0].height.saturating_sub(2) as usize;
+    let base = n + 2; // seats + board + pot
+    let big_board = inner_h >= base + 2 + 2;
+    let big_hero = big_board && inner_h >= base + 2 + 3 + 3;
+    let used = base + if big_board { 2 } else { 0 } + if big_hero { 3 } else { 0 };
+    let spare = inner_h.saturating_sub(used);
+    let gap = (spare / 3).min(3);
+    let mut felt = vec![Line::from(""); (spare - 2 * gap) / 2];
     for k in 1..n {
         let seat = (hand.hero + k) % n;
-        felt.push(seat_line(hand, seat, showdown && !st.folded[seat], app));
+        felt.push(seat_line(hand, seat, showdown && !st.folded[seat], app, inner_w));
     }
-    let spacer = if n <= 3 { 2 } else { 1 };
-    felt.extend(std::iter::repeat_n(Line::from(""), spacer));
-    felt.extend(vec![
-        Line::from(board_spans),
-        Line::from(vec![
-            Span::raw("      Pot    "),
-            Span::styled(bb(st.pot()), Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("   {}", st.street), Style::default().fg(Color::DarkGray)),
-        ]),
-    ]);
-    felt.extend(std::iter::repeat_n(Line::from(""), spacer));
-    felt.push(seat_line(hand, hand.hero, true, app));
+    felt.extend(std::iter::repeat_n(Line::from(""), gap));
+    let board: Vec<Option<Card>> = (0..5).map(|i| st.board.get(i).copied()).collect();
+    if big_board {
+        let pad = "       ";
+        for (i, l) in big_cards(&board).into_iter().enumerate() {
+            let mut spans = vec![Span::raw(if i == 1 { "  Board" } else { "       " }), Span::raw(pad)];
+            spans.extend(l.spans);
+            felt.push(Line::from(spans));
+        }
+    } else {
+        let mut spans = vec![Span::raw("  Board  ")];
+        for (i, c) in board.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::raw(" "));
+            }
+            match c {
+                Some(c) => spans.push(card_span(*c)),
+                None => spans.push(Span::styled("··", Style::default().fg(Color::DarkGray))),
+            }
+        }
+        felt.push(Line::from(spans));
+    }
+    felt.push(Line::from(vec![
+        Span::raw("  Pot    "),
+        Span::styled(bb(st.pot()), Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("   {}", st.street), Style::default().fg(Color::DarkGray)),
+    ]));
+    felt.extend(std::iter::repeat_n(Line::from(""), gap));
+    felt.push(seat_line(hand, hand.hero, true, app, inner_w));
+    if big_hero {
+        let hole: Vec<Option<Card>> = st.hole[hand.hero].iter().copied().map(Some).collect();
+        for l in big_cards(&hole) {
+            let mut spans = vec![Span::raw("    ")];
+            spans.extend(l.spans);
+            felt.push(Line::from(spans));
+        }
+    }
     f.render_widget(
         Paragraph::new(felt).block(
             Block::default()
@@ -352,9 +455,19 @@ fn draw_table(f: &mut Frame, app: &App) {
         cols[0],
     );
 
-    // Log.
+    // Log: the latest lines that fit (long lines wrap).
+    let log_w = cols[1].width.saturating_sub(2).max(1) as usize;
     let log_height = cols[1].height.saturating_sub(2) as usize;
-    let start = hand.log.len().saturating_sub(log_height);
+    let mut used_rows = 0;
+    let mut start = hand.log.len();
+    while start > 0 {
+        let rows_needed = hand.log[start - 1].text.chars().count().div_ceil(log_w).max(1);
+        if used_rows + rows_needed > log_height {
+            break;
+        }
+        used_rows += rows_needed;
+        start -= 1;
+    }
     let log: Vec<Line> = hand.log[start..]
         .iter()
         .map(|e| {
@@ -377,19 +490,18 @@ fn draw_table(f: &mut Frame, app: &App) {
     let mut lines = Vec::new();
     if hand.hero_to_act() {
         let ctx = hand.action_context().unwrap();
-        let mut spans = Vec::new();
-        for (key, a) in app.action_keys() {
-            spans.push(Span::styled(
-                format!(" [{}] ", key.to_ascii_uppercase()),
-                Style::default().fg(Color::Black).bg(ACCENT),
-            ));
-            spans.push(Span::raw(format!(" {}   ", trainer::fmt::action_label(a, &ctx))));
+        for (i, &(line, x, w)) in boxes.iter().enumerate() {
+            app.hits.add(
+                Rect { x: rows[2].x + 1 + x, y: rows[2].y + 1 + line, width: w, height: 1 },
+                Hit::Action(i),
+            );
         }
-        lines.push(Line::from(spans));
+        lines.extend(buttons);
         let mut info = format!("To call {} · pot {}", bb(ctx.to_call), bb(ctx.pot));
         if st.street == Street::Preflop {
-            info.push_str(" · [X]/[C] check/call · [A] max raise");
+            info.push_str(" · X/C check/call · A max raise");
         }
+        info.push_str(" · or click a button");
         lines.push(Line::from(Span::styled(info, Style::default().fg(Color::DarkGray))));
     } else if hand.is_finished() {
         let net = hand.hero_net().unwrap_or(0);
@@ -407,7 +519,9 @@ fn draw_table(f: &mut Frame, app: &App) {
         lines.push(Line::from(Span::styled("Villain is thinking…", Style::default().fg(Color::DarkGray))));
     }
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" Your move ")),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title(" Your move ")),
         rows[2],
     );
 
@@ -439,7 +553,7 @@ fn draw_table(f: &mut Frame, app: &App) {
                     s.decisions.len()
                 );
             }
-            Line::from(Span::styled(text, Style::default().fg(Color::LightMagenta)))
+            Line::from(Span::styled(truncate(&text, area.width as usize), Style::default().fg(Color::LightMagenta)))
         }
     };
     f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP)), rows[3]);
@@ -455,11 +569,6 @@ fn elapsed(s: &trainer::ReviewStatus) -> String {
         }
         _ => String::new(),
     }
-}
-
-fn bar(frac: f32, width: usize) -> String {
-    let filled = (frac.clamp(0.0, 1.0) * width as f32).round() as usize;
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
 }
 
 fn draw_review(f: &mut Frame, app: &App) {
@@ -523,45 +632,91 @@ fn draw_review(f: &mut Frame, app: &App) {
     let header = vec![Line::from(head), Line::from(Span::styled(second, Style::default().fg(Color::Yellow)))];
     f.render_widget(Paragraph::new(header).block(Block::default().borders(Borders::BOTTOM)), rows[1]);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(38), Constraint::Min(40)])
-        .split(rows[2]);
     let decisions = app.visible_decisions();
-    let items: Vec<ListItem> = decisions
-        .iter()
-        .map(|d| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{:<6}", d.street.name()), Style::default().fg(Color::Yellow)),
-                Span::raw(format!("{:<17}", truncate(&d.labels[d.chosen], 16))),
-                Span::styled(
-                    format!("{:>3} {}", d.verdict.symbol(), d.verdict.label()),
-                    Style::default().fg(verdict_color(d.verdict)).add_modifier(Modifier::BOLD),
-                ),
-            ]))
-        })
-        .collect();
-    let mut state = ListState::default().with_selected(if decisions.is_empty() {
-        None
-    } else {
-        Some(app.review_selected.min(decisions.len() - 1))
-    });
+    let selected = app.review_selected.min(decisions.len().saturating_sub(1));
     let empty_msg = if decisions.is_empty() && status.finished {
         " No postflop decisions to grade "
     } else {
         " Your decisions "
     };
-    f.render_stateful_widget(
-        List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(empty_msg))
-            .highlight_style(Style::default().bg(Color::DarkGray))
-            .highlight_symbol("▶ "),
-        cols[0],
-        &mut state,
-    );
-
+    // Wide windows list the decisions on the left; narrower ones show them
+    // as a strip above the details, leaving the full width to the grid.
+    let detail_area = if area.width >= 150 {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(38), Constraint::Min(40)])
+            .split(rows[2]);
+        let items: Vec<ListItem> = decisions
+            .iter()
+            .map(|d| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{:<6}", d.street.name()), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("{:<17}", truncate(&d.labels[d.chosen], 16))),
+                    Span::styled(
+                        format!("{:>3} {}", d.verdict.symbol(), d.verdict.label()),
+                        Style::default().fg(verdict_color(d.verdict)).add_modifier(Modifier::BOLD),
+                    ),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default().with_selected((!decisions.is_empty()).then_some(selected));
+        f.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(empty_msg))
+                .highlight_style(Style::default().bg(Color::DarkGray))
+                .highlight_symbol("▶ "),
+            cols[0],
+            &mut state,
+        );
+        for i in 0..decisions.len().min(cols[0].height.saturating_sub(2) as usize) {
+            app.hits.add(
+                Rect { x: cols[0].x, y: cols[0].y + 1 + i as u16, width: cols[0].width, height: 1 },
+                Hit::Decision(i),
+            );
+        }
+        cols[1]
+    } else {
+        let mut lines: Vec<Vec<Span>> = vec![vec![Span::styled(
+            format!("{}: ", empty_msg.trim()),
+            Style::default().fg(Color::DarkGray),
+        )]];
+        let mut x = lines[0][0].content.chars().count() as u16;
+        let mut boxes = Vec::new();
+        for (i, d) in decisions.iter().enumerate() {
+            let text =
+                format!(" {} {} {} ", d.street.name(), truncate(&d.labels[d.chosen], 14), d.verdict.symbol());
+            let w = text.chars().count() as u16;
+            if x + w + 1 > area.width && x > 0 {
+                lines.push(Vec::new());
+                x = 0;
+            }
+            let mut st = Style::default().fg(verdict_color(d.verdict)).add_modifier(Modifier::BOLD);
+            if i == selected {
+                st = st.bg(Color::Indexed(238)).add_modifier(Modifier::UNDERLINED);
+            }
+            boxes.push(((lines.len() - 1) as u16, x, w));
+            let line = lines.last_mut().unwrap();
+            line.push(Span::styled(text, st));
+            line.push(Span::raw(" "));
+            x += w + 1;
+        }
+        let strip_h = lines.len() as u16 + 1;
+        let parts = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(strip_h), Constraint::Min(6)])
+            .split(rows[2]);
+        for (i, &(line, x, w)) in boxes.iter().enumerate() {
+            app.hits.add(Rect { x: parts[0].x + x, y: parts[0].y + line, width: w, height: 1 }, Hit::Decision(i));
+        }
+        f.render_widget(
+            Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(Block::default().borders(Borders::BOTTOM)),
+            parts[0],
+        );
+        parts[1]
+    };
     if let Some(d) = decisions.get(app.review_selected.min(decisions.len().saturating_sub(1))) {
-        draw_decision(f, cols[1], d, &status.notes);
+        draw_decision(f, detail_area, d, &status.notes);
     } else {
         let mut lines: Vec<Line> = status.notes.iter().map(|n| Line::from(format!("• {n}"))).collect();
         if lines.is_empty() {
@@ -569,21 +724,16 @@ fn draw_review(f: &mut Frame, app: &App) {
         }
         f.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: true }).block(Block::default().borders(Borders::ALL)),
-            cols[1],
+            detail_area,
         );
     }
     f.render_widget(
-        Paragraph::new("↑/↓ decision · Tab switch range variant · N next hand · Esc back · Q quit"),
+        Paragraph::new(truncate(
+            "↑/↓ or click a decision · Tab switch range variant · N next hand · Esc back · Q quit",
+            area.width as usize,
+        )),
         rows[3],
     );
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        s.chars().take(n - 1).collect::<String>() + "…"
-    }
 }
 
 fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[String]) {
@@ -591,20 +741,25 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
         Block::default().borders(Borders::ALL).title(format!(" {} — {} ", d.street, d.variant.label()));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    const GRID_W: u16 = 54;
-    const GRID_H: u16 = 15;
-    let side_by_side = inner.width >= 56 + GRID_W;
+    // Grid beside the text when both fit (the grid grows with the space),
+    // otherwise below it.
+    const TEXT_MIN: u16 = 45;
+    let side_by_side = inner.width > TEXT_MIN + 52;
     let parts = if side_by_side {
+        let grid_w = (inner.width / 2).clamp(52, inner.width - TEXT_MIN - 1);
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(56), Constraint::Length(GRID_W)])
+            .constraints([Constraint::Min(TEXT_MIN), Constraint::Length(1), Constraint::Length(grid_w)])
             .split(inner)
     } else {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(10), Constraint::Length(GRID_H)])
+            .constraints([Constraint::Min(6), Constraint::Length(0), Constraint::Length(15)])
             .split(inner)
     };
+    let text_w = parts[0].width as usize;
+    let bar_w = text_w.saturating_sub(28 + 14).min(10);
+    let label_w = text_w.saturating_sub(28 + bar_w).clamp(10, 19);
 
     let mut lines = Vec::new();
     let mut board = vec![Span::raw("Board ")];
@@ -652,10 +807,10 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
         };
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {:<19}", truncate(&d.labels[i], 18)),
+                format!(" {:<w$}", truncate(&d.labels[i], label_w - 1), w = label_w),
                 Style::default().fg(action_color(&d.actions, i)),
             ),
-            Span::styled(bar(d.hero_strategy[i], 10), Style::default().fg(action_color(&d.actions, i))),
+            Span::styled(bar(d.hero_strategy[i], bar_w), Style::default().fg(action_color(&d.actions, i))),
             Span::raw(format!(
                 " {:5.1}%  EV {:>8} {mark}",
                 100.0 * d.hero_strategy[i],
@@ -668,11 +823,11 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
     for i in 0..d.actions.len() {
         lines.push(Line::from(vec![
             Span::styled(
-                format!(" {:<19}", truncate(&d.labels[i], 18)),
+                format!(" {:<w$}", truncate(&d.labels[i], label_w - 1), w = label_w),
                 Style::default().fg(action_color(&d.actions, i)),
             ),
             Span::styled(
-                bar(d.range_strategy[i] as f32, 10),
+                bar(d.range_strategy[i] as f32, bar_w),
                 Style::default().fg(action_color(&d.actions, i)),
             ),
             Span::raw(format!(" {:5.1}%", 100.0 * d.range_strategy[i])),
@@ -687,77 +842,32 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
         lines.push(Line::from(Span::styled(format!("• {n}"), Style::default().fg(Color::DarkGray))));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[0]);
-    draw_grid(f, parts[1], d);
+    draw_review_grid(f, parts[2], d);
 }
 
-/// Splits `width` character cells among actions in proportion to `strategy`
-/// (largest remainders), so a cell shows its mix rather than one action.
-fn mix_slots(strategy: &[f32], width: usize) -> Vec<usize> {
-    let total: f32 = strategy.iter().sum();
-    if total <= 0.0 {
-        return vec![0; strategy.len()];
-    }
-    let exact: Vec<f32> = strategy.iter().map(|&v| v / total * width as f32).collect();
-    let mut slots: Vec<usize> = exact.iter().map(|&x| x.floor() as usize).collect();
-    let mut left = width - slots.iter().sum::<usize>();
-    let mut order: Vec<usize> = (0..exact.len()).collect();
-    order.sort_by(|&a, &b| (exact[b] - exact[b].floor()).total_cmp(&(exact[a] - exact[a].floor())));
-    for &i in &order {
-        if left == 0 {
-            break;
-        }
-        slots[i] += 1;
-        left -= 1;
-    }
-    slots
-}
-
-/// 13x13 grid; each class's 4-character cell is colored by its action mix
-/// (in quarters). Coloring by the single most frequent action would hide
-/// low-frequency bluffs and make betting ranges look value-heavy.
-fn draw_grid(f: &mut Frame, area: Rect, d: &DecisionReview) {
-    let mut lines = vec![Line::from(Span::styled(
-        "Your range at this spot (each cell colored by its action mix):",
+/// 13x13 grid of the hero's range at a decision; each cell is colored by
+/// its action mix (coloring by the most frequent action alone would hide
+/// low-frequency bluffs and make betting ranges look value-heavy).
+fn draw_review_grid(f: &mut Frame, area: Rect, d: &DecisionReview) {
+    let cells: Vec<GridCell> = d
+        .grid
+        .iter()
+        .map(|c| match c {
+            Some(c) => GridCell {
+                fill: 1.0,
+                mix: c.strategy.iter().enumerate().map(|(a, &w)| (w, action_color(&d.actions, a))).collect(),
+                sub: None,
+            },
+            None => GridCell::default(),
+        })
+        .collect();
+    let entries: Vec<(String, Color)> =
+        d.labels.iter().enumerate().map(|(i, l)| (l.clone(), action_color(&d.actions, i))).collect();
+    let title = Line::from(Span::styled(
+        "Your range here (cells colored by action mix):",
         Style::default().fg(ACCENT),
-    ))];
-    for row in 0..13 {
-        let mut spans = Vec::new();
-        for col in 0..13 {
-            let g = row * 13 + col;
-            let class = HandClass::from_grid_index(g);
-            let label: Vec<char> = format!("{:<4}", class.to_string()).chars().collect();
-            match &d.grid[g] {
-                Some(ClassCell { strategy, .. }) => {
-                    let slots = mix_slots(strategy, label.len());
-                    let mut k = 0;
-                    for (a, &n) in slots.iter().enumerate() {
-                        if n == 0 {
-                            continue;
-                        }
-                        let text: String = label[k..k + n].iter().collect();
-                        k += n;
-                        spans.push(Span::styled(
-                            text,
-                            Style::default().fg(Color::Black).bg(action_color(&d.actions, a)),
-                        ));
-                    }
-                }
-                None => {
-                    let text: String = label.iter().collect();
-                    spans.push(Span::styled(text, Style::default().fg(Color::DarkGray)));
-                }
-            }
-        }
-        lines.push(Line::from(spans));
-    }
-    let mut legend = vec![Span::raw(" ")];
-    for (i, l) in d.labels.iter().enumerate() {
-        legend.push(Span::styled("  ", Style::default().bg(action_color(&d.actions, i))));
-        legend.push(Span::raw(format!(" {}  ", truncate(l, 16))));
-    }
-    lines.push(Line::from(legend));
-    debug_assert_eq!(d.grid.len(), NUM_CLASSES);
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    ));
+    draw_grid(f, area, title, &cells, legend(&entries, 16), None, None);
 }
 
 fn draw_history(f: &mut Frame, app: &App) {
@@ -827,6 +937,11 @@ fn draw_help(f: &mut Frame) {
         Line::from("Grades (EV lost vs. the best action, as % of the pot)"),
         Line::from("  ✓ Best ≤1% · ✓ Good ≤3% · ?! Inaccuracy ≤6% · ? Mistake ≤12% · ?? Blunder >12%"),
         Line::from(""),
+        Line::from("Solver study"),
+        Line::from("  F / C / 1-9 take an action · arrow keys pick a hand (or click it) · Tab cycles strategy / ranges"),
+        Line::from("  Backspace goes back · G back to the start · N new random board · E type a spot · P preflop"),
+        Line::from("  At the end of a street, type the next card (e.g. 9h) or press Enter for a random one."),
+        Line::from(""),
         Line::from("EV is measured from the decision onwards: folding is worth 0."),
         Line::from(""),
         Line::from("Press any key to go back."),
@@ -837,22 +952,4 @@ fn draw_help(f: &mut Frame) {
             .wrap(Wrap { trim: false }),
         f.area(),
     );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::mix_slots;
-
-    #[test]
-    fn grid_cells_show_mixes() {
-        assert_eq!(mix_slots(&[1.0, 0.0], 4), vec![4, 0]);
-        assert_eq!(mix_slots(&[0.75, 0.25], 4), vec![3, 1]);
-        // A 14% bluff still shows up as one quarter of the cell.
-        assert_eq!(mix_slots(&[0.86, 0.14], 4), vec![3, 1]);
-        assert_eq!(mix_slots(&[0.5, 0.3, 0.2], 4), vec![2, 1, 1]);
-        assert_eq!(mix_slots(&[0.0, 0.0], 4), vec![0, 0]);
-        for s in [[0.1f32, 0.2, 0.7], [0.33, 0.33, 0.34], [0.05, 0.05, 0.9]] {
-            assert_eq!(mix_slots(&s, 4).iter().sum::<usize>(), 4);
-        }
-    }
 }

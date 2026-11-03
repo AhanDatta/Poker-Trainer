@@ -44,7 +44,7 @@ use rayon::prelude::*;
 use std::fmt;
 use storage::Storage;
 pub use storage::StorageMode;
-pub use tree::{BettingState, ChanceMode, TreeStats};
+pub use tree::{BettingState, ChanceMode, Transition, TreeStats};
 use tree::{Builder, Kind, Tree, TreeParams};
 
 /// Everything needed to build a solvable game.
@@ -184,7 +184,7 @@ impl fmt::Display for SolverError {
 impl std::error::Error for SolverError {}
 
 /// One step along a path from the root: an action or a dealt card.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Step {
     Action(Action),
     Card(Card),

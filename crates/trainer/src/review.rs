@@ -89,7 +89,7 @@ fn wait_solve_turn(hand: u64, cancel: &AtomicBool, mut on_wait: impl FnMut(usize
     }
 }
 
-const CANCELLED: &str = "cancelled";
+pub(crate) const CANCELLED: &str = "cancelled";
 
 /// Which villain range a solve used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -529,7 +529,7 @@ impl<'a> Worker<'a> {
         for (vi, &v) in variants.iter().enumerate() {
             let label = format!("{street} ({})", v.label());
             let pair = [ranges[vi][&seats[0]].clone(), ranges[vi][&seats[1]].clone()];
-            let cfg = self.make_config(street, &board, &pair, root, hero_combo, hero_p);
+            let cfg = self.make_config(&board, &pair, root, hero_combo, hero_p);
             match self.solve(cfg, &label) {
                 Ok(x) => solved.push(Some(x)),
                 Err(e) if e == CANCELLED => return Err(e),
@@ -588,7 +588,7 @@ impl<'a> Worker<'a> {
                         setup.settings.off_equilibrium_threshold,
                     );
                     let label = format!("{street} re-solve ({})", v.label());
-                    let cfg = self.make_config(street, &board, &r, states[k], hero_combo, hero_p);
+                    let cfg = self.make_config(&board, &r, states[k], hero_combo, hero_p);
                     match self.solve(cfg, &label) {
                         Ok((s, e)) => {
                             owned = Some((s, e));
@@ -685,31 +685,16 @@ impl<'a> Worker<'a> {
             }
             let mut keep: [Vec<usize>; 3] = Default::default();
             keep[hero_p] = orbit;
-            let seed = board.iter().fold(23u64, |h, c| h.wrapping_mul(31).wrapping_add(c.index() as u64));
-            let cfg = MultiConfig {
-                board: board.clone(),
-                ranges: rs,
+            let cfg = multi_config(
+                s,
+                &setup.menu.postflop,
+                &board,
+                rs,
                 root,
-                menu: setup.menu.postflop.clone(),
-                future_menu: Some(s.multiway_future_menu.clone()),
-                big_blind: BB,
-                chance: match street {
-                    Street::Flop => ChanceMode::Sampled {
-                        turn: s.multiway_turn_samples,
-                        river: s.multiway_river_samples,
-                        seed,
-                    },
-                    Street::Turn => {
-                        ChanceMode::Sampled { turn: 0, river: s.multiway_river_samples * 2, seed }
-                    }
-                    _ => ChanceMode::Exact,
-                },
-                prune: s.prune.max(0.002),
                 keep,
-                max_memory_bytes: (s.max_memory_gb * 1e9) as u64,
-                rake_rate: setup.rake_rate,
-                rake_cap: setup.rake_cap as f64,
-            };
+                setup.rake_rate,
+                setup.rake_cap,
+            );
             match self.solve_multi(cfg, &label) {
                 Ok(x) => solved.push(Some(x)),
                 Err(e) if e == CANCELLED => return Err(e),
@@ -793,7 +778,6 @@ impl<'a> Worker<'a> {
 
     fn make_config(
         &self,
-        street: Street,
         board: &[Card],
         ranges: &[Vec<f32>; 2],
         root: BettingState,
@@ -811,119 +795,220 @@ impl<'a> Worker<'a> {
             let w = &mut ranges[hero_p][c];
             *w = w.max(floor);
         }
-        let flop = street == Street::Flop;
-        let seed = board.iter().fold(17u64, |h, c| h.wrapping_mul(31).wrapping_add(c.index() as u64));
-        let mut cfg = SolveConfig::new(board.to_vec(), ranges, root, self.setup.menu.postflop.clone());
-        cfg.chance = if flop && s.flop_mode == FlopMode::Fast {
-            ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed }
-        } else {
-            ChanceMode::Exact
-        };
-        cfg.future_menu = if flop { Some(s.flop_future_menu.clone()) } else { None };
-        cfg.big_blind = BB;
-        cfg.prune = s.prune;
+        let mut cfg = hu_config(
+            s,
+            &self.setup.menu.postflop,
+            board,
+            ranges,
+            root,
+            self.setup.rake_rate,
+            self.setup.rake_cap,
+        );
         cfg.keep[hero_p] = orbit;
-        cfg.max_memory_bytes = (s.max_memory_gb * 1e9) as u64;
-        cfg.rake_rate = self.setup.rake_rate;
-        cfg.rake_cap = self.setup.rake_cap as f64;
         cfg
     }
 
-    fn solve(&self, mut cfg: SolveConfig, label: &str) -> Result<(Solver, f64), String> {
+    fn solve(&self, cfg: SolveConfig, label: &str) -> Result<(Solver, f64), String> {
         if let Some(dir) = std::env::var_os("POKER_TRAINER_DUMP") {
             dump_config(std::path::Path::new(&dir), self.setup.hand_id, label, &cfg);
         }
-        let shared = self.shared;
-        shared.set_stage(format!("{label}: waiting for the solver"));
-        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel, |ahead| {
-            shared.set_stage(format!(
-                "{label}: waiting for the solver ({ahead} solve{} ahead)",
-                if ahead == 1 { "" } else { "s" }
-            ))
-        }) else {
-            return Err(CANCELLED.into());
-        };
-        shared.set_stage(format!("{label}: building the game tree"));
-        let s = &self.setup.settings;
-        let mut solver = match Solver::new(cfg.clone()) {
-            Ok(x) => x,
-            Err(SolverError::TooLarge { needed, .. }) if cfg.chance == ChanceMode::Exact => {
-                shared.note(format!(
-                    "{label}: the exact tree needs ~{:.1} GB (limit {:.1} GB), so fast sampled mode was used.",
-                    needed as f64 / 1e9,
-                    s.max_memory_gb
-                ));
-                cfg.chance =
-                    ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed: 7 };
-                Solver::new(cfg).map_err(|e| e.to_string())?
-            }
-            Err(e) => return Err(e.to_string()),
-        };
-        shared.set_stage(format!(
-            "{label}: solving ({} vs {} combos)",
-            solver.hands().len(0),
-            solver.hands().len(1)
-        ));
-        // Exploitability checks cost about one iteration; check big trees less often.
-        let big = solver.stats().total_nodes() > 200_000;
-        let opts = SolveOptions {
-            max_iterations: s.max_iterations,
-            target_exploitability_pct: s.target_exploitability_pct,
-            check_every: if big { 20 } else { 10 },
-        };
-        let mut run = || {
-            solver.solve_cancellable(&opts, &shared.cancel, |p| {
-                shared.with_status(|st| st.progress = Some(*p));
-                !shared.cancel.load(Ordering::Relaxed)
-            })
-        };
-        let progress = match &self.pool {
-            Some(pool) => pool.install(run),
-            None => run(),
-        };
-        if shared.cancel.load(Ordering::Relaxed) {
-            return Err(CANCELLED.into());
-        }
-        Ok((solver, progress.exploitability_pct))
+        run_hu(cfg, &self.setup.settings, self.setup.hand_id, self.pool.as_ref(), label, self.shared)
+    }
+
+    fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, f64), String> {
+        run_multi(cfg, &self.setup.settings, self.setup.hand_id, self.pool.as_ref(), label, self.shared)
     }
 }
 
-impl Worker<'_> {
-    fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, f64), String> {
-        let shared = self.shared;
-        shared.set_stage(format!("{label}: waiting for the solver"));
-        let Some(_turn) = wait_solve_turn(self.setup.hand_id, &shared.cancel, |ahead| {
-            shared.set_stage(format!(
-                "{label}: waiting for the solver ({ahead} solve{} ahead)",
-                if ahead == 1 { "" } else { "s" }
-            ))
-        }) else {
-            return Err(CANCELLED.into());
-        };
-        shared.set_stage(format!("{label}: building the game tree"));
-        let mut solver = MultiSolver::new(cfg).map_err(|e| e.to_string())?;
-        shared.set_stage(format!("{label}: solving (approximate)"));
-        let s = &self.setup.settings;
-        let opts = SolveOptions {
-            max_iterations: s.max_iterations,
-            target_exploitability_pct: s.multiway_target_pct,
-            check_every: 20,
-        };
-        let mut run = || {
-            solver.solve_cancellable(&opts, &shared.cancel, |p| {
-                shared.with_status(|st| st.progress = Some(*p));
-                !shared.cancel.load(Ordering::Relaxed)
-            })
-        };
-        let progress = match &self.pool {
-            Some(pool) => pool.install(run),
-            None => run(),
-        };
-        if shared.cancel.load(Ordering::Relaxed) {
-            return Err(CANCELLED.into());
-        }
-        Ok((solver, progress.exploitability_pct))
+/// Receives a solve's stage changes, notes and progress.
+pub(crate) trait SolveSink {
+    fn stage(&self, s: String);
+    fn note(&self, s: String);
+    fn progress(&self, p: Progress);
+    fn cancel_flag(&self) -> &AtomicBool;
+}
+
+impl SolveSink for Shared {
+    fn stage(&self, s: String) {
+        self.set_stage(s);
     }
+    fn note(&self, s: String) {
+        Shared::note(self, s);
+    }
+    fn progress(&self, p: Progress) {
+        self.with_status(|st| st.progress = Some(p));
+    }
+    fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+}
+
+/// Heads-up solver inputs as reviews and study mode use them: the root
+/// street gets the full menu; a flop solve uses `flop_future_menu` for the
+/// turn and river, and samples them in fast mode.
+pub(crate) fn hu_config(
+    s: &SolverSettings,
+    menu: &holdem::PostflopMenu,
+    board: &[Card],
+    ranges: [Vec<f32>; 2],
+    root: BettingState,
+    rake_rate: f64,
+    rake_cap: holdem::Chips,
+) -> SolveConfig {
+    let flop = root.street == Street::Flop;
+    let seed = board.iter().fold(17u64, |h, c| h.wrapping_mul(31).wrapping_add(c.index() as u64));
+    let mut cfg = SolveConfig::new(board.to_vec(), ranges, root, menu.clone());
+    cfg.chance = if flop && s.flop_mode == FlopMode::Fast {
+        ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed }
+    } else {
+        ChanceMode::Exact
+    };
+    cfg.future_menu = if flop { Some(s.flop_future_menu.clone()) } else { None };
+    cfg.big_blind = BB;
+    cfg.prune = s.prune;
+    cfg.max_memory_bytes = (s.max_memory_gb * 1e9) as u64;
+    cfg.rake_rate = rake_rate;
+    cfg.rake_cap = rake_cap as f64;
+    cfg
+}
+
+/// Three-player solver inputs (sampled runouts, simplified later streets).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn multi_config(
+    s: &SolverSettings,
+    menu: &holdem::PostflopMenu,
+    board: &[Card],
+    ranges: [Vec<f32>; 3],
+    root: MultiState,
+    keep: [Vec<usize>; 3],
+    rake_rate: f64,
+    rake_cap: holdem::Chips,
+) -> MultiConfig {
+    let seed = board.iter().fold(23u64, |h, c| h.wrapping_mul(31).wrapping_add(c.index() as u64));
+    MultiConfig {
+        board: board.to_vec(),
+        ranges,
+        root,
+        menu: menu.clone(),
+        future_menu: Some(s.multiway_future_menu.clone()),
+        big_blind: BB,
+        chance: match root.street {
+            Street::Flop => ChanceMode::Sampled {
+                turn: s.multiway_turn_samples,
+                river: s.multiway_river_samples,
+                seed,
+            },
+            Street::Turn => ChanceMode::Sampled { turn: 0, river: s.multiway_river_samples * 2, seed },
+            _ => ChanceMode::Exact,
+        },
+        prune: s.prune.max(0.002),
+        keep,
+        max_memory_bytes: (s.max_memory_gb * 1e9) as u64,
+        rake_rate,
+        rake_cap: rake_cap as f64,
+    }
+}
+
+/// Waits for the solve queue (`priority`: smaller goes first), builds the
+/// heads-up tree (falling back to fast mode if the exact tree is too big)
+/// and solves it. Returns the solver and its exploitability (% pot).
+pub(crate) fn run_hu(
+    mut cfg: SolveConfig,
+    s: &SolverSettings,
+    priority: u64,
+    pool: Option<&rayon::ThreadPool>,
+    label: &str,
+    sink: &(dyn SolveSink + Sync),
+) -> Result<(Solver, f64), String> {
+    let cancel = sink.cancel_flag();
+    sink.stage(format!("{label}: waiting for the solver"));
+    let Some(_turn) = wait_solve_turn(priority, cancel, |ahead| {
+        sink.stage(format!(
+            "{label}: waiting for the solver ({ahead} solve{} ahead)",
+            if ahead == 1 { "" } else { "s" }
+        ))
+    }) else {
+        return Err(CANCELLED.into());
+    };
+    sink.stage(format!("{label}: building the game tree"));
+    let mut solver = match Solver::new(cfg.clone()) {
+        Ok(x) => x,
+        Err(SolverError::TooLarge { needed, .. }) if cfg.chance == ChanceMode::Exact => {
+            sink.note(format!(
+                "{label}: the exact tree needs ~{:.1} GB (limit {:.1} GB), so fast sampled mode was used.",
+                needed as f64 / 1e9,
+                s.max_memory_gb
+            ));
+            cfg.chance = ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed: 7 };
+            Solver::new(cfg).map_err(|e| e.to_string())?
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    sink.stage(format!("{label}: solving ({} vs {} combos)", solver.hands().len(0), solver.hands().len(1)));
+    // Exploitability checks cost about one iteration; check big trees less often.
+    let big = solver.stats().total_nodes() > 200_000;
+    let opts = SolveOptions {
+        max_iterations: s.max_iterations,
+        target_exploitability_pct: s.target_exploitability_pct,
+        check_every: if big { 20 } else { 10 },
+    };
+    let mut run = || {
+        solver.solve_cancellable(&opts, cancel, |p| {
+            sink.progress(*p);
+            !cancel.load(Ordering::Relaxed)
+        })
+    };
+    let progress = match pool {
+        Some(pool) => pool.install(run),
+        None => run(),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    Ok((solver, progress.exploitability_pct))
+}
+
+/// Like [`run_hu`] for a three-player spot (approximate).
+pub(crate) fn run_multi(
+    cfg: MultiConfig,
+    s: &SolverSettings,
+    priority: u64,
+    pool: Option<&rayon::ThreadPool>,
+    label: &str,
+    sink: &(dyn SolveSink + Sync),
+) -> Result<(MultiSolver, f64), String> {
+    let cancel = sink.cancel_flag();
+    sink.stage(format!("{label}: waiting for the solver"));
+    let Some(_turn) = wait_solve_turn(priority, cancel, |ahead| {
+        sink.stage(format!(
+            "{label}: waiting for the solver ({ahead} solve{} ahead)",
+            if ahead == 1 { "" } else { "s" }
+        ))
+    }) else {
+        return Err(CANCELLED.into());
+    };
+    sink.stage(format!("{label}: building the game tree"));
+    let mut solver = MultiSolver::new(cfg).map_err(|e| e.to_string())?;
+    sink.stage(format!("{label}: solving (approximate)"));
+    let opts = SolveOptions {
+        max_iterations: s.max_iterations,
+        target_exploitability_pct: s.multiway_target_pct,
+        check_every: 20,
+    };
+    let mut run = || {
+        solver.solve_cancellable(&opts, cancel, |p| {
+            sink.progress(*p);
+            !cancel.load(Ordering::Relaxed)
+        })
+    };
+    let progress = match pool {
+        Some(pool) => pool.install(run),
+        None => run(),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
+    Ok((solver, progress.exploitability_pct))
 }
 
 /// Seats still in the hand at the start of `street`.
@@ -1033,6 +1118,35 @@ fn context(st: &BettingState) -> ActionContext {
     }
 }
 
+/// Per-class strategy of the acting player at a node (grid order; `None`
+/// where the class isn't in range). A cell's weight is the summed reach of
+/// its combos.
+pub fn class_grid(info: &NodeInfo) -> Vec<Option<ClassCell>> {
+    let n = info.num_hands();
+    let na = info.actions.len();
+    let mut sums: Vec<(f32, Vec<f32>)> = vec![(0.0, vec![0.0; na]); NUM_CLASSES];
+    for h in 0..n {
+        let w = info.reach[h];
+        if w <= 0.0 {
+            continue;
+        }
+        let g = COMBO_CLASS[info.combos[h] as usize] as usize;
+        sums[g].0 += w;
+        for a in 0..na {
+            sums[g].1[a] += w * info.strategy[a * n + h];
+        }
+    }
+    sums.into_iter()
+        .map(|(w, s)| {
+            if w > 0.0 {
+                Some(ClassCell { weight: w, strategy: s.into_iter().map(|x| x / w).collect() })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn grade(
     info: &NodeInfo,
@@ -1065,30 +1179,7 @@ fn grade(
     let loss_pct = 100.0 * loss / pot_f;
     let labels = info.actions.iter().map(|&a| action_label(a, ctx)).collect();
 
-    let n = info.num_hands();
-    let na = info.actions.len();
-    let mut sums: Vec<(f32, Vec<f32>)> = vec![(0.0, vec![0.0; na]); NUM_CLASSES];
-    for h in 0..n {
-        let w = info.reach[h];
-        if w <= 0.0 {
-            continue;
-        }
-        let g = COMBO_CLASS[info.combos[h] as usize] as usize;
-        sums[g].0 += w;
-        for a in 0..na {
-            sums[g].1[a] += w * info.strategy[a * n + h];
-        }
-    }
-    let grid = sums
-        .into_iter()
-        .map(|(w, s)| {
-            if w > 0.0 {
-                Some(ClassCell { weight: w, strategy: s.into_iter().map(|x| x / w).collect() })
-            } else {
-                None
-            }
-        })
-        .collect();
+    let grid = class_grid(info);
 
     Ok(DecisionReview {
         variant,
