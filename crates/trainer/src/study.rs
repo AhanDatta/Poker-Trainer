@@ -769,7 +769,10 @@ impl Study {
         }
         let mut all_notes = notes;
         if multiway {
-            all_notes.push(crate::review::multiway_note(street, self.settings.solver.multiway_exact_removal));
+            all_notes.push(format!(
+                "{street}: {}",
+                crate::review::multiway_note(self.settings.solver.multiway_exact_removal)
+            ));
         } else if street == Street::Flop && self.settings.solver.flop_mode == FlopMode::Fast {
             all_notes.push("Flop solved with sampled turn and river cards (fast mode): approximate.".into());
         }

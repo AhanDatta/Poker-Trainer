@@ -744,7 +744,7 @@ impl<'a> Worker<'a> {
                     })
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let notes = vec![multiway_note(street, s.multiway_exact_removal)];
+                let notes = vec![multiway_note(s.multiway_exact_removal)];
                 let review = grade(
                     &info,
                     &context_multi(&states[k]),
@@ -842,9 +842,9 @@ impl SolveSink for Shared {
 }
 
 /// What a 3-way solve approximates (shown with its results).
-pub(crate) fn multiway_note(street: Street, exact_removal: bool) -> String {
+pub(crate) fn multiway_note(exact_removal: bool) -> String {
     format!(
-        "{street}: 3-way pot, approximate solve (no equilibrium guarantee for 3 players; {}sampled runouts; simplified later streets).",
+        "3-way pot: approximate solve (no equilibrium guarantee for 3 players; {}sampled runouts; simplified later streets).",
         if exact_removal { "" } else { "opponents' hands treated as independent; " }
     )
 }
