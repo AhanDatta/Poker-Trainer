@@ -911,6 +911,8 @@ pub(crate) fn multi_config(
         rake_rate,
         rake_cap: rake_cap as f64,
         exact_removal: s.multiway_exact_removal,
+        storage: solver::StorageMode::Auto,
+        dcfr: solver::multi::multiway_dcfr(),
     }
 }
 

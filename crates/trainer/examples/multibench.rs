@@ -17,6 +17,20 @@ use trainer::preflop::ChartSet;
 use trainer::study::{range_combos, PreflopNav, StudySettings};
 use trainer::TrainerConfig;
 
+/// DCFR="alpha,beta,gamma[,flags]" (flags: r = restart the average at
+/// powers of 4, u = unweighted average).
+fn dcfr_from_env() -> solver::DcfrParams {
+    let Ok(d) = std::env::var("DCFR") else { return solver::multi::multiway_dcfr() };
+    let v: Vec<&str> = d.split(',').collect();
+    solver::DcfrParams {
+        alpha: v[0].parse().unwrap(),
+        beta: if v[1] == "clip" { None } else { Some(v[1].parse().unwrap()) },
+        gamma: v[2].parse().unwrap(),
+        restart_average: v.get(3).is_some_and(|x| x.contains('r')),
+        unweighted_average: v.get(3).is_some_and(|x| x.contains('u')),
+    }
+}
+
 fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -78,6 +92,8 @@ fn main() {
         rake_rate: 0.0,
         rake_cap: 0.0,
         exact_removal: std::env::var("EXACT_REMOVAL").is_ok(),
+        storage: solver::StorageMode::Auto,
+        dcfr: dcfr_from_env(),
     };
     if std::env::var("COMPARE").is_ok() {
         compare(mc, iters);
@@ -97,6 +113,11 @@ fn main() {
         solver.cells() as f64 * 8.0 / 1e9,
         t0.elapsed()
     );
+    if std::env::var("NOBATCH").is_ok() {
+        solver.set_batch_river(false);
+    }
+    let (by_bet, runout) = solver.showdown_counts();
+    println!("showdowns: {by_bet} after betting, {runout} in all-in runouts");
     if iters == 0 {
         return;
     }

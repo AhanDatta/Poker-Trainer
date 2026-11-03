@@ -106,6 +106,20 @@ impl Discount {
     }
 }
 
+/// `1 / d` for a positive sum, 0 (treated as "nothing positive") when `d`
+/// isn't positive or is so small (subnormal) that its reciprocal overflows:
+/// tiny regrets of hands with almost no compatible opponent hands
+/// otherwise turned strategies into infinities and NaN.
+#[inline(always)]
+fn recip(d: f32) -> f32 {
+    let i = 1.0 / d;
+    if d > 0.0 && i.is_finite() {
+        i
+    } else {
+        0.0
+    }
+}
+
 /// Normalizes action-major values per hand (uniform when the column sums to 0).
 pub(crate) fn normalize_in_place(s: &mut [f32], num_actions: usize, n: usize) {
     if n == 0 {
@@ -121,8 +135,8 @@ pub(crate) fn normalize_in_place(s: &mut [f32], num_actions: usize, n: usize) {
     // scaling, then the (rare) hands without weight are made uniform.
     let mut any_zero = false;
     for d in inv.iter_mut() {
-        any_zero |= *d <= 0.0;
-        *d = if *d > 0.0 { 1.0 / *d } else { 0.0 };
+        *d = recip(*d);
+        any_zero |= *d == 0.0;
     }
     for row in s.chunks_exact_mut(n) {
         for (v, &i) in row.iter_mut().zip(inv.iter()) {
@@ -157,8 +171,8 @@ pub(crate) fn regret_match_into<T: Copy + Into<f32>>(
     positive_sums(regrets, n, &mut inv);
     let mut any_zero = false;
     for d in inv.iter_mut() {
-        any_zero |= *d <= 0.0;
-        *d = if *d > 0.0 { 1.0 / *d } else { 0.0 };
+        *d = recip(*d);
+        any_zero |= *d == 0.0;
     }
     for (orow, rrow) in out.chunks_exact_mut(n).zip(regrets.chunks_exact(n)) {
         for ((o, &r), &i) in orow.iter_mut().zip(rrow).zip(inv.iter()) {
@@ -291,8 +305,22 @@ fn own_node(ctx: &Ctx, node: &Node, p: usize, opp_reach: &[f32], mode: Mode, out
 /// encoded once.
 #[inline]
 pub(crate) fn own_node_combine(ctx: &Ctx, node: &Node, n: usize, cfv: &[f32], mode: Mode, out: &mut [f32]) {
-    let na = node.num_actions();
-    let b = node.block(n);
+    own_node_update(ctx.store, node.block(n), node.num_actions(), n, cfv, mode, out)
+}
+
+/// [`own_node_combine`] for any solver's storage: the value of a traverser
+/// node with `na` actions from its children's values, and in CFR mode its
+/// regret update.
+#[inline]
+pub(crate) fn own_node_update(
+    store: &Storage,
+    b: crate::storage::Block,
+    na: usize,
+    n: usize,
+    cfv: &[f32],
+    mode: Mode,
+    out: &mut [f32],
+) {
     let combine = |s: &[f32], out: &mut [f32]| {
         out.fill(0.0);
         for (srow, crow) in s.chunks_exact(n).zip(cfv.chunks_exact(n)) {
@@ -312,12 +340,12 @@ pub(crate) fn own_node_combine(ctx: &Ctx, node: &Node, n: usize, cfv: &[f32], mo
         }
         Mode::Average => {
             let mut s = Buf::uninit(na * n);
-            unsafe { ctx.store.load_strat(b, &mut s) };
+            unsafe { store.load_strat(b, &mut s) };
             normalize_in_place(&mut s, na, n);
             combine(&s, out);
         }
         Mode::Cfr(d) => unsafe {
-            ctx.store.update_regrets(b, |r| {
+            store.update_regrets(b, |r| {
                 // Value under regret matching without materializing the
                 // strategy: sum(max(r, 0) * cfv) / sum(max(r, 0)), or the
                 // mean over actions when no regret is positive.
@@ -330,13 +358,14 @@ pub(crate) fn own_node_combine(ctx: &Ctx, node: &Node, n: usize, cfv: &[f32], mo
                     }
                 }
                 let mut any_zero = false;
-                for (o, &dn) in out.iter_mut().zip(inv.iter()) {
-                    any_zero |= dn <= 0.0;
-                    *o *= if dn > 0.0 { 1.0 / dn } else { 0.0 };
+                for (o, dn) in out.iter_mut().zip(inv.iter_mut()) {
+                    *dn = recip(*dn);
+                    any_zero |= *dn == 0.0;
+                    *o *= *dn;
                 }
                 if any_zero {
                     let mean = 1.0 / na as f32;
-                    for h in (0..n).filter(|&h| inv[h] <= 0.0) {
+                    for h in (0..n).filter(|&h| inv[h] == 0.0) {
                         out[h] = (0..na).map(|a| cfv[a * n + h]).sum::<f32>() * mean;
                     }
                 }
