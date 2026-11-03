@@ -23,6 +23,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Review => draw_review(f, app),
         Screen::History => draw_history(f, app),
         Screen::Study => crate::study_ui::draw_study(f, app),
+        Screen::Sizes => draw_sizes(f, app),
         Screen::Help => draw_help(f),
     }
     if let Some((msg, _)) = &app.message {
@@ -200,6 +201,21 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
                 )
             }
         }
+        SetupItem::BetSizes => {
+            let p = &cfg.menu.postflop;
+            let st =
+                |s: &holdem::StreetSizes| s.bet.iter().map(|b| b.to_string()).collect::<Vec<_>>().join("/");
+            (
+                if cfg.menu == holdem::BetMenu::default() { "Default".into() } else { "Custom".into() },
+                format!(
+                    "Open {}bb · flop {} · turn {} · river {}. Press Enter to edit.",
+                    cfg.menu.preflop.open_bb,
+                    st(&p.flop),
+                    st(&p.turn),
+                    st(&p.river)
+                ),
+            )
+        }
         SetupItem::VillainRange => match cfg.solver.villain_range {
             VillainRange::Gto => s("GTO ranges", "The review assumes villains play the charts preflop."),
             VillainRange::Actual => {
@@ -245,6 +261,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
             SetupItem::Rake => "Rake",
             SetupItem::FlopSolve => "Flop solving",
             SetupItem::ThreeWay => "3-way pots",
+            SetupItem::BetSizes => "Bet sizes",
             SetupItem::VillainRange => "Villain range in review",
             SetupItem::RevealStyle => "Reveal style during hand",
         }
@@ -900,6 +917,25 @@ fn draw_review_grid(f: &mut Frame, area: Rect, d: &DecisionReview) {
         Style::default().fg(ACCENT),
     ));
     draw_grid(f, area, title, &cells, legend(&entries, 16), None, None);
+}
+
+fn draw_sizes(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(10), Constraint::Length(1)])
+        .split(area);
+    f.render_widget(title_bar(app, "Bet sizes"), rows[0]);
+    if let Some(ed) = &app.sizes {
+        ed.draw(f, rows[1], &app.session.config, &app.hits);
+    }
+    f.render_widget(
+        Paragraph::new(truncate(
+            "↑/↓ field · Enter edit/confirm · ←/→ change · Ctrl+U clear · Esc back (W on the setup screen saves)",
+            area.width as usize,
+        )),
+        rows[2],
+    );
 }
 
 fn draw_history(f: &mut Frame, app: &App) {

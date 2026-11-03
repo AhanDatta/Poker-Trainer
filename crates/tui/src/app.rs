@@ -17,6 +17,8 @@ pub enum Screen {
     Review,
     History,
     Study,
+    /// Bet-size editor.
+    Sizes,
     Help,
 }
 
@@ -45,6 +47,8 @@ pub enum SetupItem {
     FlopSolve,
     /// Exact card removal between opponents in 3-way solves.
     ThreeWay,
+    /// Opens the bet-size editor.
+    BetSizes,
     VillainRange,
     RevealStyle,
 }
@@ -68,6 +72,9 @@ pub enum OpponentChoice {
     Style(String),
 }
 
+/// Time to press Q a second time to quit.
+pub const QUIT_WINDOW: Duration = Duration::from_secs(2);
+
 pub struct App {
     pub session: Session,
     pub screen: Screen,
@@ -86,6 +93,9 @@ pub struct App {
     pub study: Option<StudyState>,
     /// Clickable regions of the last frame.
     pub hits: HitMap,
+    /// When Q was pressed once: a second press within [`QUIT_WINDOW`] quits.
+    quit_armed: Option<Instant>,
+    pub sizes: Option<crate::sizes::SizesEditor>,
     /// The last finished hand (now in the history) is still on the table.
     showing_last: bool,
     last_step: Instant,
@@ -109,6 +119,8 @@ impl App {
             mode: Mode::Play,
             study: None,
             hits: HitMap::default(),
+            quit_armed: None,
+            sizes: None,
             showing_last: false,
             last_step: Instant::now(),
         }
@@ -167,6 +179,7 @@ impl App {
                 SetupItem::Rake,
                 SetupItem::FlopSolve,
                 SetupItem::ThreeWay,
+                SetupItem::BetSizes,
             ];
         }
         let mut v = vec![SetupItem::Mode, SetupItem::Table, SetupItem::Opponent];
@@ -180,6 +193,7 @@ impl App {
             SetupItem::Rake,
             SetupItem::FlopSolve,
             SetupItem::ThreeWay,
+            SetupItem::BetSizes,
             SetupItem::VillainRange,
             SetupItem::RevealStyle,
         ]);
@@ -236,10 +250,27 @@ impl App {
         }
     }
 
+    /// Quits on the second Q within [`QUIT_WINDOW`], so a stray key press
+    /// doesn't end a long session (Ctrl+C still quits at once).
+    pub fn request_quit(&mut self) {
+        if self.quit_armed.is_some_and(|t| t.elapsed() <= QUIT_WINDOW) {
+            self.quit = true;
+        } else {
+            self.quit_armed = Some(Instant::now());
+            self.flash("Press Q again to quit (this session's stats aren't kept after quitting).");
+        }
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
+        }
+        // Any other key cancels a pending quit.
+        let quit_key = matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            || (self.screen == Screen::Setup && key.code == KeyCode::Esc);
+        if !quit_key && self.quit_armed.take().is_some() {
+            self.message = None;
         }
         match self.screen {
             Screen::Setup => self.setup_key(key),
@@ -247,6 +278,12 @@ impl App {
             Screen::Review => self.review_key(key),
             Screen::History => self.history_key(key),
             Screen::Study => self.study_key(key),
+            Screen::Sizes => {
+                let ed = self.sizes.get_or_insert_with(crate::sizes::SizesEditor::new);
+                if ed.on_key(key, &mut self.session.config) {
+                    self.screen = Screen::Setup;
+                }
+            }
             Screen::Help => {
                 self.screen = self.prev_screen;
             }
@@ -270,6 +307,12 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => self.change_setting(-1),
             KeyCode::Right | KeyCode::Char('l') => self.change_setting(1),
+            KeyCode::Enter | KeyCode::Char(' ')
+                if self.setup_items().get(self.setup_cursor) == Some(&SetupItem::BetSizes) =>
+            {
+                self.sizes.get_or_insert_with(crate::sizes::SizesEditor::new);
+                self.goto(Screen::Sizes);
+            }
             KeyCode::Enter | KeyCode::Char(' ') => match self.mode {
                 Mode::Play => {
                     self.goto(Screen::Table);
@@ -287,7 +330,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.goto(Screen::Help),
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => self.request_quit(),
             _ => {}
         }
     }
@@ -375,6 +418,10 @@ impl App {
             SetupItem::ThreeWay => {
                 cfg.solver.multiway_exact_removal = !cfg.solver.multiway_exact_removal;
             }
+            SetupItem::BetSizes => {
+                self.sizes.get_or_insert_with(crate::sizes::SizesEditor::new);
+                self.goto(Screen::Sizes);
+            }
             SetupItem::VillainRange => {
                 let all = [VillainRange::Gto, VillainRange::Actual, VillainRange::Both];
                 let cur = all.iter().position(|&p| p == cfg.solver.villain_range).unwrap_or(0);
@@ -454,7 +501,7 @@ impl App {
                     self.goto(Screen::Setup);
                 }
             }
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             _ => {}
         }
     }
@@ -484,7 +531,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.goto(Screen::Help),
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.screen = if self.review_target.is_some() { Screen::History } else { Screen::Table };
             }
@@ -512,7 +559,7 @@ impl App {
                     self.flash("That hand has no solver review (it ended preflop).");
                 }
             }
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Table,
             _ => {}
         }
@@ -544,7 +591,7 @@ impl App {
             study_app::Outcome::None => {}
             study_app::Outcome::Leave => self.screen = Screen::Setup,
             study_app::Outcome::Help => self.goto(Screen::Help),
-            study_app::Outcome::Quit => self.quit = true,
+            study_app::Outcome::Quit => self.request_quit(),
         }
     }
 
@@ -557,6 +604,11 @@ impl App {
             Screen::Study => {
                 if let Some(st) = &mut self.study {
                     st.on_click(hit);
+                }
+            }
+            Screen::Sizes => {
+                if let Some(ed) = &mut self.sizes {
+                    ed.on_click(hit);
                 }
             }
             Screen::Review => {

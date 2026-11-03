@@ -3,6 +3,7 @@
 mod app;
 mod charts_cmd;
 mod selfplay;
+mod sizes;
 mod study_app;
 mod study_ui;
 mod ui;
@@ -441,5 +442,38 @@ mod tests {
         assert_eq!(app.screen, app::Screen::Study);
         study_settle(&mut app);
         assert!(render_at(&app, 120, 34).contains("BB to act"));
+    }
+
+    /// Q quits only when pressed twice in a row.
+    #[test]
+    fn quit_needs_two_presses() {
+        let mut app = App::new(Session::new(TrainerConfig::default()).unwrap(), "/nonexistent/x.toml".into());
+        app.on_key(key('q'));
+        assert!(!app.quit);
+        assert!(render_at(&app, 120, 34).contains("Press Q again to quit"));
+        // Another key in between cancels it.
+        press(&mut app, KeyCode::Down);
+        app.on_key(key('q'));
+        assert!(!app.quit);
+        app.on_key(key('q'));
+        assert!(app.quit);
+    }
+
+    /// Prints the bet-size editor (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn print_sizes_screen() {
+        let mut app = App::new(Session::new(TrainerConfig::default()).unwrap(), "/nonexistent/x.toml".into());
+        while app.setup_items()[app.setup_cursor] != app::SetupItem::BetSizes {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        let t = std::time::Instant::now();
+        println!("{}", render_at(&app, 120, 34));
+        println!("first draw {:?}", t.elapsed());
+        for _ in 0..8 {
+            press(&mut app, KeyCode::Down);
+        }
+        println!("{}", render_at(&app, 120, 34));
     }
 }

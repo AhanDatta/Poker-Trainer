@@ -93,12 +93,26 @@ cargo run --release -p solver --example compare -- Ks7s2d                 # fast
 
 | Where | Keys |
 |---|---|
-| Setup | ↑/↓ select · ←/→ change (mode, table size, styles, position, stacks, rake, solver) · Enter play/study · W save settings · Q quit |
+| Setup | ↑/↓ select · ←/→ change (mode, table size, styles, position, stacks, rake, solver) · Enter play/study (on "Bet sizes": open the size editor) · W save settings · Q Q quit |
 | Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** solver review · **H** history · **S** settings |
 | Review | ↑/↓ choose decision · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · Esc back |
 | Study | **F**/**C**/**1–9** take an action · arrows (or click) pick a hand · **Tab** strategy / each player's range · **Backspace** back · **G**/Home start · **N** new random board · **E** type a spot · **P** back to preflop · Esc menu |
 
-After you fold, the rest of the hand plays out instantly.
+After you fold, the rest of the hand plays out instantly. Quitting takes Q
+twice within two seconds (any other key cancels), so a stray key press
+doesn't end a session; Ctrl+C quits at once.
+
+### Bet sizes
+
+The setup screen's **Bet sizes** row opens an editor for the sizes used at
+the table, by the AI and in every solve: the preflop open, iso-raise and
+3-bet/4-bet sizes, bet and raise sizes per street (`33%, 75%`, `150%` for
+an overbet, `3x`, `allin`), the cap on bets per street, when all-in is
+added, and the simplified turn/river sizes inside flop solves. It previews
+the options in a sample pot and shows the solve cost against the default
+sizes (a turn tree's decision count and an exact flop's memory), since every
+extra size makes trees bigger. W on the setup screen saves the sizes to the
+config (`[menu]` and `[solver.flop_future_menu]`).
 
 ### Solver study mode
 
@@ -463,9 +477,9 @@ the presets in `crates/trainer/src/profiles.rs`.
 * **3-way solves are approximate:** sampled runouts (including all-in
   runouts) and simplified later streets, and no equilibrium guarantee.
 * **Preflop grading** isn't implemented.
-* **Study mode** uses the bet menu from the config (`[menu]`); there's no
-  per-spot size editor yet. Its 3-way solves have the same limits as the
-  3-way review.
+* **Study mode** uses the sizes from the bet-size editor for every spot (no
+  per-spot sizes). Its 3-way solves have the same limits as the 3-way
+  review.
 * **9-max charts** use fallback rules; no public solver set was found.
 * **Exact flop solves still take minutes** on a 4-core machine. Wider SIMD,
   single-pass sweeps and predictive CFR variants were tried and didn't help
