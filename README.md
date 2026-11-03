@@ -181,6 +181,13 @@ restarts at iterations 4, 16, 64 and 256. With reach-weighted averages, rarely
 reached hands' contributions rounded away in 16-bit storage, so big flop
 solves stalled between 1% and 0.5% of the pot.
 
+Alternatives that were measured and didn't help at the 0.5%-of-pot target
+(turn and sampled-flop benchmarks, exploitability every 50 iterations):
+predictive CFR+ and predictive DCFR (about 2× worse at every checkpoint,
+and they need 50% more memory), other α/β/γ values and clipping negative
+regrets (equal or worse), and reach-weighted averages without restarts
+(~10% better on turns, worse on flops until ~250 iterations).
+
 River solutions were cross-checked against postflop-solver on the same games
 (strategies within ~1.5 points, per-hand EVs within ~0.5% of the pot).
 
@@ -460,9 +467,10 @@ the presets in `crates/trainer/src/profiles.rs`.
   per-spot size editor yet. Its 3-way solves have the same limits as the
   3-way review.
 * **9-max charts** use fallback rules; no public solver set was found.
-* **Exact flop solves still take minutes** on a 4-core machine. The next
-  steps would be SIMD-friendlier showdown sweeps and a predictive
-  (PDCFR+-style) update.
+* **Exact flop solves still take minutes** on a 4-core machine. Wider SIMD,
+  single-pass sweeps and predictive CFR variants were tried and didn't help
+  (see the solver sections); the remaining lever is smaller trees (e.g. fewer
+  bet sizes).
 * **Exploitative review:** node-lock the villain to its AI style's postflop
   tendencies to show the max-EV play against that specific opponent.
 * The preflop menu has one raise size per level, while imported charts may
