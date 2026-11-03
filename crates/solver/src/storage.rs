@@ -196,6 +196,7 @@ impl Storage {
     ///
     /// # Safety
     /// The node's block must not be mutated concurrently.
+    #[cfg(test)]
     pub unsafe fn load_regrets(&self, b: Block, out: &mut [f32]) {
         match self {
             Storage::F32 { regrets, .. } => out.copy_from_slice(regrets.get(b.offset, b.len)),
@@ -212,6 +213,20 @@ impl Storage {
     ///
     /// # Safety
     /// The node's block must not be mutated concurrently.
+    /// The node's current strategy (regret matching), computed straight
+    /// from the stored regrets.
+    pub unsafe fn load_current_strategy(&self, b: Block, num_actions: usize, n: usize, out: &mut [f32]) {
+        match self {
+            Storage::F32 { regrets, .. } => {
+                crate::cfr::regret_match_into(regrets.get(b.offset, b.len), num_actions, n, out)
+            }
+            // The per-node scale cancels out in the normalization.
+            Storage::Compressed { regrets, .. } => {
+                crate::cfr::regret_match_into(regrets.get(b.offset, b.len), num_actions, n, out)
+            }
+        }
+    }
+
     pub unsafe fn load_strat(&self, b: Block, out: &mut [f32]) {
         match self {
             Storage::F32 { strat, .. } => out.copy_from_slice(strat.get(b.offset, b.len)),

@@ -218,11 +218,15 @@ fn batched_river_matches_recursion() {
     let pa = a.solve(&opts, |_| true);
     let pb = b.solve(&opts, |_| true);
     assert!((pa.exploitability - pb.exploitability).abs() < 1e-4 * (1.0 + pb.exploitability.abs()));
+    // The batched path sums some fold values in strength order rather than
+    // hand order. After one iteration the paths differ by f32 rounding
+    // (5e-7 in strategy, 1e-4 chips in EV, with EVs up to ~2500 chips);
+    // five iterations amplify that to ~1e-5 and ~0.1 chips.
     for path in [vec![], vec![Step::Action(Action::Check)]] {
-        assert_same_node(&a.query(&path).unwrap(), &b.query(&path).unwrap(), 1e-5, 1e-2);
+        assert_same_node(&a.query(&path).unwrap(), &b.query(&path).unwrap(), 5e-5, 0.25);
     }
     let river = [Step::Action(Action::Check), Step::Action(Action::Check), Step::Card("Ks".parse().unwrap())];
-    assert_same_node(&a.query(&river).unwrap(), &b.query(&river).unwrap(), 1e-5, 1e-2);
+    assert_same_node(&a.query(&river).unwrap(), &b.query(&river).unwrap(), 5e-5, 0.25);
 }
 
 /// Solving with suit isomorphism must give the same strategies and EVs,

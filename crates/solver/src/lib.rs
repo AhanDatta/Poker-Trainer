@@ -27,6 +27,8 @@ mod eval;
 mod hands;
 mod iso;
 pub mod multi;
+#[cfg(test)]
+mod multi_ref;
 mod river;
 mod sampling;
 mod scratch;

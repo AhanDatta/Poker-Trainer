@@ -122,8 +122,11 @@ proptest! {
         let mut out = vec![0f32; hs.len(p)];
         eval_showdown(&hs, &table, p, &r, w, l, tie, &mut out);
         let brute = brute_showdown(&hs, &board, p, &r, w, l, tie);
+        // Values are sums of terms up to `mag`; a result near zero can still
+        // carry f32 rounding of those terms.
+        let mag = (w.abs() + l.abs() + tie.abs()) * r.iter().map(|&x| x as f64).sum::<f64>();
         for (a, b) in out.iter().zip(&brute) {
-            prop_assert!(close(*a as f64, *b, b.abs() * 10.0), "{} vs {}", a, b);
+            prop_assert!(close(*a as f64, *b, b.abs() * 10.0 + mag * 0.01), "{} vs {}", a, b);
         }
         // The batched evaluator agrees with the scalar one.
         let k = 1 + (seed % LANES as u64) as usize;
@@ -134,12 +137,28 @@ proptest! {
         let ties: Vec<f64> = vec![tie; k];
         let mut bufs: Vec<Vec<f32>> = vec![vec![0.0; hs.len(p)]; k];
         let mut outs: Vec<&mut [f32]> = bufs.iter_mut().map(|v| v.as_mut_slice()).collect();
-        showdown_batch(&hs, &table, p, &refs, &wins, &loses, &ties, &mut outs);
+        // Every other lane also has a fold terminal with the same reach.
+        let mut fold_bufs: Vec<Vec<f32>> = vec![vec![0.0; hs.len(p)]; k];
+        let mut folds: Vec<Option<(f64, &mut [f32])>> = fold_bufs
+            .iter_mut()
+            .enumerate()
+            .map(|(t, v)| (t % 2 == 0).then(|| (-2.5 - t as f64, v.as_mut_slice())))
+            .collect();
+        showdown_batch(&hs, &table, p, &refs, &wins, &loses, &ties, &mut outs, &mut folds);
         for t in 0..k {
             let mut single = vec![0f32; hs.len(p)];
             eval_showdown(&hs, &table, p, &reaches[t], wins[t], loses[t], ties[t], &mut single);
+            let mag = (wins[t].abs() + loses[t].abs() + ties[t].abs())
+                * reaches[t].iter().map(|&x| x as f64).sum::<f64>();
             for (a, b) in bufs[t].iter().zip(&single) {
-                prop_assert!(close(*a as f64, *b as f64, b.abs() as f64 * 10.0));
+                prop_assert!(close(*a as f64, *b as f64, b.abs() as f64 * 10.0 + mag * 0.01));
+            }
+            if t % 2 == 0 {
+                let mut fold = vec![0f32; hs.len(p)];
+                eval_fold(&hs, p, &reaches[t], -2.5 - t as f64, &mut fold);
+                for (a, b) in fold_bufs[t].iter().zip(&fold) {
+                    prop_assert!(close(*a as f64, *b as f64, b.abs() as f64 * 10.0), "fold {} vs {}", a, b);
+                }
             }
         }
     }

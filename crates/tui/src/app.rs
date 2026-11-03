@@ -43,6 +43,8 @@ pub enum SetupItem {
     Stack,
     Rake,
     FlopSolve,
+    /// Exact card removal between opponents in 3-way solves.
+    ThreeWay,
     VillainRange,
     RevealStyle,
 }
@@ -158,7 +160,14 @@ impl App {
     /// Rows of the setup screen (custom tables get one row per style).
     pub fn setup_items(&self) -> Vec<SetupItem> {
         if self.mode == Mode::Study {
-            return vec![SetupItem::Mode, SetupItem::Table, SetupItem::Stack, SetupItem::Rake, SetupItem::FlopSolve];
+            return vec![
+                SetupItem::Mode,
+                SetupItem::Table,
+                SetupItem::Stack,
+                SetupItem::Rake,
+                SetupItem::FlopSolve,
+                SetupItem::ThreeWay,
+            ];
         }
         let mut v = vec![SetupItem::Mode, SetupItem::Table, SetupItem::Opponent];
         if self.current_opponent_choice() == OpponentChoice::Game(GameType::Custom) {
@@ -170,6 +179,7 @@ impl App {
             SetupItem::Stack,
             SetupItem::Rake,
             SetupItem::FlopSolve,
+            SetupItem::ThreeWay,
             SetupItem::VillainRange,
             SetupItem::RevealStyle,
         ]);
@@ -361,6 +371,9 @@ impl App {
                 if cfg.solver.flop_mode == FlopMode::Exact {
                     self.flash("Exact flop solves need several GB of RAM and minutes per hand.");
                 }
+            }
+            SetupItem::ThreeWay => {
+                cfg.solver.multiway_exact_removal = !cfg.solver.multiway_exact_removal;
             }
             SetupItem::VillainRange => {
                 let all = [VillainRange::Gto, VillainRange::Actual, VillainRange::Both];

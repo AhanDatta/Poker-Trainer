@@ -63,8 +63,7 @@ pub struct SpotEditor {
 }
 
 /// Example ranges for a fresh editor: a button open called by the big blind.
-const EXAMPLE_IP: &str =
-    "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,96s+,85s+,75s+,64s+,54s,A2o+,K8o+,Q9o+,J9o+,T9o";
+const EXAMPLE_IP: &str = "22+,A2s+,K2s+,Q5s+,J7s+,T7s+,96s+,85s+,75s+,64s+,54s,A2o+,K8o+,Q9o+,J9o+,T9o";
 const EXAMPLE_OOP: &str =
     "22-99,A2s-AJs,K2s-KJs,Q6s+,J7s+,T7s+,96s+,85s+,74s+,63s+,53s+,43s,A8o-AJo,K9o+,QTo+,JTo,T9o";
 
@@ -143,7 +142,8 @@ impl SpotEditor {
 
     /// Builds the spot (a random flop when the board is empty).
     fn spot(&self) -> Result<Spot, String> {
-        let pot: f64 = self.pot.trim().parse().map_err(|_| "pot: enter a number of big blinds".to_string())?;
+        let pot: f64 =
+            self.pot.trim().parse().map_err(|_| "pot: enter a number of big blinds".to_string())?;
         let stack: f64 =
             self.stack.trim().parse().map_err(|_| "stacks: enter a number of big blinds".to_string())?;
         let board = if self.board.trim().is_empty() {
@@ -194,7 +194,13 @@ pub struct StudyState {
 pub fn fingerprint(s: &StudySettings) -> String {
     format!(
         "{}|{}|{}|{}|{:?}|{:?}|{:?}",
-        s.players, s.stack_bb, s.rake_rate, s.rake_cap, s.solver, s.menu, Arc::as_ptr(&s.charts)
+        s.players,
+        s.stack_bb,
+        s.rake_rate,
+        s.rake_cap,
+        s.solver,
+        s.menu,
+        Arc::as_ptr(&s.charts)
     )
 }
 
@@ -270,7 +276,12 @@ impl StudyState {
                     }
                     _ => vec![false; spot.names.len()],
                 };
-                spot.names.iter().enumerate().filter(|(i, _)| !folded[*i]).map(|(i, n)| (i, n.clone())).collect()
+                spot.names
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !folded[*i])
+                    .map(|(i, n)| (i, n.clone()))
+                    .collect()
             }
         }
     }
@@ -339,11 +350,12 @@ impl StudyState {
     fn check_preflop(&mut self) {
         let Phase::Preflop(nav) = &self.phase else { return };
         self.message = match nav.outcome() {
-            PreflopOutcome::Won(s) => Some(format!(
-                "{} wins the blinds. Backspace goes back.",
-                nav.state().position_name(s)
-            )),
-            PreflopOutcome::AllIn => Some("All-in preflop: nothing left to decide. Backspace goes back.".into()),
+            PreflopOutcome::Won(s) => {
+                Some(format!("{} wins the blinds. Backspace goes back.", nav.state().position_name(s)))
+            }
+            PreflopOutcome::AllIn => {
+                Some("All-in preflop: nothing left to decide. Backspace goes back.".into())
+            }
             PreflopOutcome::Flop(seats) if seats.len() > 3 => Some(format!(
                 "{} players see the flop: study mode solves 2 or 3. Backspace goes back.",
                 seats.len()
@@ -370,7 +382,10 @@ impl StudyState {
             }
         };
         if to_preflop {
-            let old = std::mem::replace(&mut self.phase, Phase::Preflop(Box::new(PreflopNav::new(Arc::clone(&self.settings)))));
+            let old = std::mem::replace(
+                &mut self.phase,
+                Phase::Preflop(Box::new(PreflopNav::new(Arc::clone(&self.settings)))),
+            );
             if let Phase::Postflop(p) = old {
                 self.phase = Phase::Preflop(Box::new(p.preflop.expect("checked")));
             }
@@ -548,7 +563,8 @@ impl StudyState {
                     }
                 }
                 KeyCode::Char(c)
-                    if !key.modifiers.contains(KeyModifiers::CONTROL) && (c.is_ascii_alphanumeric() || c == ' ') =>
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && (c.is_ascii_alphanumeric() || c == ' ') =>
                 {
                     if let Some(i) = &mut self.input {
                         if i.text.len() < 16 {

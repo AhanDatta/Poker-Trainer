@@ -12,9 +12,7 @@
 //! This is the hot path of turn and flop solves; it must give exactly the
 //! same results as the recursive traversal (see the tests).
 
-use crate::cfr::{
-    fold_payoff, normalize_in_place, own_node_combine, regret_match, showdown_payoffs, Ctx, Mode,
-};
+use crate::cfr::{fold_payoff, normalize_in_place, own_node_combine, showdown_payoffs, Ctx, Mode};
 use crate::eval::{fold_batch, showdown_batch, LANES};
 use crate::tree::Kind;
 use std::cell::RefCell;
@@ -36,7 +34,13 @@ struct Scratch {
     reach: Vec<f32>,
     vals: Vec<f32>,
     strat: Vec<f32>,
+    /// Terminal groups: (reach slot, showdown item, fold item), NONE if absent.
+    groups: Vec<(u32, u32, u32)>,
+    /// Reach slot -> group index.
+    group_of: Vec<u32>,
 }
+
+const NONE: u32 = u32::MAX;
 
 thread_local! {
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
@@ -63,7 +67,7 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
     let nodes = &ctx.tree.nodes;
     let n = out.len();
     let nq = opp_reach.len();
-    let Scratch { items, reach, vals, strat } = s;
+    let Scratch { items, reach, vals, strat, groups, group_of } = s;
 
     // Phase 0: items in breadth-first order (parents before children).
     items.clear();
@@ -114,8 +118,7 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
         unsafe {
             match mode {
                 Mode::Cfr(d) => {
-                    ctx.store.load_regrets(b, strat);
-                    regret_match(strat, na, nq);
+                    ctx.store.load_current_strategy(b, na, nq, strat);
                     let r = &reach[it.reach as usize * nq..(it.reach as usize + 1) * nq];
                     let g = d.strat;
                     let weighted = d.reach_weighted;
@@ -157,54 +160,91 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
         }
     }
 
-    // Phase 2: terminals, batched.
+    // Phase 2: terminals. Terminals that share an opponent reach (a fold
+    // and the call next to it, both the traverser's actions) share one
+    // strength sweep, which yields every showdown and fold value.
     vals.clear();
     vals.resize(items.len() * n, 0.0);
+    if n == 0 {
+        return;
+    }
     let reach_of = |slot: u32| -> &[f32] { &reach[slot as usize * nq..(slot as usize + 1) * nq] };
-    let mut showdowns: Vec<usize> = Vec::new();
-    let mut folds: Vec<usize> = Vec::new();
+    group_of.clear();
+    group_of.resize(reach_slots, NONE);
+    groups.clear();
+    let mut board_table = None;
     for (k, it) in items.iter().enumerate() {
         if it.dead {
             continue;
         }
-        match nodes[it.id as usize].kind {
-            Kind::Showdown => showdowns.push(k),
-            Kind::Fold(_) => folds.push(k),
-            _ => {}
+        let node = &nodes[it.id as usize];
+        let is_showdown = match node.kind {
+            Kind::Showdown => true,
+            Kind::Fold(_) => false,
+            _ => continue,
+        };
+        if is_showdown {
+            debug_assert!(board_table.is_none_or(|t| t == node.offset), "one board per subtree");
+            board_table = Some(node.offset);
+        }
+        // A reach is shared by at most one showdown and one fold (both
+        // children of one traverser node); anything else gets its own group.
+        let g = group_of[it.reach as usize];
+        let fits = g != NONE && {
+            let grp = groups[g as usize];
+            if is_showdown {
+                grp.1 == NONE
+            } else {
+                grp.2 == NONE
+            }
+        };
+        let g = if fits {
+            g as usize
+        } else {
+            group_of[it.reach as usize] = groups.len() as u32;
+            groups.push((it.reach, NONE, NONE));
+            groups.len() - 1
+        };
+        if is_showdown {
+            groups[g].1 = k as u32;
+        } else {
+            groups[g].2 = k as u32;
         }
     }
+    // Groups with a showdown first.
+    groups.sort_unstable_by_key(|g| g.1 == NONE);
+    let split = groups.iter().position(|g| g.1 == NONE).unwrap_or(groups.len());
     // Item value slots are disjoint `n`-sized chunks of `vals`.
-    let mut slots: Vec<Option<&mut [f32]>> = vals.chunks_exact_mut(n.max(1)).map(Some).collect();
-    if n == 0 {
-        return;
-    }
-    for chunk in showdowns.chunks(LANES) {
-        let table = &ctx.tables[nodes[items[chunk[0]].id as usize].offset as usize];
-        let reaches: Vec<&[f32]> = chunk.iter().map(|&k| reach_of(items[k].reach)).collect();
-        let (mut win, mut lose, mut tie) = (Vec::new(), Vec::new(), Vec::new());
-        for &k in chunk {
-            let node = &nodes[items[k].id as usize];
-            debug_assert_eq!(node.offset, nodes[items[chunk[0]].id as usize].offset, "one board per subtree");
-            let (w, l, t) = showdown_payoffs(ctx, node, p);
-            win.push(w);
-            lose.push(l);
-            tie.push(t);
+    let mut slots: Vec<Option<&mut [f32]>> = vals.chunks_exact_mut(n).map(Some).collect();
+    if let Some(t) = board_table {
+        let table = &ctx.tables[t as usize];
+        for chunk in groups[..split].chunks(LANES) {
+            let reaches: Vec<&[f32]> = chunk.iter().map(|g| reach_of(g.0)).collect();
+            let (mut win, mut lose, mut tie) = (Vec::new(), Vec::new(), Vec::new());
+            let mut outs = Vec::with_capacity(chunk.len());
+            let mut folds = Vec::with_capacity(chunk.len());
+            for &(_, sd, fd) in chunk {
+                let (w, l, t) = showdown_payoffs(ctx, &nodes[items[sd as usize].id as usize], p);
+                win.push(w);
+                lose.push(l);
+                tie.push(t);
+                outs.push(slots[sd as usize].take().unwrap());
+                folds.push((fd != NONE).then(|| {
+                    (
+                        fold_payoff(ctx, &nodes[items[fd as usize].id as usize], p),
+                        slots[fd as usize].take().unwrap(),
+                    )
+                }));
+            }
+            showdown_batch(ctx.hands, table, p, &reaches, &win, &lose, &tie, &mut outs, &mut folds);
         }
-        let mut outs: Vec<&mut [f32]> = chunk.iter().map(|&k| slots[k].take().unwrap()).collect();
-        showdown_batch(ctx.hands, table, p, &reaches, &win, &lose, &tie, &mut outs);
-        for (&k, o) in chunk.iter().zip(outs) {
-            slots[k] = Some(o);
-        }
     }
-    for chunk in folds.chunks(LANES) {
-        let reaches: Vec<&[f32]> = chunk.iter().map(|&k| reach_of(items[k].reach)).collect();
+    for chunk in groups[split..].chunks(LANES) {
+        let reaches: Vec<&[f32]> = chunk.iter().map(|g| reach_of(g.0)).collect();
         let payoffs: Vec<f64> =
-            chunk.iter().map(|&k| fold_payoff(ctx, &nodes[items[k].id as usize], p)).collect();
-        let mut outs: Vec<&mut [f32]> = chunk.iter().map(|&k| slots[k].take().unwrap()).collect();
+            chunk.iter().map(|g| fold_payoff(ctx, &nodes[items[g.2 as usize].id as usize], p)).collect();
+        let mut outs: Vec<&mut [f32]> = chunk.iter().map(|g| slots[g.2 as usize].take().unwrap()).collect();
         fold_batch(ctx.hands, p, &reaches, &payoffs, &mut outs);
-        for (&k, o) in chunk.iter().zip(outs) {
-            slots[k] = Some(o);
-        }
     }
     drop(slots);
 

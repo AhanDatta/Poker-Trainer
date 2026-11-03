@@ -66,6 +66,11 @@ pub struct SolverSettings {
     pub multiway_river_samples: usize,
     /// Three-way pots: stop at this average best-response gain (% pot).
     pub multiway_target_pct: f64,
+    /// Exact card removal between the two opponents in 3-way solves (the
+    /// default; about 2.5x slower). Off, their hands are treated as
+    /// independent, which is close with wide ranges but can be off by
+    /// several % of the pot when narrow ranges overlap (e.g. squeeze pots).
+    pub multiway_exact_removal: bool,
     /// Three-way pots: sizes on later streets (kept small: no raises).
     pub multiway_future_menu: PostflopMenu,
 }
@@ -99,6 +104,7 @@ impl Default for SolverSettings {
             multiway_turn_samples: 8,
             multiway_river_samples: 4,
             multiway_target_pct: 1.5,
+            multiway_exact_removal: true,
             multiway_future_menu: PostflopMenu {
                 turn: StreetSizes::new(&["66%"], &["3x"]),
                 river: StreetSizes::new(&["75%"], &["3x"]),
