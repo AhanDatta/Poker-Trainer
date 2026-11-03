@@ -29,10 +29,11 @@ use std::time::Instant;
 
 /// Solve-queue priority of study solves: ahead of every hand review.
 const PRIORITY: u64 = 0;
-/// Finished solves kept for lines you navigated away from (turn and river
-/// solves are small; flop solves can take gigabytes, so only one is kept).
+/// Finished solves kept for lines you navigated away from. Turn and river
+/// solves are small; flop solves can take gigabytes, so flop re-solves are
+/// dropped as soon as you leave them (the spot's own flop solve stays).
 const KEEP_OFF_LINE: usize = 8;
-const KEEP_OFF_LINE_FLOPS: usize = 1;
+const KEEP_OFF_LINE_FLOPS: usize = 0;
 
 /// Inputs shared by the preflop and postflop browsers.
 #[derive(Clone)]
@@ -436,7 +437,7 @@ impl AnyState {
             AnyState::Multi(s) => s.street,
         }
     }
-    fn to_act(&self) -> usize {
+    fn actor(&self) -> usize {
         match self {
             AnyState::Hu(s) => s.to_act,
             AnyState::Multi(s) => s.to_act,
@@ -849,7 +850,7 @@ impl Study {
                         end = LocEnd::Broken("an action after the end of the street".into());
                         break;
                     }
-                    let player = seg.players[state.to_act()];
+                    let player = seg.players[state.actor()];
                     line.push(LineItem::Action { player, label: action_label(a, &state.context()) });
                     local.push(step);
                     match state.flow(a) {

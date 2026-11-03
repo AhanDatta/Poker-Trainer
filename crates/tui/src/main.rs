@@ -198,6 +198,8 @@ mod tests {
         let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
         let s = render(&app);
         assert!(s.contains("Opponent") && s.contains("All Calling Station"), "{s}");
+        let small = render_at(&app, 100, 30);
+        assert!(small.contains("Reveal style during hand  ◂ Off ▸"), "{small}");
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let mut reviewed = false;
         for _ in 0..4000 {
@@ -206,6 +208,9 @@ mod tests {
             if hand.hero_to_act() {
                 let s = render(&app);
                 assert!(s.contains("Your move"), "{s}");
+                let small = render_at(&app, 100, 30);
+                assert!(small.contains("[F]") || small.contains("[C]"), "{small}");
+                assert!(small.contains("Board") && small.contains("Pot"), "{small}");
                 // Check/call when possible.
                 app.on_key(key('c'));
             } else if hand.is_finished() {
@@ -220,6 +225,10 @@ mod tests {
                     if !app.visible_decisions().is_empty() {
                         assert!(s.contains("Solver, your hand"), "{s}");
                         assert!(s.contains("Whole range"), "{s}");
+                        // Zoomed-in terminal: everything important still shows.
+                        let small = render_at(&app, 100, 30);
+                        assert!(small.contains("Solver, your hand") && small.contains("Your decisions"), "{small}");
+                        assert!(small.contains("A2o") && small.contains("22"), "grid cut off:\n{small}");
                         reviewed = true;
                         break;
                     }
@@ -358,5 +367,78 @@ mod tests {
         }
         app.on_key(key('e'));
         println!("{}", render_at(&app, 150, 40));
+    }
+
+    /// Drives study mode: a preflop line, a flop, actions, a turn card,
+    /// the range view, going back, and a typed spot.
+    #[test]
+    fn study_flow_works() {
+        let mut app = App::new(Session::new(study_config()).unwrap(), "/nonexistent/x.toml".into());
+        // From the setup screen: switch the mode row, then Enter.
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.mode, app::Mode::Study);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, app::Screen::Study);
+        app.tick();
+        let s = render_at(&app, 100, 30);
+        assert!(s.contains("UTG to act") && s.contains("Raise to 2.5bb"), "{s}");
+        // UTG, HJ, CO fold; BTN raises; SB folds; BB calls.
+        for c in ['f', 'f', 'f', '1', 'f', 'c'] {
+            app.on_key(key(c));
+            app.tick();
+        }
+        let s = render_at(&app, 100, 30);
+        assert!(s.contains("Flop cards"), "{s}");
+        press(&mut app, KeyCode::Tab);
+        let s = render_at(&app, 100, 30);
+        assert!(s.contains("BB's range"), "{s}");
+        press(&mut app, KeyCode::BackTab);
+        type_text(&mut app, "Ks7d2c");
+        press(&mut app, KeyCode::Enter);
+        study_settle(&mut app);
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("BB to act") && s.contains("Check"), "{s}");
+        // Clicking an action works like its key: check, then check back.
+        app.on_key(key('c'));
+        study_settle(&mut app);
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("BTN to act"), "{s}");
+        app.on_key(key('c'));
+        study_settle(&mut app);
+        app.tick();
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("Turn card"), "{s}");
+        type_text(&mut app, "9h");
+        press(&mut app, KeyCode::Enter);
+        study_settle(&mut app);
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("BB to act") && s.contains("Turn 9♥"), "{s}");
+        // Ranges going into the turn.
+        press(&mut app, KeyCode::Tab);
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("BB's range") && s.contains("of the starting range"), "{s}");
+        // Back to the card prompt, then to BTN's flop decision.
+        press(&mut app, KeyCode::Backspace);
+        app.tick();
+        press(&mut app, KeyCode::Backspace);
+        study_settle(&mut app);
+        app.tick();
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("BTN to act"), "{s}");
+        // Type a spot: the editor starts from the current spot.
+        app.on_key(key('e'));
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("Type a spot") && s.contains("BB range"), "{s}");
+        app.on_key(key('s'));
+        study_settle(&mut app);
+        let s = render_at(&app, 120, 34);
+        assert!(s.contains("BB to act"), "{s}");
+        // Esc goes back to the menu; Enter resumes the same study.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.screen, app::Screen::Setup);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.screen, app::Screen::Study);
+        study_settle(&mut app);
+        assert!(render_at(&app, 120, 34).contains("BB to act"));
     }
 }

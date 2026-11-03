@@ -26,7 +26,7 @@ pub struct TextInput {
 }
 
 pub enum Phase {
-    Preflop(PreflopNav),
+    Preflop(Box<PreflopNav>),
     Postflop(Box<Postflop>),
 }
 
@@ -202,7 +202,7 @@ impl StudyState {
     pub fn new(settings: Arc<StudySettings>) -> StudyState {
         StudyState {
             fingerprint: fingerprint(&settings),
-            phase: Phase::Preflop(PreflopNav::new(Arc::clone(&settings))),
+            phase: Phase::Preflop(Box::new(PreflopNav::new(Arc::clone(&settings)))),
             settings,
             view: GridView::Strategy,
             cursor: 0,
@@ -370,11 +370,24 @@ impl StudyState {
             }
         };
         if to_preflop {
-            let old = std::mem::replace(&mut self.phase, Phase::Preflop(PreflopNav::new(Arc::clone(&self.settings))));
+            let old = std::mem::replace(&mut self.phase, Phase::Preflop(Box::new(PreflopNav::new(Arc::clone(&self.settings)))));
             if let Phase::Postflop(p) = old {
-                self.phase = Phase::Preflop(p.preflop.expect("checked"));
+                self.phase = Phase::Preflop(Box::new(p.preflop.expect("checked")));
             }
             self.view = GridView::Strategy;
+        }
+    }
+
+    /// Back to the start of the current street's browser (preflop: the
+    /// first decision; postflop: the spot's root).
+    fn home(&mut self) {
+        self.message = None;
+        match &mut self.phase {
+            Phase::Preflop(nav) => nav.reset(),
+            Phase::Postflop(p) => {
+                p.study.home();
+                p.pos = p.study.poll();
+            }
         }
     }
 
@@ -424,7 +437,7 @@ impl StudyState {
             Phase::Preflop(nav) => {
                 let Some(mut spot) = nav.spot() else { return };
                 spot.board = cards;
-                let pre = nav.clone();
+                let pre = (**nav).clone();
                 self.open(spot, Some(pre));
             }
             Phase::Postflop(p) => {
@@ -496,7 +509,7 @@ impl StudyState {
                 return Outcome::None;
             }
             KeyCode::Left => {
-                if self.cursor % 13 > 0 {
+                if !self.cursor.is_multiple_of(13) {
                     self.cursor -= 1;
                 }
                 return Outcome::None;
@@ -520,6 +533,10 @@ impl StudyState {
         }
         if self.input.is_some() {
             match key.code {
+                KeyCode::Home => {
+                    self.input = None;
+                    self.home();
+                }
                 KeyCode::Enter => self.submit_input(),
                 KeyCode::Backspace => {
                     let empty = self.input.as_ref().is_some_and(|i| i.text.is_empty());
@@ -530,12 +547,12 @@ impl StudyState {
                         i.text.pop();
                     }
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if c.is_ascii_alphanumeric() || c == ' ' {
-                        if let Some(i) = &mut self.input {
-                            if i.text.len() < 16 {
-                                i.text.push(c);
-                            }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) && (c.is_ascii_alphanumeric() || c == ' ') =>
+                {
+                    if let Some(i) = &mut self.input {
+                        if i.text.len() < 16 {
+                            i.text.push(c);
                         }
                     }
                 }
@@ -545,16 +562,7 @@ impl StudyState {
         }
         match key.code {
             KeyCode::Backspace | KeyCode::Char('b') => self.back(),
-            KeyCode::Home | KeyCode::Char('g') => {
-                self.message = None;
-                match &mut self.phase {
-                    Phase::Preflop(nav) => nav.reset(),
-                    Phase::Postflop(p) => {
-                        p.study.home();
-                        p.pos = p.study.poll();
-                    }
-                }
-            }
+            KeyCode::Home | KeyCode::Char('g') => self.home(),
             KeyCode::Char('e') => self.open_editor(),
             KeyCode::Char('n') => self.new_board(),
             KeyCode::Char('p') => {
@@ -564,7 +572,7 @@ impl StudyState {
                         self.back();
                     }
                 } else if let Phase::Postflop(_) = self.phase {
-                    self.phase = Phase::Preflop(PreflopNav::new(Arc::clone(&self.settings)));
+                    self.phase = Phase::Preflop(Box::new(PreflopNav::new(Arc::clone(&self.settings))));
                     self.view = GridView::Strategy;
                 }
             }

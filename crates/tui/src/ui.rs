@@ -743,7 +743,7 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
     f.render_widget(block, area);
     // Grid beside the text when both fit (the grid grows with the space),
     // otherwise below it.
-    const TEXT_MIN: u16 = 46;
+    const TEXT_MIN: u16 = 45;
     let side_by_side = inner.width > TEXT_MIN + 52;
     let parts = if side_by_side {
         let grid_w = (inner.width / 2).clamp(52, inner.width - TEXT_MIN - 1);

@@ -4,7 +4,8 @@ A No-Limit Hold'em trainer for the terminal, written in Rust. Think chess
 puzzles, but for NLHE. You're dealt into a hand at a heads-up, 6-max or 9-max
 table, play it from preflop to the river against AI opponents with
 recognizable styles, and afterwards check every postflop decision you made
-against a solver.
+against a solver. A separate **solver study** mode lets you browse the
+preflop charts and the solver's strategy in any spot, GTO Wizard style.
 
 ```
 ┌ Your decisions ───────────────┐┌ Flop — GTO ranges ──────────────────────────────────────────┐
@@ -34,6 +35,8 @@ against a solver.
 | Villain range in review: GTO charts / villain's actual style range / both | ✅ |
 | Rake (no flop, no drop, capped) | ✅ |
 | Solver-based preflop charts (heads-up, 6-max), built in | ✅ |
+| Solver study mode: browse charts and solutions, any line, both ranges, typed spots | ✅ (heads-up exact, 3-way approximate) |
+| Layouts that fit zoomed terminals (~100×30) and grow on big windows; mouse clicks | ✅ |
 | Preflop grading | ❌ not yet (charts drive the AIs and the starting ranges) |
 
 ## Quick start
@@ -63,13 +66,19 @@ features, which is fine for a local build.
 RUSTFLAGS="-C target-cpu=native" cargo install --path crates/tui
 ```
 
-Use a terminal with Unicode and colors (any modern one; on Windows,
-Windows Terminal). The review shows its two panels side by side at 110+
-columns and stacked otherwise.
+Use a terminal with Unicode and 256 colors (any modern one; on Windows,
+Windows Terminal).
+
+**Text too small?** A terminal program can't set its own font size, so zoom
+the terminal itself (usually Ctrl/Cmd + and Ctrl/Cmd −). Every screen adapts
+down to about 100×30 characters; on bigger windows the hand grids, cards and
+panels grow to use the space. You can click actions, grid cells and review
+decisions with the mouse (hold Shift to select text instead).
 
 Other commands:
 
 ```bash
+cargo run --release -- study                  # open the solver study mode directly
 cargo run --release -- init-config            # writes poker-trainer.toml with every setting
 cargo run --release -- --config my.toml       # use a specific config
 cargo run --release -- --seed 42              # reproducible hands
@@ -84,11 +93,52 @@ cargo run --release -p solver --example compare -- Ks7s2d                 # fast
 
 | Where | Keys |
 |---|---|
-| Setup | ↑/↓ select · ←/→ change (table size, styles, position, stacks, rake, solver) · Enter play · W save settings · Q quit |
+| Setup | ↑/↓ select · ←/→ change (mode, table size, styles, position, stacks, rake, solver) · Enter play/study · W save settings · Q quit |
 | Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** solver review · **H** history · **S** settings |
 | Review | ↑/↓ choose decision · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · Esc back |
+| Study | **F**/**C**/**1–9** take an action · arrows (or click) pick a hand · **Tab** strategy / each player's range · **Backspace** back · **G**/Home start · **N** new random board · **E** type a spot · **P** back to preflop · Esc menu |
 
 After you fold, the rest of the hand plays out instantly.
+
+### Solver study mode
+
+Set **Mode** to *Solver study* on the setup screen and press Enter (or run
+`poker-trainer study`). It uses the table size, stacks, rake and flop-solving
+settings from the same screen.
+
+1. **Preflop:** click through a line in the charts, seat by seat. The grid
+   shows the acting seat's chart mix per hand; a cell's colored width is the
+   share of that hand still in the seat's range, so you see the range narrow
+   as the line goes on. **Tab** cycles through each player's range.
+2. **Flop:** once two or three players see the flop, type it (`Ks7d2c`) or
+   press Enter for a random one. The flop is solved with the line's ranges,
+   pot and stacks (your Fast/Exact setting applies; Fast is recommended).
+3. **Browse:** the grid shows the acting player's strategy (colored by
+   action mix; the second row of each cell is the hand's EV in bb on taller
+   windows). The panel lists every action with its frequency over the whole
+   range and for the selected hand, the selected hand's EV per action, and
+   each of its combos. Take any action, the solver's or not, to go down the
+   tree. **Tab** shows each player's range at this point.
+4. **Turn and river:** when a street's betting ends, type the next card (or
+   Enter for a random one). That street is then solved from the ranges the
+   previous street narrowed to, with the full bet menu, like the hand
+   reviews do. On the development machine (4 cores) a fast flop took ~30 s,
+   a turn ~2–8 s, a river well under a second, and a 3-way flop ~1 min.
+5. **Rare lines:** if you take a line the solver almost never takes (under
+   1.5% of a range gets there), the spot is re-solved from that point with
+   that range widened, so the strategy shown still means something. A note
+   says so.
+
+Press **E** to type a spot instead: 2 or 3 players, their ranges in the
+usual notation (`22+,A2s+,KTo+`, weights like `AKs:0.5`), pot, stacks and a
+board of 3 to 5 cards (empty = random flop). The editor starts from the
+current spot, with a live grid preview of the range you're editing. **N**
+deals a new random board for the same ranges.
+
+Going back and forth is cheap: finished turn and river solves are kept for
+lines you leave, and solves you abandon before they finish are cancelled.
+Study solves go ahead of hand reviews in the solver queue, and opening study
+mode cancels unfinished hand reviews.
 
 ### Grades
 
@@ -362,6 +412,9 @@ the presets in `crates/trainer/src/profiles.rs`.
 * **3-way review is approximate:** it ignores card removal between the two
   opponents and uses simplified later streets.
 * **Preflop grading** isn't implemented.
+* **Study mode** uses the bet menu from the config (`[menu]`); there's no
+  per-spot size editor yet. Its 3-way solves have the same limits as the
+  3-way review.
 * **9-max charts** use fallback rules; no public solver set was found.
 * **Exact flop solves still take minutes** on a 4-core machine. The next
   steps would be SIMD-friendlier showdown sweeps and a predictive

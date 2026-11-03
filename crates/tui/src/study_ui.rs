@@ -23,7 +23,7 @@ const PLAYER_COLORS: [Color; 3] = [Color::Cyan, Color::LightYellow, Color::Light
 
 /// Width of the right-hand panel.
 fn panel_width(total: u16) -> u16 {
-    (total * 2 / 5).clamp(44, 72).min(total.saturating_sub(52))
+    (total * 9 / 20).clamp(44, 72).min(total.saturating_sub(52))
 }
 
 pub fn draw_study(f: &mut Frame, app: &App) {
@@ -172,9 +172,9 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &StudyState, editor: bool) {
     let keys = if editor {
         "↑/↓ field · Enter edit/confirm · ←/→ players · Ctrl+U clear · S solve · Esc cancel"
     } else if st.input.is_some() {
-        "Type cards · Enter confirm (empty = random) · Backspace back · Tab ranges · arrows hand · Esc menu"
+        "Type cards · Enter confirm (empty = random) · Backspace back · Home start · Tab ranges · arrows hand · Esc menu"
     } else {
-        "F/C/1-9 act · arrows hand · Tab ranges · Backspace back · G start · N new board · E edit spot · P preflop · Esc menu · ? help"
+        "F/C/1-9 act · arrows hand · Tab ranges · Backspace back · G/Home start · N new board · E edit spot · P preflop · Esc menu · ? help"
     };
     lines.push(Line::from(Span::styled(truncate(keys, area.width as usize), Style::default().fg(Color::DarkGray))));
     f.render_widget(Paragraph::new(lines), area);
@@ -305,7 +305,7 @@ impl RowLayout {
         let extra = if class { 8 } else { 0 } + if ev { 10 } else { 0 };
         let mut bar = 6;
         let mut label = inner.saturating_sub(4 + bar + 7 + extra);
-        if label < 12 {
+        if label < 16 {
             bar = 0;
             label = inner.saturating_sub(4 + 7 + extra);
         }
@@ -391,7 +391,14 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
                     Some(c) => GridCell {
                         fill: (c.weight / live_combos(g, &board).max(1) as f32).clamp(0.0, 1.0),
                         mix: c.strategy.iter().enumerate().map(|(a, &w)| (w, action_color(&v.actions, a))).collect(),
-                        sub: evs[g].map(|e| format!("{:+.1}", e / BB as f32)),
+                        sub: evs[g].map(|e| {
+                            let v = e / BB as f32;
+                            if v.abs() >= 9.95 {
+                                format!("{v:.0}")
+                            } else {
+                                format!("{v:.1}")
+                            }
+                        }),
                     },
                     None => GridCell::default(),
                 })
@@ -655,8 +662,7 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, ed: &SpotEditor) {
     let text_w = (cols[0].width as usize).saturating_sub(label_w + 4).max(10);
     let rows = ed.rows();
     let y0 = cols[0].y + lines.len() as u16;
-    let mut y = y0;
-    for (i, row) in rows.iter().enumerate() {
+    for (y, (i, row)) in (y0..).zip(rows.iter().enumerate()) {
         let selected = i == ed.cursor;
         let (label, value) = match row {
             EditorRow::Players => (
@@ -696,7 +702,6 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, ed: &SpotEditor) {
         ));
         lines.push(Line::from(spans));
         app.hits.add(Rect { x: cols[0].x, y, width: cols[0].width, height: 1 }, Hit::Field(i));
-        y += 1;
     }
     lines.push(Line::from(""));
     if let Some(e) = &ed.error {
