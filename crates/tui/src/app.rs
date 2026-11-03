@@ -1,9 +1,13 @@
 //! Application state and input handling.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::study_app::{self, StudyState};
+use crate::widgets::{Hit, HitMap};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use holdem::Action;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trainer::config::{FlopMode, GameType, HeroPosition, VillainRange};
+use trainer::study::StudySettings;
 use trainer::{LiveHand, Session, Variant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,12 +16,23 @@ pub enum Screen {
     Table,
     Review,
     History,
+    Study,
     Help,
+}
+
+/// What Enter on the setup screen starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Play hands against the AI, with solver reviews.
+    Play,
+    /// Browse the preflop charts and solver strategies.
+    Study,
 }
 
 /// Rows of the setup screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupItem {
+    Mode,
     Table,
     Opponent,
     /// Custom table: how many players of style `i` (index into the style
@@ -65,6 +80,10 @@ pub struct App {
     pub message: Option<(String, Instant)>,
     pub quit: bool,
     pub config_path: String,
+    pub mode: Mode,
+    pub study: Option<StudyState>,
+    /// Clickable regions of the last frame.
+    pub hits: HitMap,
     /// The last finished hand (now in the history) is still on the table.
     showing_last: bool,
     last_step: Instant,
@@ -85,6 +104,9 @@ impl App {
             message: None,
             quit: false,
             config_path,
+            mode: Mode::Play,
+            study: None,
+            hits: HitMap::default(),
             showing_last: false,
             last_step: Instant::now(),
         }
@@ -135,7 +157,10 @@ impl App {
 
     /// Rows of the setup screen (custom tables get one row per style).
     pub fn setup_items(&self) -> Vec<SetupItem> {
-        let mut v = vec![SetupItem::Table, SetupItem::Opponent];
+        if self.mode == Mode::Study {
+            return vec![SetupItem::Mode, SetupItem::Table, SetupItem::Stack, SetupItem::Rake, SetupItem::FlopSolve];
+        }
+        let mut v = vec![SetupItem::Mode, SetupItem::Table, SetupItem::Opponent];
         if self.current_opponent_choice() == OpponentChoice::Game(GameType::Custom) {
             v.extend((0..self.session.config.profiles().len()).map(SetupItem::Count));
         }
@@ -153,6 +178,17 @@ impl App {
 
     /// Advances AI actions / dealing at the configured pace.
     pub fn tick(&mut self) {
+        if let Some((_, t)) = &self.message {
+            if t.elapsed() > Duration::from_secs(4) {
+                self.message = None;
+            }
+        }
+        if self.screen == Screen::Study {
+            if let Some(st) = &mut self.study {
+                st.tick();
+            }
+            return;
+        }
         if self.screen != Screen::Table {
             return;
         }
@@ -166,11 +202,6 @@ impl App {
             }
         }
         self.archive_if_finished();
-        if let Some((_, t)) = &self.message {
-            if t.elapsed() > Duration::from_secs(4) {
-                self.message = None;
-            }
-        }
     }
 
     fn start_hand(&mut self) {
@@ -205,6 +236,7 @@ impl App {
             Screen::Table => self.table_key(key),
             Screen::Review => self.review_key(key),
             Screen::History => self.history_key(key),
+            Screen::Study => self.study_key(key),
             Screen::Help => {
                 self.screen = self.prev_screen;
             }
@@ -228,12 +260,15 @@ impl App {
             }
             KeyCode::Left | KeyCode::Char('h') => self.change_setting(-1),
             KeyCode::Right | KeyCode::Char('l') => self.change_setting(1),
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                self.goto(Screen::Table);
-                if self.hand_finished() {
-                    self.start_hand();
+            KeyCode::Enter | KeyCode::Char(' ') => match self.mode {
+                Mode::Play => {
+                    self.goto(Screen::Table);
+                    if self.hand_finished() {
+                        self.start_hand();
+                    }
                 }
-            }
+                Mode::Study => self.open_study(),
+            },
             KeyCode::Char('w') => {
                 let text = self.session.config.to_toml();
                 match std::fs::write(&self.config_path, text) {
@@ -253,6 +288,13 @@ impl App {
         let item = items[self.setup_cursor.min(items.len() - 1)];
         let cfg = &mut self.session.config;
         match item {
+            SetupItem::Mode => {
+                self.mode = match self.mode {
+                    Mode::Play => Mode::Study,
+                    Mode::Study => Mode::Play,
+                };
+                self.setup_cursor = 0;
+            }
             SetupItem::Table => {
                 let sizes = [2usize, 6, 9];
                 let cur = sizes.iter().position(|&n| n == self.session.config.players).unwrap_or(0);
@@ -459,6 +501,70 @@ impl App {
             }
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Table,
+            _ => {}
+        }
+    }
+
+    /// Opens the study screen, resuming the last study unless the settings
+    /// it depends on changed.
+    pub fn open_study(&mut self) {
+        let settings =
+            Arc::new(StudySettings::from_config(&self.session.config, Arc::clone(self.session.charts())));
+        let fresh = study_app::fingerprint(&settings);
+        if self.study.as_ref().is_none_or(|s| s.fingerprint != fresh) {
+            self.study = Some(StudyState::new(settings));
+        }
+        if self.session.stats().reviews_pending > 0 {
+            self.session.cancel_pending_reviews();
+            self.flash("Unfinished hand reviews were cancelled to free the solver for study mode.");
+        }
+        self.mode = Mode::Study;
+        self.goto(Screen::Study);
+    }
+
+    fn study_key(&mut self, key: KeyEvent) {
+        let Some(st) = &mut self.study else {
+            self.screen = Screen::Setup;
+            return;
+        };
+        match st.on_key(key) {
+            study_app::Outcome::None => {}
+            study_app::Outcome::Leave => self.screen = Screen::Setup,
+            study_app::Outcome::Help => self.goto(Screen::Help),
+            study_app::Outcome::Quit => self.quit = true,
+        }
+    }
+
+    pub fn on_mouse(&mut self, ev: MouseEvent) {
+        if ev.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let Some(hit) = self.hits.at(ev.column, ev.row) else { return };
+        match self.screen {
+            Screen::Study => {
+                if let Some(st) = &mut self.study {
+                    st.on_click(hit);
+                }
+            }
+            Screen::Review => {
+                if let Hit::Decision(i) = hit {
+                    self.review_selected = i;
+                }
+            }
+            Screen::Table => {
+                if let Hit::Action(i) = hit {
+                    let acts = self.action_keys();
+                    if let Some(&(_, a)) = acts.get(i) {
+                        if let Some(hand) = &mut self.hand {
+                            if let Err(e) = hand.hero_act(a) {
+                                self.flash(e.to_string());
+                            }
+                            self.last_step = Instant::now();
+                        }
+                        self.archive_if_finished();
+                    }
+                }
+            }
             _ => {}
         }
     }

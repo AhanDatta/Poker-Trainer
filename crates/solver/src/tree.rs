@@ -33,9 +33,14 @@ pub struct BettingState {
     pub needs: [bool; 2],
 }
 
-pub(crate) enum Transition {
+/// What an action leads to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transition {
+    /// The street continues with this state.
     Continue(BettingState),
+    /// The given player folded.
     Fold(usize),
+    /// The street's betting is over (the state holds the final commitments).
     StreetOver(BettingState),
 }
 
@@ -78,6 +83,11 @@ impl BettingState {
             Transition::Continue(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// Where `action` leads.
+    pub fn transition(&self, action: Action) -> Transition {
+        self.apply(action).0
     }
 
     pub(crate) fn apply(&self, action: Action) -> (Transition, Chips) {

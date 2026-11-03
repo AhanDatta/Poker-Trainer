@@ -7,6 +7,7 @@
 //!   and grades every hero decision.
 //! * [`ai`] / [`profiles`] implement the opponent styles.
 //! * [`preflop`] holds the preflop charts and abstract preflop actions.
+//! * [`study`] is the solver study mode (browse charts and solutions).
 
 // Index loops are clearer than iterator chains in the numeric code here.
 #![allow(clippy::needless_range_loop)]
@@ -22,6 +23,7 @@ pub mod profiles;
 pub mod review;
 pub mod session;
 pub mod strength;
+pub mod study;
 
 pub use config::{FlopMode, GameType, HeroPosition, SolverSettings, TrainerConfig, VillainRange};
 pub use hand::{LiveHand, LogEntry, StepResult};

@@ -46,9 +46,14 @@ pub struct MultiState {
     pub needs: [bool; N],
 }
 
-enum Next {
+/// What an action leads to in a three-player street.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// The street continues with this state.
     Continue(MultiState),
+    /// Everyone else folded: the given player wins.
     Won(usize),
+    /// The street's betting is over.
     StreetOver(MultiState),
 }
 
@@ -106,6 +111,11 @@ impl MultiState {
             Next::Continue(s) => Some(s),
             _ => None,
         }
+    }
+
+    /// Where `action` leads.
+    pub fn transition(&self, action: Action) -> Next {
+        self.apply(action).0
     }
 
     fn apply(&self, action: Action) -> (Next, Chips) {

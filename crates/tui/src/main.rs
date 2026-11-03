@@ -3,12 +3,16 @@
 mod app;
 mod charts_cmd;
 mod selfplay;
+mod study_app;
+mod study_ui;
 mod ui;
+mod widgets;
 
 use anyhow::{anyhow, Result};
 use app::App;
 use clap::{Parser, Subcommand};
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind};
+use crossterm::execute;
 use std::path::Path;
 use std::time::Duration;
 use trainer::{Session, TrainerConfig};
@@ -36,6 +40,8 @@ struct Cli {
 enum Cmd {
     /// Play in the terminal UI (default).
     Play,
+    /// Open the solver study mode directly.
+    Study,
     /// Write a config file with all settings and their defaults.
     InitConfig {
         /// Output path.
@@ -114,25 +120,35 @@ fn main() -> Result<()> {
             let session = Session::new(cfg).map_err(|e| anyhow!(e))?;
             run_tui(App::new(session, path))
         }
+        Some(Cmd::Study) => {
+            let (cfg, path) = load_config(&cli)?;
+            let session = Session::new(cfg).map_err(|e| anyhow!(e))?;
+            let mut app = App::new(session, path);
+            app.open_study();
+            run_tui(app)
+        }
     }
 }
 
 fn run_tui(mut app: App) -> Result<()> {
     let mut terminal = ratatui::init();
+    // Clicks select hands and actions (hold Shift to select text instead).
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let result = (|| -> Result<()> {
         while !app.quit {
             terminal.draw(|f| ui::draw(f, &app))?;
             if event::poll(Duration::from_millis(50))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        app.on_key(key);
-                    }
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => app.on_key(key),
+                    Event::Mouse(m) => app.on_mouse(m),
+                    _ => {}
                 }
             }
             app.tick();
         }
         Ok(())
     })();
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
 }
@@ -150,7 +166,11 @@ mod tests {
     }
 
     fn render(app: &App) -> String {
-        let mut term = Terminal::new(TestBackend::new(150, 40)).unwrap();
+        render_at(app, 150, 40)
+    }
+
+    fn render_at(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ui::draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = String::new();
@@ -225,6 +245,14 @@ mod tests {
         cfg.opponent = "LAG".into();
         cfg.players = std::env::var("PLAYERS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
         cfg.solver.flop_mode = trainer::FlopMode::Fast;
+        cfg.solver.flop_turn_samples = 4;
+        cfg.solver.flop_river_samples = 3;
+        let size: Vec<u16> = std::env::var("SIZE")
+            .unwrap_or("150x40".into())
+            .split('x')
+            .map(|v| v.parse().unwrap())
+            .collect();
+        let render = |app: &App| render_at(app, size[0], size[1]);
         let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
         println!("{}", render(&app));
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -257,5 +285,78 @@ mod tests {
                 app.on_key(key('n'));
             }
         }
+    }
+
+    fn study_config() -> TrainerConfig {
+        let mut cfg = TrainerConfig::default();
+        cfg.seed = Some(5);
+        cfg.players = 6;
+        cfg.solver.flop_mode = trainer::FlopMode::Fast;
+        cfg.solver.flop_turn_samples = 4;
+        cfg.solver.flop_river_samples = 3;
+        cfg.solver.max_iterations = 60;
+        cfg.solver.target_exploitability_pct = 2.0;
+        cfg
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.on_key(key(c));
+        }
+    }
+
+    /// Ticks until the study screen has a decision (or `f` says stop).
+    fn study_settle(app: &mut App) {
+        for _ in 0..6000 {
+            app.tick();
+            let st = app.study.as_ref().unwrap();
+            if let study_app::Phase::Postflop(p) = &st.phase {
+                if !matches!(p.pos, trainer::study::StudyPos::Solving(_) | trainer::study::StudyPos::Loading) {
+                    return;
+                }
+            } else {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("study didn't settle");
+    }
+
+    /// Prints the study screens at several sizes (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn print_study_screens() {
+        let mut app = App::new(Session::new(study_config()).unwrap(), "/nonexistent/x.toml".into());
+        app.open_study();
+        app.tick();
+        let sizes = [(100u16, 30u16), (150, 40), (200, 55)];
+        for &(w, h) in &sizes {
+            println!("{}", render_at(&app, w, h));
+        }
+        // UTG, HJ, CO fold; BTN raises; SB folds; BB calls.
+        for c in ['f', 'f', 'f', '1', 'f', 'c'] {
+            app.on_key(key(c));
+            app.tick();
+        }
+        press(&mut app, KeyCode::Tab);
+        app.tick();
+        println!("{}", render_at(&app, 100, 30));
+        press(&mut app, KeyCode::BackTab);
+        type_text(&mut app, "Ks7d2c");
+        println!("{}", render_at(&app, 100, 30));
+        press(&mut app, KeyCode::Enter);
+        app.tick();
+        println!("{}", render_at(&app, 150, 40));
+        study_settle(&mut app);
+        app.study.as_mut().unwrap().cursor = 0; // AA
+        for &(w, h) in &sizes {
+            println!("{}", render_at(&app, w, h));
+        }
+        app.on_key(key('e'));
+        println!("{}", render_at(&app, 150, 40));
     }
 }
