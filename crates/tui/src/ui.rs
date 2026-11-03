@@ -24,6 +24,8 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::History => draw_history(f, app),
         Screen::Study => crate::study_ui::draw_study(f, app),
         Screen::Sizes => draw_sizes(f, app),
+        Screen::Sessions => crate::score_ui::draw_sessions(f, app),
+        Screen::Score => crate::score_ui::draw_score(f, app),
         Screen::Help => draw_help(f),
     }
     if let Some((msg, _)) = &app.message {
@@ -78,6 +80,9 @@ pub(crate) fn title_bar(app: &App, extra: &str) -> Paragraph<'static> {
             st.avg_loss_pct()
         )));
     }
+    if let Some(r) = app.session.report() {
+        spans.push(Span::raw(format!(" · Freq score {:.0} [G]", r.calibration.score())));
+    }
     if st.reviews_pending > 0 {
         spans.push(Span::styled(
             format!(" · {} review(s) solving", st.reviews_pending),
@@ -93,6 +98,48 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
     let cfg = &app.session.config;
     let s = |a: &str, b: &str| (a.to_string(), b.to_string());
     match item {
+        SetupItem::Session => {
+            let hands = app.session.history.len();
+            match (&app.sessions_root, app.session.save_id()) {
+                (None, _) => s("Not saved", "Saving is off (save_sessions = false in the config)."),
+                (Some(root), Some(id)) => (
+                    format!("Saved · {hands} hands"),
+                    format!(
+                        "Saved as {} after every hand. Enter: start a new session, continue or delete another.",
+                        root.join(id).display()
+                    ),
+                ),
+                (Some(root), None) if hands > 0 => (
+                    format!("Saving · {hands} hands"),
+                    format!("Hands are saved in {} as their reviews finish.", root.display()),
+                ),
+                (Some(root), None) => (
+                    if app.sessions.is_empty() { "New".into() } else { format!("New ({} saved)", app.sessions.len()) },
+                    format!(
+                        "Saved in {} once a hand is finished. Enter: continue or delete saved sessions.",
+                        root.display()
+                    ),
+                ),
+            }
+        }
+        SetupItem::Rng => {
+            if cfg.show_rng {
+                s(
+                    "Shown",
+                    "A random number 0-99 at each of your decisions, to play mixes: with a 30% bet, \
+                     bet on 0-29. The review shows what the solver's mix makes of it.",
+                )
+            } else {
+                s("Hidden", "No random number at your decisions.")
+            }
+        }
+        SetupItem::ScoreWeight => {
+            if cfg.scoring.pot_weighted {
+                s("By pot size", "Frequency score: decisions count in proportion to the pot, so leaks in big pots weigh more.")
+            } else {
+                s("Equal", "Frequency score: every decision counts the same.")
+            }
+        }
         SetupItem::Mode => match app.mode {
             Mode::Play => s(
                 "Play hands",
@@ -243,6 +290,9 @@ fn draw_setup(f: &mut Frame, app: &App) {
     let cfg = &app.session.config;
     let label = |item: SetupItem| -> String {
         match item {
+            SetupItem::Session => "Session",
+            SetupItem::Rng => "Random number",
+            SetupItem::ScoreWeight => "Frequency score weighting",
             SetupItem::Mode => "Mode",
             SetupItem::Table => "Table",
             SetupItem::Opponent => {
@@ -334,7 +384,9 @@ fn draw_setup(f: &mut Frame, app: &App) {
         mid[1],
     );
     let keys = match app.mode {
-        Mode::Play => "↑/↓ select · ←/→ change · Enter play · W save settings · ? help · Q quit",
+        Mode::Play => {
+            "↑/↓ select · ←/→ change · Enter play · O sessions · G score · W save settings · ? help · Q quit"
+        }
         Mode::Study => "↑/↓ select · ←/→ change · Enter study · W save settings · ? help · Q quit",
     };
     f.render_widget(
@@ -560,15 +612,23 @@ fn draw_table(f: &mut Frame, app: &App) {
                     .fg(if net >= 0 { Color::Green } else { Color::Red })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   [N] next hand   [R] solver review   [H] history   [S] settings"),
+            Span::raw("   [N] next hand   [R] solver review   [H] history   [G] score   [S] settings"),
         ]));
     } else {
         lines.push(Line::from(Span::styled("Villain is thinking…", Style::default().fg(Color::DarkGray))));
     }
+    let mut title = vec![Span::raw(" Your move ")];
+    if let Some(roll) = hand.current_roll().filter(|_| app.session.config.show_rng) {
+        title.push(Span::styled(
+            format!(" RNG {roll:02} "),
+            Style::default().fg(Color::Black).bg(Color::LightYellow).add_modifier(Modifier::BOLD),
+        ));
+        title.push(Span::raw(" "));
+    }
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" Your move ")),
+            .block(Block::default().borders(Borders::ALL).title(Line::from(title))),
         rows[2],
     );
 
@@ -585,21 +645,23 @@ fn draw_table(f: &mut Frame, app: &App) {
             Style::default().fg(Color::DarkGray),
         )),
         Some(r) => {
-            let s = r.status();
-            let mut text = format!("Solver: {}", s.stage);
-            if let Some(p) = s.progress {
-                text.push_str(&format!(
-                    " — iteration {} · exploitability {:.2}% pot",
-                    p.iteration, p.exploitability_pct
-                ));
-            }
-            text.push_str(&elapsed(&s));
-            if s.finished && s.error.is_none() {
-                text = format!(
-                    "Solver: review ready ({} decisions graded) — press R after the hand",
-                    s.decisions.len()
-                );
-            }
+            let text = r.with_status(|s| {
+                let mut text = format!("Solver: {}", s.stage);
+                if let Some(p) = s.progress {
+                    text.push_str(&format!(
+                        " — iteration {} · exploitability {:.2}% pot",
+                        p.iteration, p.exploitability_pct
+                    ));
+                }
+                text.push_str(&elapsed(s));
+                if s.finished && s.error.is_none() {
+                    text = format!(
+                        "Solver: review ready ({} decisions graded) — press R after the hand",
+                        s.decisions.len()
+                    );
+                }
+                text
+            });
             Line::from(Span::styled(
                 truncate(&text, area.width as usize),
                 Style::default().fg(Color::LightMagenta),
@@ -765,7 +827,9 @@ fn draw_review(f: &mut Frame, app: &App) {
         parts[1]
     };
     if let Some(d) = decisions.get(app.review_selected.min(decisions.len().saturating_sub(1))) {
-        draw_decision(f, detail_area, d, &status.notes);
+        let roll = (app.session.config.show_rng && d.spot.categories.len() == d.actions.len())
+            .then(|| hand.roll(d.spot.history_index));
+        draw_decision(f, detail_area, d, &status.notes, roll);
     } else {
         let mut lines: Vec<Line> = status.notes.iter().map(|n| Line::from(format!("• {n}"))).collect();
         if lines.is_empty() {
@@ -785,7 +849,7 @@ fn draw_review(f: &mut Frame, app: &App) {
     );
 }
 
-fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[String]) {
+fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[String], roll: Option<u8>) {
     let block =
         Block::default().borders(Borders::ALL).title(format!(" {} — {} ", d.street, d.variant.label()));
     let inner = block.inner(area);
@@ -844,6 +908,16 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
             "  no EV lost".to_string()
         }),
     ]));
+    if let Some(roll) = roll {
+        let pick = trainer::scoring::rng_action(&d.hero_strategy, roll);
+        let same = pick == d.chosen;
+        lines.push(Line::from(vec![
+            Span::styled(format!("RNG {roll:02}"), Style::default().fg(Color::LightYellow)),
+            Span::raw(" → the solver's mix plays "),
+            Span::styled(d.labels[pick].clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(if same { "  (as you did)" } else { "" }, Style::default().fg(Color::DarkGray)),
+        ]));
+    }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Solver, your hand:", Style::default().fg(ACCENT))));
     for i in 0..d.actions.len() {
@@ -945,9 +1019,18 @@ fn draw_history(f: &mut Frame, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
         .split(area);
     f.render_widget(title_bar(app, "History"), rows[0]);
-    let items: Vec<ListItem> = app
-        .session
-        .history
+    // Only the rows that fit are built (long sessions have thousands).
+    let window = rows[1].height.saturating_sub(2).max(1) as usize;
+    let n = app.session.history.len();
+    let selected = app.history_selected.min(n.saturating_sub(1));
+    let mut offset = app.history_offset.get().min(n.saturating_sub(1));
+    if selected < offset {
+        offset = selected;
+    } else if selected >= offset + window {
+        offset = selected + 1 - window;
+    }
+    app.history_offset.set(offset);
+    let items: Vec<ListItem> = app.session.history[offset..(offset + window).min(n)]
         .iter()
         .map(|h| {
             let net = h.hero_net().unwrap_or(0);
@@ -960,8 +1043,7 @@ fn draw_history(f: &mut Frame, app: &App) {
             ));
             match h.review() {
                 None => spans.push(Span::styled("no postflop", Style::default().fg(Color::DarkGray))),
-                Some(r) => {
-                    let st = r.status();
+                Some(r) => r.with_status(|st| {
                     if !st.finished {
                         spans.push(Span::styled("solving…", Style::default().fg(Color::Yellow)));
                     } else if st.cancelled {
@@ -974,15 +1056,15 @@ fn draw_history(f: &mut Frame, app: &App) {
                             Style::default().fg(verdict_color(d.verdict)),
                         ));
                     }
-                }
+                }),
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let mut state = ListState::default().with_selected(Some(app.history_selected));
+    let mut state = ListState::default().with_selected(Some(selected - offset));
     f.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" Finished hands "))
+            .block(Block::default().borders(Borders::ALL).title(format!(" Finished hands ({n}) ")))
             .highlight_style(Style::default().bg(Color::DarkGray))
             .highlight_symbol("▶ "),
         rows[1],
@@ -997,13 +1079,18 @@ fn draw_help(f: &mut Frame) {
         Line::from(""),
         Line::from("At the table"),
         Line::from("  F fold · C or X check/call · 1-9 bet/raise sizes from the menu · A largest raise"),
-        Line::from("  N next hand · R solver review (after the hand) · H history · S settings · Q quit"),
+        Line::from("  N next hand · R solver review (after the hand) · H history · G frequency score · S settings · Q quit"),
+        Line::from("  RNG nn: a random number 0-99 for mixing (low numbers: the most aggressive option)"),
         Line::from(""),
         Line::from("Review"),
         Line::from("  ↑/↓ choose a decision · Tab switch between GTO and villain's-actual-range solves"),
         Line::from(""),
         Line::from("Grades (EV lost vs. the best action, as % of the pot)"),
         Line::from("  ✓ Best ≤1% · ✓ Good ≤3% · ?! Inaccuracy ≤6% · ? Mistake ≤12% · ?? Blunder >12%"),
+        Line::from("  The frequency score (G) checks how often you take each option against the solver's mixes."),
+        Line::from(""),
+        Line::from("Sessions"),
+        Line::from("  Hands are saved as you play. O on the setup screen: continue a session, start a new one, delete one (D)."),
         Line::from(""),
         Line::from("Solver study"),
         Line::from("  F / C / 1-9 take an action · arrow keys pick a hand (or click it) · Tab cycles strategy / ranges"),

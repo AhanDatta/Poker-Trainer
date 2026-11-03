@@ -4,9 +4,11 @@ use crate::study_app::{self, StudyState};
 use crate::widgets::{Hit, HitMap};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use holdem::Action;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use trainer::config::{FlopMode, GameType, HeroPosition, VillainRange};
+use trainer::save::{self, SessionMeta, SessionStore};
 use trainer::study::StudySettings;
 use trainer::{LiveHand, Session, Variant};
 
@@ -19,6 +21,10 @@ pub enum Screen {
     Study,
     /// Bet-size editor.
     Sizes,
+    /// Saved sessions: continue, start new, delete.
+    Sessions,
+    /// The session's frequency score.
+    Score,
     Help,
 }
 
@@ -34,6 +40,8 @@ pub enum Mode {
 /// Rows of the setup screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SetupItem {
+    /// Which saved session this is (Enter: the sessions screen).
+    Session,
     Mode,
     Table,
     Opponent,
@@ -51,6 +59,10 @@ pub enum SetupItem {
     BetSizes,
     VillainRange,
     RevealStyle,
+    /// Show a random number at each decision.
+    Rng,
+    /// Frequency score: weight decisions by the pot.
+    ScoreWeight,
 }
 
 /// Rake presets: (percent, cap in big blinds).
@@ -96,6 +108,17 @@ pub struct App {
     /// When Q was pressed once: a second press within [`QUIT_WINDOW`] quits.
     quit_armed: Option<Instant>,
     pub sizes: Option<crate::sizes::SizesEditor>,
+    /// Where sessions are saved (`None`: saving is off).
+    pub sessions_root: Option<PathBuf>,
+    /// Saved sessions as last listed, and the selected row (0 = new).
+    pub sessions: Vec<SessionMeta>,
+    pub sessions_cursor: usize,
+    /// A saved session waiting for "y" to be deleted.
+    pub confirm_delete: Option<String>,
+    /// First line shown on the score screen.
+    pub score_scroll: usize,
+    /// First hand shown on the history screen (kept by drawing).
+    pub history_offset: std::cell::Cell<usize>,
     /// The last finished hand (now in the history) is still on the table.
     showing_last: bool,
     last_step: Instant,
@@ -121,9 +144,161 @@ impl App {
             hits: HitMap::default(),
             quit_armed: None,
             sizes: None,
+            sessions_root: None,
+            sessions: Vec::new(),
+            sessions_cursor: 0,
+            confirm_delete: None,
+            score_scroll: 0,
+            history_offset: std::cell::Cell::new(0),
             showing_last: false,
             last_step: Instant::now(),
         }
+    }
+
+    /// Saves finished hands under `root` and lists the saved sessions.
+    pub fn enable_saving(&mut self, root: PathBuf) {
+        self.session.start_saving(root.clone());
+        self.sessions = save::list_sessions(&root);
+        self.sessions_root = Some(root);
+    }
+
+    /// Opens the saved-sessions screen.
+    pub fn open_sessions(&mut self) {
+        if let Some(root) = &self.sessions_root {
+            self.sessions = save::list_sessions(root);
+        }
+        self.sessions_cursor = 0;
+        self.confirm_delete = None;
+        if self.screen != Screen::Sessions {
+            self.goto(Screen::Sessions);
+        }
+    }
+
+    /// Replaces the session (after saving the current one).
+    fn switch_session(&mut self, s: Session) {
+        self.session = s;
+        self.hand = None;
+        self.showing_last = false;
+        self.review_target = None;
+        self.history_selected = 0;
+        self.review_selected = 0;
+        self.score_scroll = 0;
+        self.screen = Screen::Setup;
+    }
+
+    /// Continues saved session `id`.
+    fn continue_session(&mut self, id: &str) {
+        let Some(root) = self.sessions_root.clone() else { return };
+        if self.session.save_id() == Some(id) {
+            self.flash("That's the session you're playing.");
+            self.screen = Screen::Setup;
+            return;
+        }
+        let loaded = match SessionStore::open(&root, id).map_err(|e| e.to_string()).and_then(|s| s.load()) {
+            Ok(l) => l,
+            Err(e) => return self.flash(format!("Couldn't read that session: {e}")),
+        };
+        let skipped = loaded.skipped;
+        self.session.flush(Duration::from_secs(3));
+        match Session::resume(loaded, root, &self.session.config) {
+            Ok(s) => {
+                let n = s.history.len();
+                self.switch_session(s);
+                let mut msg = format!("Continuing the session: {n} hands so far.");
+                if skipped > 0 {
+                    msg.push_str(&format!(" {skipped} damaged hand(s) couldn't be read."));
+                }
+                self.flash(msg);
+            }
+            Err(e) => self.flash(format!("Couldn't continue that session: {e}")),
+        }
+    }
+
+    /// Starts a new session with the current settings.
+    fn new_session(&mut self) {
+        if self.session.history.is_empty() && self.session.save_id().is_none() {
+            self.screen = Screen::Setup;
+            return;
+        }
+        self.session.flush(Duration::from_secs(3));
+        match Session::new(self.session.config.clone()) {
+            Ok(mut s) => {
+                if let Some(root) = &self.sessions_root {
+                    s.start_saving(root.clone());
+                }
+                self.switch_session(s);
+                self.flash("New session started.");
+            }
+            Err(e) => self.flash(e),
+        }
+    }
+
+    fn sessions_key(&mut self, key: KeyEvent) {
+        if let Some(id) = self.confirm_delete.clone() {
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                if let Some(root) = &self.sessions_root {
+                    match save::delete_session(root, &id) {
+                        Ok(()) => self.flash("Session deleted."),
+                        Err(e) => self.flash(format!("Couldn't delete it: {e}")),
+                    }
+                }
+                self.open_sessions();
+            }
+            self.confirm_delete = None;
+            return;
+        }
+        let n = self.sessions.len() + 1;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sessions_cursor = self.sessions_cursor.checked_sub(1).unwrap_or(n - 1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.sessions_cursor = (self.sessions_cursor + 1) % n,
+            KeyCode::Enter | KeyCode::Char(' ') => match self.sessions_cursor {
+                0 => self.new_session(),
+                i => {
+                    if let Some(id) = self.sessions.get(i - 1).map(|m| m.id.clone()) {
+                        self.continue_session(&id);
+                    }
+                }
+            },
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete | KeyCode::Backspace => {
+                match self.sessions_cursor.checked_sub(1).and_then(|i| self.sessions.get(i)) {
+                    Some(m) if self.session.save_id() == Some(m.id.as_str()) => {
+                        self.flash("That's the session you're playing: start a new one first to delete it.")
+                    }
+                    Some(m) => {
+                        self.confirm_delete = Some(m.id.clone());
+                        // The prompt must not hide behind an old message.
+                        self.message = None;
+                    }
+                    None => {}
+                }
+            }
+            KeyCode::Char('?') => self.goto(Screen::Help),
+            KeyCode::Char('q') => self.request_quit(),
+            KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Setup,
+            _ => {}
+        }
+    }
+
+    fn score_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.score_scroll = self.score_scroll.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.score_scroll += 1,
+            KeyCode::PageUp => self.score_scroll = self.score_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.score_scroll += 10,
+            KeyCode::Char('?') => self.goto(Screen::Help),
+            KeyCode::Char('q') => self.request_quit(),
+            _ => {
+                self.screen =
+                    if self.prev_screen == Screen::Score { Screen::Table } else { self.prev_screen };
+            }
+        }
+    }
+
+    fn open_score(&mut self) {
+        self.score_scroll = 0;
+        self.goto(Screen::Score);
     }
 
     /// The hand on the table: the live hand, or the just-finished one.
@@ -182,7 +357,7 @@ impl App {
                 SetupItem::BetSizes,
             ];
         }
-        let mut v = vec![SetupItem::Mode, SetupItem::Table, SetupItem::Opponent];
+        let mut v = vec![SetupItem::Mode, SetupItem::Session, SetupItem::Table, SetupItem::Opponent];
         if self.current_opponent_choice() == OpponentChoice::Game(GameType::Custom) {
             v.extend((0..self.session.config.profiles().len()).map(SetupItem::Count));
         }
@@ -196,6 +371,8 @@ impl App {
             SetupItem::BetSizes,
             SetupItem::VillainRange,
             SetupItem::RevealStyle,
+            SetupItem::Rng,
+            SetupItem::ScoreWeight,
         ]);
         v
     }
@@ -206,6 +383,11 @@ impl App {
             if t.elapsed() > Duration::from_secs(4) {
                 self.message = None;
             }
+        }
+        // Settles hands whose reviews finished (stats, score, autosave).
+        self.session.refresh();
+        if let Some(e) = self.session.take_save_error() {
+            self.flash(e);
         }
         if self.screen == Screen::Study {
             if let Some(st) = &mut self.study {
@@ -257,7 +439,11 @@ impl App {
             self.quit = true;
         } else {
             self.quit_armed = Some(Instant::now());
-            self.flash("Press Q again to quit (this session's stats aren't kept after quitting).");
+            if self.session.is_saving() {
+                self.flash("Press Q again to quit (the session is saved: continue it next time).");
+            } else {
+                self.flash("Press Q again to quit (this session isn't saved: saving is off).");
+            }
         }
     }
 
@@ -284,6 +470,8 @@ impl App {
                     self.screen = Screen::Setup;
                 }
             }
+            Screen::Sessions => self.sessions_key(key),
+            Screen::Score => self.score_key(key),
             Screen::Help => {
                 self.screen = self.prev_screen;
             }
@@ -313,6 +501,13 @@ impl App {
                 self.sizes.get_or_insert_with(crate::sizes::SizesEditor::new);
                 self.goto(Screen::Sizes);
             }
+            KeyCode::Enter | KeyCode::Char(' ')
+                if self.setup_items().get(self.setup_cursor) == Some(&SetupItem::Session) =>
+            {
+                self.open_session_screen_or_explain();
+            }
+            KeyCode::Char('g') => self.open_score(),
+            KeyCode::Char('o') => self.open_session_screen_or_explain(),
             KeyCode::Enter | KeyCode::Char(' ') => match self.mode {
                 Mode::Play => {
                     self.goto(Screen::Table);
@@ -341,6 +536,9 @@ impl App {
         let item = items[self.setup_cursor.min(items.len() - 1)];
         let cfg = &mut self.session.config;
         match item {
+            SetupItem::Session => self.open_session_screen_or_explain(),
+            SetupItem::Rng => cfg.show_rng = !cfg.show_rng,
+            SetupItem::ScoreWeight => cfg.scoring.pot_weighted = !cfg.scoring.pot_weighted,
             SetupItem::Mode => {
                 self.mode = match self.mode {
                     Mode::Play => Mode::Study,
@@ -494,6 +692,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.goto(Screen::Help),
+            KeyCode::Char('g') => self.open_score(),
             KeyCode::Esc | KeyCode::Char('s') => {
                 if !finished {
                     self.flash("Finish this hand before changing settings.");
@@ -531,6 +730,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.goto(Screen::Help),
+            KeyCode::Char('g') => self.open_score(),
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.screen = if self.review_target.is_some() { Screen::History } else { Screen::Table };
@@ -559,9 +759,20 @@ impl App {
                     self.flash("That hand has no solver review (it ended preflop).");
                 }
             }
+            KeyCode::Char('g') => self.open_score(),
             KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc | KeyCode::Char('b') => self.screen = Screen::Table,
             _ => {}
+        }
+    }
+
+    fn open_session_screen_or_explain(&mut self) {
+        if self.sessions_root.is_some() {
+            self.open_sessions();
+        } else {
+            self.flash(
+                "Saving is off (save_sessions = false in the config), so there are no saved sessions.",
+            );
         }
     }
 

@@ -25,5 +25,5 @@ pub use card::{Card, CardSet, Deck, ParseError};
 pub use combo::{combo_cards, combo_index, HandClass, NUM_CLASSES, NUM_COMBOS};
 pub use eval::{evaluate_cards, HandCategory, HandValue};
 pub use game::{Action, ActionRecord, Chips, GameError, HandState, Street, TableConfig};
-pub use menu::{BetMenu, BetSize, PostflopMenu, PreflopMenu, Situation, StreetSizes};
+pub use menu::{BetMenu, BetSize, Category, PostflopMenu, PreflopMenu, Situation, StreetSizes};
 pub use range::Range;

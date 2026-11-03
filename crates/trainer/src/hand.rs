@@ -5,13 +5,15 @@ use crate::fmt::{action_verb, bb, ActionContext};
 use crate::preflop::{availability, chart_policy, line_range, spot_key, ChartSet, PreDecision};
 use crate::profiles::Profile;
 use crate::review::{Review, ReviewSetup, Snapshot};
+use crate::save::{SavedHand, SavedReview};
 use holdem::game::{Phase, Settlement};
 use holdem::{Action, BetMenu, Card, CardSet, Chips, Deck, GameError, HandState, Street, TableConfig};
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 use std::sync::Arc;
 
 /// A line of the hand log.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub street: Street,
     pub seat: Option<usize>,
@@ -60,6 +62,16 @@ pub struct LiveHand {
     review_settings: Option<crate::config::SolverSettings>,
     review: Option<Review>,
     rng: StdRng,
+    /// Seed of the hero's random numbers (see [`LiveHand::roll`]).
+    roll_seed: u64,
+}
+
+/// SplitMix64: a well-mixed 64-bit hash.
+pub(crate) fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
 }
 
 impl LiveHand {
@@ -88,6 +100,7 @@ impl LiveHand {
             review_settings: setup.review,
             review: None,
             rng,
+            roll_seed: mix64(setup.id),
         };
         let (sb, bb_seat) = (hand.state.sb_seat(), hand.state.bb_seat());
         hand.push_log(
@@ -104,6 +117,47 @@ impl LiveHand {
         hand
     }
 
+    /// The hand as saved to disk.
+    pub fn to_saved(&self) -> SavedHand {
+        SavedHand {
+            id: self.id,
+            hero: self.hero,
+            state: self.state.clone(),
+            profiles: self.profiles.clone(),
+            preflop: self.preflop.clone(),
+            log: self.log.clone(),
+            roll_seed: self.roll_seed,
+            review: self.review.as_ref().map(|r| r.with_status(SavedReview::from_status)),
+        }
+    }
+
+    /// A finished hand read back from a save (it can be reviewed, not
+    /// played on).
+    pub fn from_saved(h: SavedHand, menu: BetMenu, charts: Arc<ChartSet>) -> LiveHand {
+        let n = h.state.num_players();
+        let mut rng = StdRng::seed_from_u64(h.id);
+        let deck = Deck::shuffled(&mut rng);
+        let review = h.review.map(|r| {
+            Review::finished(Snapshot { state: h.state.clone(), preflop: h.preflop.clone() }, r.into_status())
+        });
+        LiveHand {
+            id: h.id,
+            state: h.state,
+            hero: h.hero,
+            profiles: h.profiles,
+            preflop: h.preflop,
+            log: h.log,
+            ais: (0..n).map(|_| None).collect(),
+            deck,
+            menu,
+            charts,
+            review_settings: None,
+            review,
+            rng,
+            roll_seed: h.roll_seed,
+        }
+    }
+
     /// Adds a table note (not tied to a seat) to the hand log.
     pub fn note(&mut self, text: String) {
         self.push_log(None, text);
@@ -111,6 +165,27 @@ impl LiveHand {
 
     pub fn menu(&self) -> &BetMenu {
         &self.menu
+    }
+
+    /// Sets the seed of the hero's random numbers (separate from the deal,
+    /// so showing them changes nothing else).
+    pub fn set_roll_seed(&mut self, seed: u64) {
+        self.roll_seed = seed;
+    }
+
+    pub fn roll_seed(&self) -> u64 {
+        self.roll_seed
+    }
+
+    /// The random number (0-99) shown for the decision that becomes action
+    /// `history_index` of the hand, to help play mixed strategies.
+    pub fn roll(&self, history_index: usize) -> u8 {
+        (mix64(self.roll_seed ^ mix64(history_index as u64)) % 100) as u8
+    }
+
+    /// The hero's random number for the decision at hand.
+    pub fn current_roll(&self) -> Option<u8> {
+        self.hero_to_act().then(|| self.roll(self.state.history.len()))
     }
 
     /// "SB (you)" / "BB (Villain)".

@@ -229,12 +229,45 @@ impl BetMenu {
 
 /// Postflop action list (see [`BetMenu::actions`]).
 pub fn postflop_actions(sit: &Situation, menu: &PostflopMenu) -> Vec<Action> {
+    postflop_categorized(sit, menu).into_iter().map(|(a, _)| a).collect()
+}
+
+/// Kind of a postflop action for frequency statistics: what the player
+/// chose among the menu's options.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Category {
+    Fold,
+    Check,
+    Call,
+    /// A bet or raise from this menu size (when it isn't all-in).
+    Size(BetSize),
+    AllIn,
+}
+
+impl fmt::Display for Category {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Category::Fold => f.write_str("Fold"),
+            Category::Check => f.write_str("Check"),
+            Category::Call => f.write_str("Call"),
+            Category::Size(s) => write!(f, "{s}"),
+            Category::AllIn => f.write_str("All-in"),
+        }
+    }
+}
+
+/// Postflop actions, each with the [`Category`] it belongs to: a bet or
+/// raise is labeled by the menu size that produced it, or all-in when it
+/// puts the player (or the shortest opponent) all-in. When several sizes
+/// round to the same amount the first one listed names it; a size merged
+/// into a larger one disappears.
+pub fn postflop_categorized(sit: &Situation, menu: &PostflopMenu) -> Vec<(Action, Category)> {
     let mut out = Vec::with_capacity(6);
     if sit.to_call > 0 {
-        out.push(Action::Fold);
-        out.push(Action::Call);
+        out.push((Action::Fold, Category::Fold));
+        out.push((Action::Call, Category::Call));
     } else {
-        out.push(Action::Check);
+        out.push((Action::Check, Category::Check));
     }
     if !sit.can_raise() || sit.num_raises >= menu.max_raises {
         return out;
@@ -242,8 +275,9 @@ pub fn postflop_actions(sit: &Situation, menu: &PostflopMenu) -> Vec<Action> {
     let sizes = menu.street(sit.street);
     let list = if sit.current_bet == 0 { &sizes.bet } else { &sizes.raise };
     let pot_after_call = (sit.pot + sit.to_call) as f64;
+    // (raise-to, index of the size in `list`; `list.len()` = the extra all-in)
     let mut amounts = Vec::with_capacity(list.len() + 1);
-    for size in list {
+    for (i, size) in list.iter().enumerate() {
         let to = match *size {
             BetSize::Pot(f) => sit.current_bet + (f * pot_after_call).round() as Chips,
             BetSize::Mult(m) => {
@@ -254,15 +288,22 @@ pub fn postflop_actions(sit: &Situation, menu: &PostflopMenu) -> Vec<Action> {
             }
             BetSize::AllIn => sit.max_to,
         };
-        amounts.push(to);
+        amounts.push((to, i));
     }
     if menu.add_allin_threshold > 0.0
         && ((sit.max_to - sit.current_bet) as f64) <= menu.add_allin_threshold * pot_after_call
     {
-        amounts.push(sit.max_to);
+        amounts.push((sit.max_to, list.len()));
     }
-    let amounts = finalize_amounts(sit, amounts, menu.force_allin_threshold, menu.merge_threshold);
-    out.extend(amounts.into_iter().map(Action::Raise));
+    let amounts = finalize_tagged(sit, amounts, menu.force_allin_threshold, menu.merge_threshold);
+    out.extend(amounts.into_iter().map(|(to, i)| {
+        let cat = if to >= sit.max_to {
+            Category::AllIn
+        } else {
+            list.get(i).map_or(Category::AllIn, |&s| Category::Size(s))
+        };
+        (Action::Raise(to), cat)
+    }));
     out
 }
 
@@ -304,30 +345,43 @@ pub fn preflop_actions(sit: &Situation, pre: &PreflopMenu, post: &PostflopMenu) 
 /// Clamps raise-to amounts to the legal interval, converts near-all-in sizes
 /// to all-in, removes duplicates and merges sizes that are too close.
 fn finalize_amounts(sit: &Situation, amounts: Vec<Chips>, force_allin: f64, merge: f64) -> Vec<Chips> {
+    let tagged = amounts.into_iter().map(|a| (a, 0)).collect();
+    finalize_tagged(sit, tagged, force_allin, merge).into_iter().map(|(a, _)| a).collect()
+}
+
+/// [`finalize_amounts`] for amounts tagged with where they came from: a
+/// duplicate keeps the smallest tag, a merged size the tag of the size it
+/// merged into.
+fn finalize_tagged(
+    sit: &Situation,
+    amounts: Vec<(Chips, usize)>,
+    force_allin: f64,
+    merge: f64,
+) -> Vec<(Chips, usize)> {
     let lo = sit.min_raise_to.min(sit.max_to);
     let pot_after_call = sit.pot + sit.to_call;
-    let mut v: Vec<Chips> = amounts
+    let mut v: Vec<(Chips, usize)> = amounts
         .into_iter()
-        .map(|a| {
+        .map(|(a, tag)| {
             let a = a.clamp(lo, sit.max_to);
             let new_pot = pot_after_call + 2 * (a - sit.current_bet);
             let threshold = (new_pot as f64 * force_allin).round() as Chips;
             if sit.max_to - a <= threshold {
-                sit.max_to
+                (sit.max_to, tag)
             } else {
-                a
+                (a, tag)
             }
         })
-        .filter(|&a| a > sit.current_bet)
+        .filter(|&(a, _)| a > sit.current_bet)
         .collect();
     v.sort_unstable();
-    v.dedup();
+    v.dedup_by_key(|x| x.0);
     if merge > 0.0 && v.len() > 1 {
         let ratio = |a: Chips| (a - sit.current_bet) as f64 / pot_after_call as f64;
-        let mut kept: Vec<Chips> = Vec::with_capacity(v.len());
+        let mut kept: Vec<(Chips, usize)> = Vec::with_capacity(v.len());
         for &a in v.iter().rev() {
             match kept.last() {
-                Some(&k) if (1.0 + ratio(k)) / (1.0 + ratio(a)) < 1.0 + merge => {}
+                Some(&k) if (1.0 + ratio(k.0)) / (1.0 + ratio(a.0)) < 1.0 + merge => {}
                 _ => kept.push(a),
             }
         }
@@ -387,6 +441,20 @@ mod tests {
         // calling 1000 the pot is 4000 and 500 remains: 500 <= 0.15*4000=600.
         let a = menu.actions(&sit(Street::River, 2000, 0, 0, 1500));
         assert_eq!(a, vec![Action::Check, Action::Raise(1500)]);
+    }
+
+    #[test]
+    fn categories_name_the_menu_size() {
+        let menu = BetMenu::default();
+        let cats = |s: &Situation| -> Vec<String> {
+            postflop_categorized(s, &menu.postflop).iter().map(|(_, c)| c.to_string()).collect()
+        };
+        assert_eq!(cats(&sit(Street::Flop, 600, 0, 0, 9750)), ["Check", "33%", "75%"]);
+        assert_eq!(cats(&sit(Street::Flop, 1050, 450, 450, 9750)), ["Fold", "Call", "3x"]);
+        // Short stack: 50% is forced all-in and merges with the added shove.
+        assert_eq!(cats(&sit(Street::River, 2000, 0, 0, 1500)), ["Check", "All-in"]);
+        // Shoving is offered next to the sizes when it is at most 1.5 pots.
+        assert_eq!(cats(&sit(Street::Turn, 2000, 0, 0, 2900)), ["Check", "50%", "All-in"]);
     }
 
     #[test]

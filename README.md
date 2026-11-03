@@ -37,6 +37,9 @@ preflop charts and the solver's strategy in any spot, GTO Wizard style.
 | Solver-based preflop charts (heads-up, 6-max), built in | ✅ |
 | Solver study mode: browse charts and solutions, any line, both ranges, typed spots | ✅ (heads-up exact, 3-way approximate) |
 | Layouts that fit zoomed terminals (~100×30) and grow on big windows; mouse clicks | ✅ |
+| Session frequency score: how your action frequencies match the solver's mixes, spot by spot | ✅ (heads-up pots) |
+| Random number (0–99) at each decision, for playing mixed strategies | ✅ |
+| Saved sessions: continue, start new, delete | ✅ |
 | Preflop grading | ❌ not yet (charts drive the AIs and the starting ranges) |
 
 ## Quick start
@@ -93,14 +96,80 @@ cargo run --release -p solver --example compare -- Ks7s2d                 # fast
 
 | Where | Keys |
 |---|---|
-| Setup | ↑/↓ select · ←/→ change (mode, table size, styles, position, stacks, rake, solver) · Enter play/study (on "Bet sizes": open the size editor) · W save settings · Q Q quit |
-| Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** solver review · **H** history · **S** settings |
-| Review | ↑/↓ choose decision · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · Esc back |
+| Setup | ↑/↓ select · ←/→ change (mode, table size, styles, position, stacks, rake, solver) · Enter play/study (on "Bet sizes": open the size editor) · **O** sessions · **G** frequency score · W save settings · Q Q quit |
+| Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** solver review · **H** history · **G** frequency score · **S** settings |
+| Review | ↑/↓ choose decision · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · **G** frequency score · Esc back |
+| Sessions | ↑/↓ select · Enter continue (or start a new session) · **D** delete (then **Y**) · Esc back |
 | Study | **F**/**C**/**1–9** take an action · arrows (or click) pick a hand · **Tab** strategy / each player's range · **Backspace** back · **G**/Home start · **N** new random board · **E** type a spot · **P** back to preflop · Esc menu |
 
 After you fold, the rest of the hand plays out instantly. Quitting takes Q
 twice within two seconds (any other key cancels), so a stray key press
-doesn't end a session; Ctrl+C quits at once.
+doesn't end a session; Ctrl+C quits at once. Either way the session is
+saved (see below).
+
+### Saved sessions
+
+Every finished hand is saved, with its review, as soon as the review is done.
+Quitting saves the rest; a review still running is cut short. The next time
+you start the trainer it offers to continue a saved session (stats, history,
+reviews and the frequency score carry on), start a new one, or delete old
+ones. The **Session** row on the setup screen (or **O**) opens the same list.
+
+Sessions live in `~/.local/share/poker-trainer/sessions` (macOS:
+`~/Library/Application Support/poker-trainer/sessions`; Windows:
+`%APPDATA%\poker-trainer\sessions`). Each is a directory with `meta.json`
+(settings, lineup, summary) and `hands.jsonl` (one hand per line, about 20 KB
+per reviewed hand). Set `sessions_dir` to keep them elsewhere,
+`save_sessions = false` to turn saving off, or pass `--no-save` for one run.
+A continued session uses its own saved settings.
+
+### Frequency score
+
+The EV grade can't reward mixing. When the solver mixes, its actions have
+nearly equal EV, so always taking the most common one grades as Best every
+time. More generally, no per-decision score can reward mixing: its expected
+value is linear in your frequencies, so a pure strategy always does at least
+as well. The frequency score (**G**) therefore looks at the whole session.
+It covers your decisions in heads-up pots, from the GTO-range solve.
+
+* **Calibration, per spot type.** A spot type is street × facing nothing / a
+  bet / a raise × in or out of position. Each action category is the
+  solver's own option: fold, check, call, each bet or raise size of the
+  menu, and all-in.
+  * The **expected share** of a category is the sum of the solver's
+    probabilities for the hands you actually held.
+  * The **observed share** is how often you chose it.
+  * A 5% bluff taken once in 20 such spots matches exactly; always taking
+    the main option of a 70/30 spot shows up as 30 points of deviation.
+  * The deviation (total-variation distance) is compared with what a player
+    sampling exactly from the solver's mixes would show on the same
+    decisions. This comes from a Monte Carlo of 1000 sessions, which gives
+    the noise level and a p-value per spot and overall.
+  * The **score** is 100 × (1 − deviation beyond luck). It is shown with the
+    ± that luck alone could move it. Spots with p < 0.05 are listed as
+    leaks, biggest first, with the category furthest off (e.g. "Flop IP no
+    bet: Bet 75% 12% vs solver 40% ▼").
+* **Aggression and mixing.** Order each spot's actions from passive to
+  aggressive. Place your choice at the midpoint of its interval on the
+  solver's cumulative mix: u = F(a−) + p(a)/2.
+  * For a perfect mixer E[u] = ½ exactly, so mean(u) − ½ measures
+    **aggression**, with an exact z-score.
+  * The spread of u around ½ relative to its exact expectation measures
+    **mixing**. Below 1, you take the solver's main option too often (too
+    pure). Above 1, you take its rare options too often. This catches what
+    the totals can't: always checking the hands the solver checks 70% and
+    always betting those it bets 70% matches the totals but never mixes.
+* **Weighting.** Decisions are weighted by the pot in big blinds, so leaks in
+  big pots count more. The setup row *Frequency score weighting* switches to
+  equal weights.
+
+The EV grades stay alongside, for actions the solver doesn't take at all.
+
+**Random number.** At each of your decisions the table shows *RNG nn* (0–99,
+independent of the deal). Use it to play mixes: with a 30% bet, bet on 0–29.
+Low numbers go to the most aggressive option. The review shows which action
+the solver's mix for your hand gives that number. Turn it off with the setup
+row *Random number* (`show_rng`).
 
 ### Bet sizes
 
@@ -404,6 +473,26 @@ fast mode's best action, judged by the exact solve:
 Sampling turn cards is the main error source, so fast mode deals every turn
 and samples only rivers. Exact mode is the default.
 
+### Scoring and saved sessions
+
+`cargo run --release -p trainer --example scorebench` builds a 2,000-hand
+session with three graded decisions per hand (6,000 decisions, grids
+included).
+
+| Operation | Time |
+|---|---|
+| Frequency score, 500 / 2,000 / 6,000 decisions (after each settled hand) | 3 ms / 11 ms / 15 ms |
+| Saving one hand (append + meta) | 0.45 ms average |
+| Loading the 2,000-hand session (43 MB) + resuming it | 0.26 s + 0.03 s |
+| `stats()` per frame / `refresh()` per tick | 23 ns / 2 ns |
+
+The score's Monte Carlo is capped at about two million draws, with at least
+200 simulated sessions. Spots with a pure mix are counted once instead of
+being drawn. Drawing the history, score and sessions screens takes under
+0.5 ms per frame with 2,000 hands. Solver speed is unchanged: the bet-menu
+change behind the categories was benchmarked against the previous commit on
+the turn and flop benchmarks.
+
 ## Testing
 
 * **Unit and end-to-end tests:** whole hands at 2/6/9-max tables, including
@@ -419,7 +508,18 @@ and samples only rivers. Exact mode is the default.
   * batched vs. recursive and isomorphic vs. full trees give the same
     results;
   * random river solutions are well-formed;
-  * AI style adjustments always produce valid frequencies.
+  * AI style adjustments always produce valid frequencies;
+  * every bet-menu action gets exactly one frequency category;
+  * the frequency score is invariant to scaling the weights, its shares and
+    p-values stay in range, and the aggression z-score is standard normal
+    for a perfect mixer.
+* **Scoring and sessions:**
+  * a perfect mixer scores ~100 with no leaks;
+  * always-the-main-option, over-bluffing and balanced-but-pure play are
+    each caught by the right statistic;
+  * saved sessions round-trip, with stats, score, reviews, rolls and grids
+    to 1/10000;
+  * a session can be continued, and quitting mid-review is handled.
 * **Debug-build sentinels.** The engine re-checks its invariants after every
   action. The solver checks strategies, reach and values for validity at
   every node. They're free in release builds.
@@ -454,6 +554,13 @@ threads = 0                  # 0 = all cores
 multiway_turn_samples = 8    # 3-way pots
 multiway_river_samples = 4
 
+[scoring]
+pot_weighted = true          # frequency score: weight decisions by the pot
+simulations = 1000           # Monte Carlo samples (capped on long sessions)
+
+show_rng = true              # random number at each decision
+save_sessions = true         # sessions_dir = "..." to save elsewhere
+
 [menu.postflop.flop]
 bet = ["33%", "75%"]
 raise = ["3x"]
@@ -476,7 +583,15 @@ the presets in `crates/trainer/src/profiles.rs`.
 * **4+-way pots** aren't analyzed.
 * **3-way solves are approximate:** sampled runouts (including all-in
   runouts) and simplified later streets, and no equilibrium guarantee.
-* **Preflop grading** isn't implemented.
+* **Preflop grading** isn't implemented, and the frequency score covers only
+  postflop decisions in heads-up pots (3-way solves are too noisy to score
+  frequencies against).
+* **Frequency score blind spots:** a spot type pools all your hands, so
+  swapping hands (bluffing one the solver checks while checking one it
+  bluffs) keeps the totals right. The mixing measure and the EV grades
+  catch most of this, but not all. An estimate of exploitability in bb/100
+  (a best response against your measured tendencies) would be the next
+  step.
 * **Study mode** uses the sizes from the bet-size editor for every spot (no
   per-spot sizes). Its 3-way solves have the same limits as the 3-way
   review.

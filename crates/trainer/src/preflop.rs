@@ -46,7 +46,7 @@ pub type Freqs = [f32; 4];
 
 /// Which abstract actions exist at a decision, and the concrete action each
 /// maps to.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Availability {
     pub actions: [Option<Action>; 4],
 }
@@ -390,7 +390,7 @@ pub fn fallback_freqs(key: &str, class: usize, players: usize) -> Freqs {
 }
 
 /// One preflop decision of the hand.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PreDecision {
     pub seat: usize,
     /// Position name of the deciding seat (e.g. "BTN").
