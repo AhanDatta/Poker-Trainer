@@ -159,7 +159,8 @@ impl PreflopNav {
         let table = TableConfig::new(n, BB / 2, BB).with_rake(s.rake_rate, s.rake_cap);
         let stack = (s.stack_bb * BB as f64).round() as Chips;
         // The cards are never looked at.
-        let hole = (0..n).map(|i| [Card::from_index(2 * i as u8), Card::from_index(2 * i as u8 + 1)]).collect();
+        let hole =
+            (0..n).map(|i| [Card::from_index(2 * i as u8), Card::from_index(2 * i as u8 + 1)]).collect();
         HandState::new(table, n - 1, vec![stack; n], hole)
     }
 
@@ -583,7 +584,10 @@ enum NodeResult {
     View(Arc<NodeView>),
     /// The line is rare for the solver: re-solve from here with these
     /// (widened) ranges. `who` are the spot players whose range was widened.
-    Rare { ranges: Vec<Vec<f32>>, who: Vec<usize> },
+    Rare {
+        ranges: Vec<Vec<f32>>,
+        who: Vec<usize>,
+    },
     Error(String),
 }
 
@@ -616,7 +620,10 @@ pub struct NodeView {
 pub enum LineItem {
     /// A street starts with these new board cards.
     Street(Street, Vec<Card>),
-    Action { player: usize, label: String },
+    Action {
+        player: usize,
+        label: String,
+    },
 }
 
 /// Where the browser is.
@@ -629,9 +636,15 @@ pub enum StudyPos {
     Decision(Arc<NodeView>),
     /// The street is over: choose the next card. `view` holds the ranges
     /// going into the next street.
-    NeedCard { next: Street, view: Option<Arc<NodeView>> },
+    NeedCard {
+        next: Street,
+        view: Option<Arc<NodeView>>,
+    },
     /// The hand is over.
-    Over { text: String, view: Option<Arc<NodeView>> },
+    Over {
+        text: String,
+        view: Option<Arc<NodeView>>,
+    },
     Failed(String),
 }
 
@@ -695,8 +708,10 @@ impl Study {
                 BB,
             ))
         };
-        let mut study = Study { settings, spot, steps: Vec::new(), segments: HashMap::new(), kept: Vec::new(), pool };
-        let seg = Segment { players: (0..n).collect(), board: study.spot.board.clone(), root, job: Arc::default() };
+        let mut study =
+            Study { settings, spot, steps: Vec::new(), segments: HashMap::new(), kept: Vec::new(), pool };
+        let seg =
+            Segment { players: (0..n).collect(), board: study.spot.board.clone(), root, job: Arc::default() };
         let ranges = study.spot.ranges.clone();
         study.add_segment(Vec::new(), seg, ranges, Vec::new());
         Ok(study)
@@ -754,9 +769,7 @@ impl Study {
         }
         let mut all_notes = notes;
         if multiway {
-            all_notes.push(format!(
-                "{street}: 3-way pot, approximate solve (no equilibrium guarantee for 3 players; sampled runouts; simplified later streets)."
-            ));
+            all_notes.push(crate::review::multiway_note(street, self.settings.solver.multiway_exact_removal));
         } else if street == Street::Flop && self.settings.solver.flop_mode == FlopMode::Fast {
             all_notes.push("Flop solved with sampled turn and river cards (fast mode): approximate.".into());
         }
@@ -784,7 +797,15 @@ impl Study {
                     match seg.root {
                         AnyState::Hu(root) => {
                             let r: [Vec<f32>; 2] = [ranges[0].clone(), ranges[1].clone()];
-                            let cfg = hu_config(s, menu, &seg.board, r, root, settings.rake_rate, settings.rake_cap);
+                            let cfg = hu_config(
+                                s,
+                                menu,
+                                &seg.board,
+                                r,
+                                root,
+                                settings.rake_rate,
+                                settings.rake_cap,
+                            );
                             run_hu(cfg, s, PRIORITY, pool.as_deref(), &label, &**job)
                                 .map(|(x, e)| (AnySolver::Hu(x), e))
                         }
@@ -805,14 +826,15 @@ impl Study {
                         }
                     }
                 };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|e| {
-                    let msg = e
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| e.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic".into());
-                    Err(format!("internal error: {msg}"))
-                });
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).unwrap_or_else(|e| {
+                        let msg = e
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| e.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic".into());
+                        Err(format!("internal error: {msg}"))
+                    });
                 match result {
                     Ok((solver, e)) => {
                         *job.solver.write().unwrap_or_else(|e| e.into_inner()) = Some(solver);
@@ -909,7 +931,10 @@ impl Study {
             return StudyPos::Failed(format!("internal error: {e}"));
         }
         if let LocEnd::Won(p) = loc.end {
-            return StudyPos::Over { text: format!("{} wins the pot (everyone else folded).", self.spot.names[p]), view: None };
+            return StudyPos::Over {
+                text: format!("{} wins the pot (everyone else folded).", self.spot.names[p]),
+                view: None,
+            };
         }
         let status = loc.seg.job.status();
         if let Some(e) = status.error {
@@ -935,9 +960,10 @@ impl Study {
                 let can_bet = (0..s.len()).filter(|&i| !s.folded(i) && s.stack(i) > 0).count();
                 match s.street().next() {
                     None => StudyPos::Over { text: "Showdown.".into(), view },
-                    Some(_) if can_bet < 2 => {
-                        StudyPos::Over { text: "All-in: no more decisions; the board is dealt out.".into(), view }
-                    }
+                    Some(_) if can_bet < 2 => StudyPos::Over {
+                        text: "All-in: no more decisions; the board is dealt out.".into(),
+                        view,
+                    },
                     Some(next) => StudyPos::NeedCard { next, view },
                 }
             }
@@ -973,8 +999,9 @@ impl Study {
                     let k = seg.players.len();
                     if decision && !local.is_empty() {
                         let root = solver.ranges_after(&[]).map_err(|e| e.to_string())?;
-                        let rare: Vec<usize> =
-                            (0..k).filter(|&i| !state.folded(i) && fraction(&now[i], &root[i]) < threshold).collect();
+                        let rare: Vec<usize> = (0..k)
+                            .filter(|&i| !state.folded(i) && fraction(&now[i], &root[i]) < threshold)
+                            .collect();
                         if !rare.is_empty() {
                             let mut ranges = now.clone();
                             for &i in &rare {
@@ -1046,7 +1073,12 @@ impl Study {
             if names.len() == 1 { "es" } else { "" },
             100.0 * self.settings.solver.off_equilibrium_threshold
         );
-        let seg = Segment { players: loc.seg.players.clone(), board: loc.board.clone(), root: loc.state, job: Arc::default() };
+        let seg = Segment {
+            players: loc.seg.players.clone(),
+            board: loc.board.clone(),
+            root: loc.state,
+            job: Arc::default(),
+        };
         self.add_segment(key, seg, ranges, vec![note]);
     }
 
@@ -1109,7 +1141,12 @@ impl Study {
             let seg_ranges: Vec<Vec<f32>> = active.iter().map(|&i| ranges[i].clone()).collect();
             let pot = end.pot();
             let root = if active.len() == 2 {
-                AnyState::Hu(BettingState::street_start(next, pot, [end.stack(active[0]), end.stack(active[1])], BB))
+                AnyState::Hu(BettingState::street_start(
+                    next,
+                    pot,
+                    [end.stack(active[0]), end.stack(active[1])],
+                    BB,
+                ))
             } else {
                 let st = [end.stack(active[0]), end.stack(active[1]), end.stack(active[2])];
                 AnyState::Multi(MultiState::street_start(next, pot, st, [false; 3], BB))
@@ -1265,7 +1302,9 @@ mod tests {
         let spot = ok.unwrap();
         assert_eq!(spot.pot, 600);
         assert_eq!(spot.street(), Street::Flop);
-        assert!(Spot::from_text(names.clone(), &["QQ+".into(), "nonsense".into()], 6.0, 97.0, "Ks7d2c").is_err());
+        assert!(
+            Spot::from_text(names.clone(), &["QQ+".into(), "nonsense".into()], 6.0, 97.0, "Ks7d2c").is_err()
+        );
         assert!(Spot::from_text(names.clone(), &["QQ+".into(), "KK".into()], 6.0, 97.0, "KsKd").is_err());
         // KK is dead on a board with three kings... and two of them in hand.
         let e = Spot::from_text(names, &["QQ+".into(), "KsKh".into()], 6.0, 97.0, "Ks7d2c").unwrap_err();
@@ -1275,8 +1314,9 @@ mod tests {
     #[test]
     fn browse_a_river_spot() {
         let names = Spot::default_names(2);
-        let spot = Spot::from_text(names, &["QQ+,AK,76s".into(), "TT-77,AQs,KQs".into()], 10.0, 50.0, "Ks7d2c9h3s")
-            .unwrap();
+        let spot =
+            Spot::from_text(names, &["QQ+,AK,76s".into(), "TT-77,AQs,KQs".into()], 10.0, 50.0, "Ks7d2c9h3s")
+                .unwrap();
         let mut study = Study::new(settings(2), spot).unwrap();
         let StudyPos::Decision(v) = settle(&mut study) else { panic!() };
         assert_eq!(v.actor, Some(0));
@@ -1285,7 +1325,12 @@ mod tests {
         let info = v.info.as_ref().unwrap();
         assert_eq!(info.strategy.len(), v.actions.len() * info.num_hands());
         // Ranges: OOP's full range, IP's too.
-        assert!((range_combos(&v.ranges[0], &study.board()) - range_combos(&study.spot().ranges[0], &study.board())).abs() < 1.0);
+        assert!(
+            (range_combos(&v.ranges[0], &study.board())
+                - range_combos(&study.spot().ranges[0], &study.board()))
+            .abs()
+                < 1.0
+        );
         // Check, then IP bets: OOP faces a bet.
         study.act(Action::Check).unwrap();
         let StudyPos::Decision(v) = settle(&mut study) else { panic!() };
@@ -1315,9 +1360,14 @@ mod tests {
     #[test]
     fn turn_cards_start_a_new_solve() {
         let names = Spot::default_names(2);
-        let spot =
-            Spot::from_text(names, &["QQ+,AK,T9s".into(), "JJ-88,AQs,KQs,QJs".into()], 10.0, 40.0, "Ks7d2c9h")
-                .unwrap();
+        let spot = Spot::from_text(
+            names,
+            &["QQ+,AK,T9s".into(), "JJ-88,AQs,KQs,QJs".into()],
+            10.0,
+            40.0,
+            "Ks7d2c9h",
+        )
+        .unwrap();
         let mut study = Study::new(settings(2), spot).unwrap();
         assert!(matches!(settle(&mut study), StudyPos::Decision(_)));
         study.act(Action::Check).unwrap();
@@ -1347,7 +1397,8 @@ mod tests {
         // OOP is polarized (aces or air); IP holds a pure bluff catcher, so
         // IP never raises a bet.
         let names = Spot::default_names(2);
-        let spot = Spot::from_text(names, &["AA,QJo".into(), "TT".into()], 10.0, 100.0, "AsKd8c6h2s").unwrap();
+        let spot =
+            Spot::from_text(names, &["AA,QJo".into(), "TT".into()], 10.0, 100.0, "AsKd8c6h2s").unwrap();
         let mut study = Study::new(settings(2), spot).unwrap();
         let StudyPos::Decision(v) = settle(&mut study) else { panic!() };
         let bet = (0..v.actions.len())

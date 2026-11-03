@@ -174,6 +174,9 @@ pub struct MultiConfig {
     pub max_memory_bytes: u64,
     pub rake_rate: f64,
     pub rake_cap: f64,
+    /// Exact card removal between the two opponents (see [`exact`]); off,
+    /// the opponents' hands are treated as independent.
+    pub exact_removal: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -521,6 +524,7 @@ struct Ctx<'a> {
     third_pot: f64,
     root_pot: f64,
     norm: [f64; N],
+    exact: bool,
 }
 
 fn normalize(s: &mut [f32], na: usize, n: usize) {
@@ -550,6 +554,9 @@ fn average_strategy(node: &Node, n: usize) -> Vec<f32> {
 /// Terminal values of `p` (reach-weighted, normalized). With `unit`, every
 /// outcome pays 1: the result is the probability mass reaching the node.
 fn terminal(ctx: &Ctx, node: &Node, p: usize, reach: &[Vec<f32>; N], unit: bool, out: &mut [f32]) {
+    if ctx.exact {
+        return exact::terminal(ctx, node, p, reach, unit, out);
+    }
     let opps: Vec<usize> = (0..N).filter(|&q| q != p).collect();
     let compat: Vec<Vec<f64>> = opps.iter().map(|&q| ctx.hands.compat(p, q, &reach[q])).collect();
     let n = out.len();
@@ -788,9 +795,14 @@ fn make_ctx<'a>(hands: &'a Hands, tables: &'a [Table], config: &MultiConfig) -> 
     let mut norm = [0f64; N];
     for p in 0..N {
         let opps: Vec<usize> = (0..N).filter(|&q| q != p).collect();
-        let c0 = hands.compat(p, opps[0], &hands.weights[opps[0]]);
-        let c1 = hands.compat(p, opps[1], &hands.weights[opps[1]]);
-        let total: f64 = (0..hands.len(p)).map(|h| hands.weights[p][h] as f64 * c0[h] * c1[h]).sum();
+        let pairs: Vec<f64> = if config.exact_removal {
+            exact::total_pairs(hands, p, &hands.weights)
+        } else {
+            let c0 = hands.compat(p, opps[0], &hands.weights[opps[0]]);
+            let c1 = hands.compat(p, opps[1], &hands.weights[opps[1]]);
+            c0.iter().zip(&c1).map(|(a, b)| a * b).collect()
+        };
+        let total: f64 = (0..hands.len(p)).map(|h| hands.weights[p][h] as f64 * pairs[h]).sum();
         norm[p] = if total > 0.0 { 1.0 / total } else { 0.0 };
     }
     Ctx {
@@ -799,6 +811,7 @@ fn make_ctx<'a>(hands: &'a Hands, tables: &'a [Table], config: &MultiConfig) -> 
         third_pot: config.root.pot as f64 / N as f64,
         root_pot: config.root.pot as f64,
         norm,
+        exact: config.exact_removal,
     }
 }
 
@@ -1048,6 +1061,505 @@ impl MultiSolver {
     }
 }
 
+/// Exact card removal between the two opponents.
+///
+/// For a traverser hand `h = {a, b}` a terminal needs sums over pairs of
+/// opponent hands `(i, j)` with `h`, `i` and `j` pairwise disjoint. By
+/// inclusion–exclusion over the cards two hands can share,
+///
+/// `pairs(h) = tQ'·tR' − Σ_c mQ'[c]·mR'[c] + Σ_k xQ'(k)·xR'(k)`
+///
+/// where `t` is a set's total reach, `m[c]` the reach of its hands holding
+/// card `c`, `x(k)` the reach of combo `k`, and `'` restricts to hands
+/// disjoint from `h` (`mQ'[c] = mQ[c] − xQ(c,a) − xQ(c,b)`). With the sets
+/// held as per-card sums and a 52×52 combo matrix, a query costs one pass
+/// over the 52 cards; sets grow incrementally during strength sweeps.
+/// (Independent opponents need O(1) per hand: `pairs ≈ tQ'·tR'`.)
+mod exact {
+    use super::*;
+
+    /// Per-card sums of one player's hands in a set.
+    struct Sums {
+        t: f64,
+        m: [f64; 52],
+        /// `x[u][v] = x[v][u]` = reach of combo `{u, v}`.
+        x: Vec<[f64; 52]>,
+        /// Hands in the set by card: `by_card[u]` lists `(v, reach)` for each
+        /// combo `{u, v}`, so per-card sums cost the set's density, not 52.
+        by_card: Vec<Vec<(u8, f64)>>,
+        added: Vec<(u8, u8)>,
+    }
+
+    impl Sums {
+        fn new() -> Sums {
+            Sums {
+                t: 0.0,
+                m: [0.0; 52],
+                x: vec![[0.0; 52]; 52],
+                by_card: vec![Vec::new(); 52],
+                added: Vec::new(),
+            }
+        }
+
+        fn add(&mut self, u: u8, v: u8, w: f64) {
+            let (ui, vi) = (u as usize, v as usize);
+            self.t += w;
+            self.m[ui] += w;
+            self.m[vi] += w;
+            self.x[ui][vi] += w;
+            self.x[vi][ui] += w;
+            self.by_card[ui].push((v, w));
+            self.by_card[vi].push((u, w));
+            self.added.push((u, v));
+        }
+
+        fn clear(&mut self) {
+            for &(u, v) in &self.added {
+                self.x[u as usize][v as usize] = 0.0;
+                self.x[v as usize][u as usize] = 0.0;
+                self.by_card[u as usize].clear();
+                self.by_card[v as usize].clear();
+            }
+            self.added.clear();
+            self.m = [0.0; 52];
+            self.t = 0.0;
+        }
+    }
+
+    /// Two sets (one per opponent) and their pair statistics, kept up to
+    /// date as hands are added:
+    /// * `s = Σ_c mQ[c]·mR[c]`;
+    /// * `xqr[a] = Σ_c mQ[c]·xR(c,a)` and `xrq[a] = Σ_c mR[c]·xQ(c,a)`;
+    /// * `same = Σ_k xQ(k)·xR(k)`, `same_card[a]` its part over combos with `a`.
+    pub(super) struct Pairs {
+        q: Sums,
+        r: Sums,
+        s: f64,
+        xqr: [f64; 52],
+        xrq: [f64; 52],
+        same: f64,
+        same_card: [f64; 52],
+    }
+
+    impl Pairs {
+        fn new() -> Pairs {
+            Pairs {
+                q: Sums::new(),
+                r: Sums::new(),
+                s: 0.0,
+                xqr: [0.0; 52],
+                xrq: [0.0; 52],
+                same: 0.0,
+                same_card: [0.0; 52],
+            }
+        }
+
+        fn clear(&mut self) {
+            self.q.clear();
+            self.r.clear();
+            self.s = 0.0;
+            self.xqr = [0.0; 52];
+            self.xrq = [0.0; 52];
+            self.same = 0.0;
+            self.same_card = [0.0; 52];
+        }
+
+        fn add_q(&mut self, u: u8, v: u8, w: f64) {
+            Self::add(
+                &mut self.q,
+                &self.r,
+                &mut self.xqr,
+                &mut self.xrq,
+                u,
+                v,
+                w,
+                &mut self.s,
+                &mut self.same,
+                &mut self.same_card,
+            );
+        }
+
+        fn add_r(&mut self, u: u8, v: u8, w: f64) {
+            Self::add(
+                &mut self.r,
+                &self.q,
+                &mut self.xrq,
+                &mut self.xqr,
+                u,
+                v,
+                w,
+                &mut self.s,
+                &mut self.same,
+                &mut self.same_card,
+            );
+        }
+
+        /// Adds combo `{u, v}` with reach `w` to set `me`; `mine_x[a]` is
+        /// `Σ_c m_me[c]·x_other(c,a)` and `other_x[a]` is `Σ_c m_other[c]·x_me(c,a)`.
+        #[allow(clippy::too_many_arguments)]
+        #[inline]
+        fn add(
+            me: &mut Sums,
+            other: &Sums,
+            mine_x: &mut [f64; 52],
+            other_x: &mut [f64; 52],
+            u: u8,
+            v: u8,
+            w: f64,
+            s: &mut f64,
+            same: &mut f64,
+            same_card: &mut [f64; 52],
+        ) {
+            let (ui, vi) = (u as usize, v as usize);
+            *s += w * (other.m[ui] + other.m[vi]);
+            // m_me[u] and m_me[v] grow by w.
+            for &(a, x) in &other.by_card[ui] {
+                mine_x[a as usize] += w * x;
+            }
+            for &(a, x) in &other.by_card[vi] {
+                mine_x[a as usize] += w * x;
+            }
+            // x_me(u, v) grows by w.
+            other_x[vi] += other.m[ui] * w;
+            other_x[ui] += other.m[vi] * w;
+            let sm = w * other.x[ui][vi];
+            *same += sm;
+            same_card[ui] += sm;
+            same_card[vi] += sm;
+            me.add(u, v, w);
+        }
+
+        /// Reach of disjoint `(q hand, r hand)` pairs that are also
+        /// disjoint from `{a, b}`.
+        #[inline]
+        fn pairs(&self, a: u8, b: u8) -> f64 {
+            let (a, b) = (a as usize, b as usize);
+            let (q, r) = (&self.q, &self.r);
+            let (qab, rab) = (q.x[a][b], r.x[a][b]);
+            let tq = q.t - q.m[a] - q.m[b] + qab;
+            let tr = r.t - r.m[a] - r.m[b] + rab;
+            // Y(a,b) + Y(b,a) with Y(a,b) = Σ_c xQ(c,a)·xR(c,b).
+            let (ra, rb) = (&r.x[a], &r.x[b]);
+            let mut y = 0.0;
+            for &(c, x) in &q.by_card[a] {
+                y += x * rb[c as usize];
+            }
+            for &(c, x) in &q.by_card[b] {
+                y += x * ra[c as usize];
+            }
+            // Σ_c (mQ[c] − xQ(c,a) − xQ(c,b))·(mR[c] − xR(c,a) − xR(c,b)).
+            let mut shared = self.s - self.xqr[a] - self.xqr[b] - self.xrq[a] - self.xrq[b]
+                + self.same_card[a]
+                + self.same_card[b]
+                + y;
+            // Cards a and b themselves can't be in compatible hands.
+            shared -= (q.m[a] - qab) * (r.m[a] - rab);
+            shared -= (q.m[b] - qab) * (r.m[b] - rab);
+            let same = self.same - self.same_card[a] - self.same_card[b] + qab * rab;
+            (tq * tr - shared + same).max(0.0)
+        }
+    }
+
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<(Pairs, Pairs)> = std::cell::RefCell::new((Pairs::new(), Pairs::new()));
+    }
+
+    fn with_pairs<R>(f: impl FnOnce(&mut Pairs, &mut Pairs) -> R) -> R {
+        SCRATCH.with(|c| {
+            let (a, b) = &mut *c.borrow_mut();
+            a.clear();
+            b.clear();
+            let r = f(a, b);
+            a.clear();
+            b.clear();
+            r
+        })
+    }
+
+    /// For each hand of `p`: reach of compatible opponent pairs (no
+    /// strength condition).
+    pub(super) fn total_pairs(hands: &Hands, p: usize, reach: &[Vec<f32>; N]) -> Vec<f64> {
+        let (q, r) = opponents(p);
+        with_pairs(|all, _| {
+            for (i, &(u, v)) in hands.cards[q].iter().enumerate() {
+                let w = reach[q][i];
+                if w != 0.0 {
+                    all.add_q(u, v, w as f64);
+                }
+            }
+            for (i, &(u, v)) in hands.cards[r].iter().enumerate() {
+                let w = reach[r][i];
+                if w != 0.0 {
+                    all.add_r(u, v, w as f64);
+                }
+            }
+            hands.cards[p].iter().map(|&(a, b)| all.pairs(a, b)).collect()
+        })
+    }
+
+    fn opponents(p: usize) -> (usize, usize) {
+        let o: Vec<usize> = (0..N).filter(|&x| x != p).collect();
+        (o[0], o[1])
+    }
+
+    /// Terminal values with exact card removal (same payoff model as the
+    /// independent version: one pot, split evenly between the best hands).
+    pub(super) fn terminal(
+        ctx: &Ctx,
+        node: &Node,
+        p: usize,
+        reach: &[Vec<f32>; N],
+        unit: bool,
+        out: &mut [f32],
+    ) {
+        let (win, lose) = if unit {
+            (1.0, 1.0)
+        } else {
+            (
+                ctx.root_pot + (0..N).filter(|&j| j != p).map(|j| node.invest[j] as f64).sum::<f64>()
+                    - node.rake as f64
+                    - ctx.third_pot,
+                -(node.invest[p] as f64 + ctx.third_pot),
+            )
+        };
+        let split = |k: f64| lose + (win - lose) / k;
+        let norm = ctx.norm[p];
+        let hands = ctx.hands;
+        let (q, r) = opponents(p);
+        let showdown = matches!(node.kind, Kind::Showdown) && !node.folded[p];
+        if !showdown {
+            let pay = match node.kind {
+                Kind::Won(w) if w as usize == p => win,
+                _ => lose,
+            };
+            let total = total_pairs(hands, p, reach);
+            for (o, t) in out.iter_mut().zip(total) {
+                *o = (pay * t * norm) as f32;
+            }
+            return;
+        }
+        let table = &ctx.tables[node.table as usize];
+        let (lp, lq, lr) = (&table.lists[p], &table.lists[q], &table.lists[r]);
+        let (q_in, r_in) = (!node.folded[q], !node.folded[r]);
+        out.fill(0.0);
+        with_pairs(|lt, eq| {
+            // A folded opponent's hand only blocks cards: all of it is in
+            // the set from the start.
+            let add = |set: &mut Pairs, who: usize, e: &(u32, u32, u8, u8)| {
+                let w = reach[who][e.1 as usize];
+                if w != 0.0 {
+                    if who == q {
+                        set.add_q(e.2, e.3, w as f64);
+                    } else {
+                        set.add_r(e.2, e.3, w as f64);
+                    }
+                }
+            };
+            if !q_in {
+                lq.iter().for_each(|e| add(lt, q, e));
+            }
+            if !r_in {
+                lr.iter().for_each(|e| add(lt, r, e));
+            }
+            // Per hand of p (list order): pairs where p is strictly best,
+            // best together with others (`le`), and tied with both.
+            let mut res: Vec<(f64, f64, f64)> = vec![(0.0, 0.0, 0.0); lp.len()];
+            let (mut iq, mut ir, mut i) = (0, 0, 0);
+            while i < lp.len() {
+                let s = lp[i].0;
+                if q_in {
+                    while iq < lq.len() && lq[iq].0 < s {
+                        add(lt, q, &lq[iq]);
+                        iq += 1;
+                    }
+                }
+                if r_in {
+                    while ir < lr.len() && lr[ir].0 < s {
+                        add(lt, r, &lr[ir]);
+                        ir += 1;
+                    }
+                }
+                let start = i;
+                while i < lp.len() && lp[i].0 == s {
+                    let a = lt.pairs(lp[i].2, lp[i].3);
+                    res[i] = (a, a, 0.0);
+                    i += 1;
+                }
+                // Opponent hands of equal strength.
+                let eq_q = if q_in { lq[iq..].iter().take_while(|e| e.0 == s).count() } else { 0 };
+                let eq_r = if r_in { lr[ir..].iter().take_while(|e| e.0 == s).count() } else { 0 };
+                if eq_q + eq_r == 0 {
+                    continue;
+                }
+                for e in &lq[iq..iq + eq_q] {
+                    add(lt, q, e);
+                }
+                for e in &lr[ir..ir + eq_r] {
+                    add(lt, r, e);
+                }
+                let tie_both = eq_q > 0 && eq_r > 0;
+                if tie_both {
+                    for e in &lq[iq..iq + eq_q] {
+                        add(eq, q, e);
+                    }
+                    for e in &lr[ir..ir + eq_r] {
+                        add(eq, r, e);
+                    }
+                }
+                for k in start..i {
+                    let (a, b) = (lp[k].2, lp[k].3);
+                    res[k].1 = lt.pairs(a, b);
+                    if tie_both {
+                        res[k].2 = eq.pairs(a, b);
+                    }
+                }
+                if tie_both {
+                    eq.clear();
+                }
+                iq += eq_q;
+                ir += eq_r;
+            }
+            if q_in {
+                lq[iq..].iter().for_each(|e| add(lt, q, e));
+            }
+            if r_in {
+                lr[ir..].iter().for_each(|e| add(lt, r, e));
+            }
+            // With one opponent folded, "tied with both" can't happen and a
+            // tie with the live opponent is a two-way split.
+            let both = q_in && r_in;
+            for (e, &(alone, le, all_tied)) in lp.iter().zip(&res) {
+                let total = lt.pairs(e.2, e.3);
+                let (two, three) = if both { (le - alone - all_tied, all_tied) } else { (le - alone, 0.0) };
+                let v = win * alone + split(2.0) * two + split(3.0) * three + lose * (total - le);
+                out[e.1 as usize] = (v * norm) as f32;
+            }
+        });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use holdem::card::parse_cards;
+        use holdem::Range;
+        use rand::{Rng, SeedableRng};
+
+        /// Brute force over all hand triples.
+        #[allow(clippy::too_many_arguments)]
+        fn brute(
+            hands: &Hands,
+            board: &[Card],
+            p: usize,
+            reach: &[Vec<f32>; N],
+            folded: [bool; N],
+            win: f64,
+            lose: f64,
+        ) -> Vec<f64> {
+            let (q, r) = opponents(p);
+            let mask = EvalMask::from_cards(board);
+            let strength =
+                |(a, b): (u8, u8)| mask.add(Card::from_index(a)).add(Card::from_index(b)).evaluate();
+            let dead = CardSet::from_cards(board);
+            let live =
+                |(a, b): (u8, u8)| !dead.contains(Card::from_index(a)) && !dead.contains(Card::from_index(b));
+            let disjoint = |x: (u8, u8), y: (u8, u8)| x.0 != y.0 && x.0 != y.1 && x.1 != y.0 && x.1 != y.1;
+            hands.cards[p]
+                .iter()
+                .map(|&h| {
+                    if !live(h) {
+                        return 0.0;
+                    }
+                    let mut v = 0.0;
+                    for (i, &x) in hands.cards[q].iter().enumerate() {
+                        if !live(x) || !disjoint(h, x) {
+                            continue;
+                        }
+                        for (j, &y) in hands.cards[r].iter().enumerate() {
+                            if !live(y) || !disjoint(h, y) || !disjoint(x, y) {
+                                continue;
+                            }
+                            let w = reach[q][i] as f64 * reach[r][j] as f64;
+                            let sh = strength(h);
+                            let mut best = sh;
+                            if !folded[q] {
+                                best = best.max(strength(x));
+                            }
+                            if !folded[r] {
+                                best = best.max(strength(y));
+                            }
+                            let pay = if folded[p] || sh < best {
+                                lose
+                            } else {
+                                let k = 1 + [(q, x), (r, y)]
+                                    .iter()
+                                    .filter(|&&(o, c)| !folded[o] && strength(c) == best)
+                                    .count();
+                                lose + (win - lose) / k as f64
+                            };
+                            v += w * pay;
+                        }
+                    }
+                    v
+                })
+                .collect()
+        }
+
+        #[test]
+        fn exact_terminal_matches_brute_force() {
+            for board in ["Kd9s5h2c2d", "AhAsAdKcQh", "7c8c9cTc2h", "Js9s4d2c3h"] {
+                check_board(board);
+            }
+        }
+
+        fn check_board(board: &str) {
+            let board = parse_cards(board).unwrap();
+            // Overlapping ranges with many shared cards and ties (the board
+            // pairs, and K9 / 99 / A2 / 22-type hands collide).
+            let ranges = [
+                "AA, KK, K9, 99, A2, 55, QJs, T9s, 76s, A5s, 53s",
+                "AK, KQ, K9s, 99, 22, A9, J9s, 98s, 65s, 43s",
+                "AQ, KJ, 99, 55, A5, K5, T9, 86s, 64s, 32s",
+            ]
+            .map(|r| Range::parse(r).unwrap().into_weights());
+            let hands = Hands::new(&ranges, CardSet::from_cards(&board), 0.0, &Default::default());
+            let table = Table::new(&hands, &board);
+            let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+            for case in 0..12 {
+                let reach: [Vec<f32>; N] = std::array::from_fn(|x| {
+                    (0..hands.len(x)).map(|_| rng.random_range(0.0..1.0f32)).collect()
+                });
+                let folded = match case % 4 {
+                    0 | 1 => [false; N],
+                    2 => [false, false, true],
+                    _ => [false, true, false],
+                };
+                let p = case % N;
+                let node = Node { folded, ..Node::terminal(Kind::Showdown, [100, 250, 400], folded, 0.0) };
+                let ctx = Ctx {
+                    hands: &hands,
+                    tables: std::slice::from_ref(&table),
+                    third_pot: 300.0,
+                    root_pot: 900.0,
+                    norm: [1.0; N],
+                    exact: true,
+                };
+                let mut out = vec![0f32; hands.len(p)];
+                terminal(&ctx, &node, p, &reach, false, &mut out);
+                let win =
+                    900.0 + (0..N).filter(|&j| j != p).map(|j| node.invest[j] as f64).sum::<f64>() - 300.0;
+                let lose = -(node.invest[p] as f64 + 300.0);
+                let want = brute(&hands, &board, p, &reach, folded, win, lose);
+                for (h, (&a, &b)) in out.iter().zip(&want).enumerate() {
+                    assert!(
+                        (a as f64 - b).abs() <= 1e-3 * (1.0 + b.abs()),
+                        "board {board:?}, case {case}, player {p}, hand {h}: {a} vs {b}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +1588,7 @@ mod tests {
             max_memory_bytes: 1 << 30,
             rake_rate: 0.0,
             rake_cap: 0.0,
+            exact_removal: false,
         }
     }
 
@@ -1164,9 +1677,42 @@ mod tests {
         let r = m.ranges_after(&[Step::Action(bet)]).unwrap();
         assert!(r.iter().all(|v| v.iter().all(|&x| (0.0..=1.0 + 1e-6).contains(&x))));
     }
+
+    /// With exact card removal between opponents (and no rake) the game is
+    /// exactly zero-sum, for any strategies.
+    #[test]
+    fn exact_removal_is_zero_sum() {
+        let mut cfg = config(
+            "Ah7c2d5s",
+            ["AA, KK, QQ, AK, AQs", "AK, AQ, AJs, KK, QQ, JJ", "AQ, AJ, KQ, TT, 99, 88, A5s"],
+            [false; N],
+        );
+        cfg.exact_removal = true;
+        let mut m = MultiSolver::new(cfg).unwrap();
+        for iters in [1, 30] {
+            let opts =
+                SolveOptions { max_iterations: iters, target_exploitability_pct: 0.0, check_every: iters };
+            m.solve(&opts, |_| true);
+            let v = m.values();
+            assert!(v.iter().sum::<f64>().abs() < 1e-3 * 900.0, "after {iters} iterations: {v:?}");
+        }
+    }
 }
 
 impl MultiSolver {
+    /// Switches the terminal model (exact card removal between opponents or
+    /// independent opponents) for later solving and evaluation; used to
+    /// measure how a strategy found with one model fares under the other.
+    pub fn set_exact_removal(&mut self, on: bool) {
+        self.config.exact_removal = on;
+    }
+
+    /// Average strategy at the root, per action, over the acting player's
+    /// whole range.
+    pub fn root_range_strategy(&self) -> Vec<f64> {
+        self.query(&[]).map(|i| i.range_strategy()).unwrap_or_default()
+    }
+
     /// Number of `(action, hand)` cells in the tree (memory ≈ 8 bytes each).
     pub fn cells(&self) -> u64 {
         fn walk(n: &Node) -> u64 {
@@ -1222,6 +1768,7 @@ mod size_tests {
                 max_memory_bytes: 8 << 30,
                 rake_rate: 0.0,
                 rake_cap: 0.0,
+                exact_removal: false,
             };
             let t = Instant::now();
             let mut m = MultiSolver::new(cfg).unwrap();

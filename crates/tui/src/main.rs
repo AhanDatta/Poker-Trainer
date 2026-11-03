@@ -227,7 +227,10 @@ mod tests {
                         assert!(s.contains("Whole range"), "{s}");
                         // Zoomed-in terminal: everything important still shows.
                         let small = render_at(&app, 100, 30);
-                        assert!(small.contains("Solver, your hand") && small.contains("Your decisions"), "{small}");
+                        assert!(
+                            small.contains("Solver, your hand") && small.contains("Your decisions"),
+                            "{small}"
+                        );
                         assert!(small.contains("A2o") && small.contains("22"), "grid cut off:\n{small}");
                         reviewed = true;
                         break;
@@ -256,11 +259,8 @@ mod tests {
         cfg.solver.flop_mode = trainer::FlopMode::Fast;
         cfg.solver.flop_turn_samples = 4;
         cfg.solver.flop_river_samples = 3;
-        let size: Vec<u16> = std::env::var("SIZE")
-            .unwrap_or("150x40".into())
-            .split('x')
-            .map(|v| v.parse().unwrap())
-            .collect();
+        let size: Vec<u16> =
+            std::env::var("SIZE").unwrap_or("150x40".into()).split('x').map(|v| v.parse().unwrap()).collect();
         let render = |app: &App| render_at(app, size[0], size[1]);
         let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
         println!("{}", render(&app));
@@ -324,7 +324,8 @@ mod tests {
             app.tick();
             let st = app.study.as_ref().unwrap();
             if let study_app::Phase::Postflop(p) = &st.phase {
-                if !matches!(p.pos, trainer::study::StudyPos::Solving(_) | trainer::study::StudyPos::Loading) {
+                if !matches!(p.pos, trainer::study::StudyPos::Solving(_) | trainer::study::StudyPos::Loading)
+                {
                     return;
                 }
             } else {

@@ -144,7 +144,12 @@ pub(crate) fn normalize_in_place(s: &mut [f32], num_actions: usize, n: usize) {
 /// is positive. Any positive scale of the regrets gives the same strategy,
 /// so compressed regrets can be passed undecoded.
 #[inline]
-pub(crate) fn regret_match_into<T: Copy + Into<f32>>(regrets: &[T], num_actions: usize, n: usize, out: &mut [f32]) {
+pub(crate) fn regret_match_into<T: Copy + Into<f32>>(
+    regrets: &[T],
+    num_actions: usize,
+    n: usize,
+    out: &mut [f32],
+) {
     if n == 0 {
         return;
     }
@@ -185,16 +190,6 @@ fn positive_sums<T: Copy + Into<f32>>(regrets: &[T], n: usize, sums: &mut [f32])
             *d += r.into().max(0.0);
         }
     }
-}
-
-/// Regret matching in place: strategy proportional to positive regrets.
-#[cfg(test)]
-pub(crate) fn regret_match(s: &mut [f32], num_actions: usize, n: usize) {
-    for x in s.iter_mut() {
-        *x = x.max(0.0);
-    }
-    normalize_in_place(s, num_actions, n);
-    debug_assert!(is_distribution(s, num_actions, n), "regret matching produced an invalid strategy");
 }
 
 /// Debug sentinel: every hand's action probabilities are in [0, 1] and sum to 1.

@@ -12,9 +12,7 @@
 //! This is the hot path of turn and flop solves; it must give exactly the
 //! same results as the recursive traversal (see the tests).
 
-use crate::cfr::{
-    fold_payoff, normalize_in_place, own_node_combine, showdown_payoffs, Ctx, Mode,
-};
+use crate::cfr::{fold_payoff, normalize_in_place, own_node_combine, showdown_payoffs, Ctx, Mode};
 use crate::eval::{fold_batch, showdown_batch, LANES};
 use crate::tree::Kind;
 use std::cell::RefCell;
@@ -194,7 +192,11 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
         let g = group_of[it.reach as usize];
         let fits = g != NONE && {
             let grp = groups[g as usize];
-            if is_showdown { grp.1 == NONE } else { grp.2 == NONE }
+            if is_showdown {
+                grp.1 == NONE
+            } else {
+                grp.2 == NONE
+            }
         };
         let g = if fits {
             g as usize
@@ -228,7 +230,10 @@ fn run(ctx: &Ctx, root: usize, p: usize, opp_reach: &[f32], mode: Mode, out: &mu
                 tie.push(t);
                 outs.push(slots[sd as usize].take().unwrap());
                 folds.push((fd != NONE).then(|| {
-                    (fold_payoff(ctx, &nodes[items[fd as usize].id as usize], p), slots[fd as usize].take().unwrap())
+                    (
+                        fold_payoff(ctx, &nodes[items[fd as usize].id as usize], p),
+                        slots[fd as usize].take().unwrap(),
+                    )
                 }));
             }
             showdown_batch(ctx.hands, table, p, &reaches, &win, &lose, &tie, &mut outs, &mut folds);

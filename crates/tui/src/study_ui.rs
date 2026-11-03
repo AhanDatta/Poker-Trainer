@@ -126,7 +126,10 @@ fn draw_info(f: &mut Frame, area: Rect, st: &StudyState) {
                         items.push(v);
                     }
                     LineItem::Action { player, label } => items.push(vec![
-                        Span::styled(spot.names[player].clone(), Style::default().fg(PLAYER_COLORS[player % 3])),
+                        Span::styled(
+                            spot.names[player].clone(),
+                            Style::default().fg(PLAYER_COLORS[player % 3]),
+                        ),
                         Span::raw(format!(" {label}")),
                     ]),
                 }
@@ -148,7 +151,8 @@ fn draw_info(f: &mut Frame, area: Rect, st: &StudyState) {
         }
     }
     f.render_widget(
-        Paragraph::new(vec![Line::from(first), Line::from(second)]).block(Block::default().borders(Borders::BOTTOM)),
+        Paragraph::new(vec![Line::from(first), Line::from(second)])
+            .block(Block::default().borders(Borders::BOTTOM)),
         area,
     );
 }
@@ -157,7 +161,10 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &StudyState, editor: bool) {
     let mut lines = Vec::new();
     if let Some(i) = &st.input {
         lines.push(Line::from(vec![
-            Span::styled(format!("{}: ", i.prompt), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}: ", i.prompt),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(format!("{}▏", i.text), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(
                 st.message.as_ref().map(|m| format!("   {m}")).unwrap_or_default(),
@@ -176,7 +183,10 @@ fn draw_footer(f: &mut Frame, area: Rect, st: &StudyState, editor: bool) {
     } else {
         "F/C/1-9 act · arrows hand · Tab ranges · Backspace back · G/Home start · N new board · E edit spot · P preflop · Esc menu · ? help"
     };
-    lines.push(Line::from(Span::styled(truncate(keys, area.width as usize), Style::default().fg(Color::DarkGray))));
+    lines.push(Line::from(Span::styled(
+        truncate(keys, area.width as usize),
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -216,10 +226,17 @@ fn draw_preflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pane
                     None => GridCell::default(),
                 })
                 .collect();
-            let entries: Vec<(String, Color)> =
-                node.labels.iter().enumerate().map(|(i, l)| (l.clone(), action_color(&node.actions, i))).collect();
+            let entries: Vec<(String, Color)> = node
+                .labels
+                .iter()
+                .enumerate()
+                .map(|(i, l)| (l.clone(), action_color(&node.actions, i)))
+                .collect();
             let title = Line::from(vec![
-                Span::styled(format!("{} ", node.position), Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{} ", node.position),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("to act · chart mix per hand"),
                 Span::styled(" (width = share still in range)", Style::default().fg(Color::DarkGray)),
             ]);
@@ -227,15 +244,24 @@ fn draw_preflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pane
         }
         (view, _) => {
             let (seat, name) = match view {
-                GridView::Range(s) => players.iter().find(|p| p.0 == s).cloned().unwrap_or((s, String::new())),
+                GridView::Range(s) => {
+                    players.iter().find(|p| p.0 == s).cloned().unwrap_or((s, String::new()))
+                }
                 _ => players.first().cloned().unwrap_or((0, String::new())),
             };
             let k = players.iter().position(|p| p.0 == seat).unwrap_or(0);
             let r = nav.range_of(seat);
             let cells = range_cells(r.weights(), &[], PLAYER_COLORS[k % 3]);
             let title = Line::from(vec![
-                Span::styled(format!("{name}'s range "), Style::default().fg(PLAYER_COLORS[k % 3]).add_modifier(Modifier::BOLD)),
-                Span::raw(format!("({:.0} combos, {:.1}% of hands)", r.num_combos(), 100.0 * r.num_combos() / 1326.0)),
+                Span::styled(
+                    format!("{name}'s range "),
+                    Style::default().fg(PLAYER_COLORS[k % 3]).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "({:.0} combos, {:.1}% of hands)",
+                    r.num_combos(),
+                    100.0 * r.num_combos() / 1326.0
+                )),
             ]);
             draw_grid(f, grid_area, title, &cells, Vec::new(), Some(st.cursor), Some(&app.hits));
         }
@@ -258,8 +284,16 @@ fn draw_preflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pane
         for (i, label) in node.labels.iter().enumerate() {
             let color = action_color(&node.actions, i);
             let key = action_key(&node.actions, i);
-            lines.push(layout.row(key, label, color, node.range_strategy[i], cell.map(|c| c.strategy[i]), None));
-            app.hits.add(Rect { x: panel.x, y: y0 + i as u16, width: panel.width, height: 1 }, Hit::Action(i));
+            lines.push(layout.row(
+                key,
+                label,
+                color,
+                node.range_strategy[i],
+                cell.map(|c| c.strategy[i]),
+                None,
+            ));
+            app.hits
+                .add(Rect { x: panel.x, y: y0 + i as u16, width: panel.width, height: 1 }, Hit::Action(i));
         }
         lines.push(Line::from(""));
         match cell {
@@ -274,7 +308,10 @@ fn draw_preflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pane
             ))),
         }
     } else {
-        lines.push(Line::from(Span::styled("Preflop is over.", Style::default().add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled(
+            "Preflop is over.",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
         lines.push(Line::from(""));
         if st.input.is_some() {
             lines.push(Line::from("Type the flop below (or press Enter for a random one) to solve it."));
@@ -324,10 +361,21 @@ impl RowLayout {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn row(&self, key: char, label: &str, color: Color, freq: f64, class: Option<f32>, ev: Option<f32>) -> Line<'static> {
+    fn row(
+        &self,
+        key: char,
+        label: &str,
+        color: Color,
+        freq: f64,
+        class: Option<f32>,
+        ev: Option<f32>,
+    ) -> Line<'static> {
         let mut spans = vec![
             Span::styled(format!(" {key} "), Style::default().fg(Color::Black).bg(color)),
-            Span::styled(format!(" {:<w$}", truncate(label, self.label), w = self.label), Style::default().fg(color)),
+            Span::styled(
+                format!(" {:<w$}", truncate(label, self.label), w = self.label),
+                Style::default().fg(color),
+            ),
         ];
         if self.bar > 0 {
             spans.push(Span::styled(bar(freq as f32, self.bar), Style::default().fg(color)));
@@ -390,7 +438,12 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
                 .map(|(g, c)| match c {
                     Some(c) => GridCell {
                         fill: (c.weight / live_combos(g, &board).max(1) as f32).clamp(0.0, 1.0),
-                        mix: c.strategy.iter().enumerate().map(|(a, &w)| (w, action_color(&v.actions, a))).collect(),
+                        mix: c
+                            .strategy
+                            .iter()
+                            .enumerate()
+                            .map(|(a, &w)| (w, action_color(&v.actions, a)))
+                            .collect(),
                         sub: evs[g].map(|e| {
                             let v = e / BB as f32;
                             if v.abs() >= 9.95 {
@@ -411,7 +464,10 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
                     Style::default().fg(PLAYER_COLORS[actor % 3]).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("to act · solver mix per hand"),
-                Span::styled(" (width = share in range; 2nd row = EV in bb)", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    " (width = share in range; 2nd row = EV in bb)",
+                    Style::default().fg(Color::DarkGray),
+                ),
             ]);
             draw_grid(f, grid_area, title, &cells, legend(&entries, 18), Some(st.cursor), Some(&app.hits));
         }
@@ -434,7 +490,10 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
                     format!("{}'s range ", spot.names[who]),
                     Style::default().fg(PLAYER_COLORS[who % 3]).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(format!("({combos:.1} combos, {:.0}% of the starting range)", 100.0 * combos / start.max(1e-9))),
+                Span::raw(format!(
+                    "({combos:.1} combos, {:.0}% of the starting range)",
+                    100.0 * combos / start.max(1e-9)
+                )),
             ];
             if view.is_none() {
                 title.push(Span::styled(" — solving…", Style::default().fg(Color::Yellow)));
@@ -464,9 +523,7 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
             if let Some(pr) = s.progress {
                 lines.push(Line::from(format!(
                     "Iteration {} · exploitability {:.2}% of the pot (target {:.2}%)",
-                    pr.iteration,
-                    pr.exploitability_pct,
-                    st.settings.solver.target_exploitability_pct
+                    pr.iteration, pr.exploitability_pct, st.settings.solver.target_exploitability_pct
                 )));
             }
             lines.push(Line::from(Span::styled(
@@ -483,7 +540,10 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
             lines.push(Line::from(Span::styled("Reading the solution…", Style::default().fg(Color::Yellow))));
         }
         StudyPos::Failed(e) => {
-            lines.push(Line::from(Span::styled(format!("Solve failed: {e}"), Style::default().fg(Color::LightRed))));
+            lines.push(Line::from(Span::styled(
+                format!("Solve failed: {e}"),
+                Style::default().fg(Color::LightRed),
+            )));
             lines.push(Line::from("Backspace goes back; E edits the spot."));
         }
         StudyPos::NeedCard { next, .. } => {
@@ -491,7 +551,10 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
                 format!("The {} betting is over.", Street::from_board_len(board.len())),
                 Style::default().add_modifier(Modifier::BOLD),
             )));
-            lines.push(Line::from(format!("Type the {} card below (Enter = random).", next.name().to_lowercase())));
+            lines.push(Line::from(format!(
+                "Type the {} card below (Enter = random).",
+                next.name().to_lowercase()
+            )));
             lines.push(Line::from("Tab: the ranges going into the next street."));
         }
         StudyPos::Over { text, .. } => {
@@ -520,7 +583,10 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
                     None => (None, None),
                 };
                 lines.push(layout.row(key, label, color, v.range_strategy[i], cf, ce));
-                app.hits.add(Rect { x: panel.x, y: y0 + i as u16, width: panel.width, height: 1 }, Hit::Action(i));
+                app.hits.add(
+                    Rect { x: panel.x, y: y0 + i as u16, width: panel.width, height: 1 },
+                    Hit::Action(i),
+                );
             }
             lines.push(Line::from(""));
             match &detail {
@@ -565,7 +631,10 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
         )));
     }
     for n in p.study.notes() {
-        lines.push(Line::from(Span::styled(format!("• {}", truncate(&n, wide * 3)), Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            format!("• {}", truncate(&n, wide * 3)),
+            Style::default().fg(Color::DarkGray),
+        )));
     }
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(Block::default().borders(Borders::LEFT)),
@@ -615,7 +684,8 @@ fn class_detail(v: &NodeView, class: usize) -> Option<ClassDetail> {
     let info = v.info.as_ref()?;
     let n = info.num_hands();
     let na = info.actions.len();
-    let mut d = ClassDetail { combos: 0.0, freq: vec![0.0; na], ev: vec![0.0; na], total_ev: 0.0, rows: Vec::new() };
+    let mut d =
+        ClassDetail { combos: 0.0, freq: vec![0.0; na], ev: vec![0.0; na], total_ev: 0.0, rows: Vec::new() };
     for h in 0..n {
         let c = info.combos[h] as usize;
         let w = info.reach[h];
@@ -648,7 +718,10 @@ fn class_detail(v: &NodeView, class: usize) -> Option<ClassDetail> {
 fn draw_editor(f: &mut Frame, app: &App, area: Rect, ed: &SpotEditor) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(40), Constraint::Length(54.max(area.width / 2).min(area.width.saturating_sub(40)))])
+        .constraints([
+            Constraint::Min(40),
+            Constraint::Length(54.max(area.width / 2).min(area.width.saturating_sub(40))),
+        ])
         .split(area);
     let mut lines = vec![
         Line::from(Span::styled("Type a spot", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))),
@@ -665,10 +738,9 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, ed: &SpotEditor) {
     for (y, (i, row)) in (y0..).zip(rows.iter().enumerate()) {
         let selected = i == ed.cursor;
         let (label, value) = match row {
-            EditorRow::Players => (
-                "Players".to_string(),
-                format!("◂ {} ({}) ▸", ed.names.len(), ed.names.join(", ")),
-            ),
+            EditorRow::Players => {
+                ("Players".to_string(), format!("◂ {} ({}) ▸", ed.names.len(), ed.names.join(", ")))
+            }
             EditorRow::Range(k) => (format!("{} range", ed.names[*k]), ed.ranges[*k].clone()),
             EditorRow::Pot => ("Pot (bb)".into(), ed.pot.clone()),
             EditorRow::Stack => ("Stacks (bb)".into(), ed.stack.clone()),
@@ -698,7 +770,11 @@ fn draw_editor(f: &mut Frame, app: &App, area: Rect, ed: &SpotEditor) {
         };
         spans.push(Span::styled(
             format!(" {shown}"),
-            if editing { style.fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { style.add_modifier(Modifier::BOLD) },
+            if editing {
+                style.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                style.add_modifier(Modifier::BOLD)
+            },
         ));
         lines.push(Line::from(spans));
         app.hits.add(Rect { x: cols[0].x, y, width: cols[0].width, height: 1 }, Hit::Field(i));

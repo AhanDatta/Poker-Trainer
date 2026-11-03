@@ -2,7 +2,8 @@
 
 use crate::app::{App, Mode, OpponentChoice, Screen, SetupItem, SEAT_CHANGE_PRESETS};
 use crate::widgets::{
-    action_color, bar, big_cards, card_span, cards_spans, combo_spans, draw_grid, legend, truncate, GridCell, Hit, ACCENT,
+    action_color, bar, big_cards, card_span, cards_spans, combo_spans, draw_grid, legend, truncate, GridCell,
+    Hit, ACCENT,
 };
 use holdem::{Card, Street};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -92,7 +93,10 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
     let s = |a: &str, b: &str| (a.to_string(), b.to_string());
     match item {
         SetupItem::Mode => match app.mode {
-            Mode::Play => s("Play hands", "Play against the AI; after each hand the solver grades your postflop decisions."),
+            Mode::Play => s(
+                "Play hands",
+                "Play against the AI; after each hand the solver grades your postflop decisions.",
+            ),
             Mode::Study => s(
                 "Solver study",
                 "Browse the preflop charts and the solver's postflop strategy in any spot, GTO Wizard style.",
@@ -114,7 +118,9 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
             OpponentChoice::Game(g) if cfg.players == 2 => {
                 (g.label().to_string(), format!("Your opponent is drawn from: {}.", g.description()))
             }
-            OpponentChoice::Game(g) => (g.label().to_string(), format!("Seats are filled with {}.", g.description())),
+            OpponentChoice::Game(g) => {
+                (g.label().to_string(), format!("Seats are filled with {}.", g.description()))
+            }
             OpponentChoice::Style(name) => {
                 let d = cfg.profile_by_name(&name).map(|p| p.description).unwrap_or_default();
                 (format!("All {name}"), d)
@@ -159,7 +165,10 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
             } else {
                 (
                     format!("{}%, cap {}bb", cfg.rake_pct, cfg.rake_cap_bb),
-                    format!("{}% of the pot, capped at {}bb (no flop, no drop).", cfg.rake_pct, cfg.rake_cap_bb),
+                    format!(
+                        "{}% of the pot, capped at {}bb (no flop, no drop).",
+                        cfg.rake_pct, cfg.rake_cap_bb
+                    ),
                 )
             }
         }
@@ -176,6 +185,20 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
                 format!("Every runout: up to {} GB of RAM and minutes per flop.", cfg.solver.max_memory_gb),
             ),
         },
+        SetupItem::ThreeWay => {
+            if cfg.solver.multiway_exact_removal {
+                s(
+                    "Exact card removal",
+                    "3-way pots account for the two opponents blocking each other's cards. About 2-3x slower.",
+                )
+            } else {
+                s(
+                    "Approximate",
+                    "3-way pots treat the two opponents' hands as independent: close with wide ranges, \
+                     but off by several % of the pot when narrow ranges overlap (squeeze pots).",
+                )
+            }
+        }
         SetupItem::VillainRange => match cfg.solver.villain_range {
             VillainRange::Gto => s("GTO ranges", "The review assumes villains play the charts preflop."),
             VillainRange::Actual => {
@@ -220,6 +243,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
             SetupItem::Stack => "Stacks",
             SetupItem::Rake => "Rake",
             SetupItem::FlopSolve => "Flop solving",
+            SetupItem::ThreeWay => "3-way pots",
             SetupItem::VillainRange => "Villain range in review",
             SetupItem::RevealStyle => "Reveal style during hand",
         }
@@ -280,13 +304,15 @@ fn draw_setup(f: &mut Frame, app: &App) {
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "Heads-up and 3-way pots (3-way solves are approximate). Fast flop solving is recommended here.",
+                "Heads-up and 3-way pots (3-way solves are approximate; see the 3-way row). Fast flop solving is recommended here.",
                 Style::default().fg(Color::DarkGray),
             )),
         ],
     });
     f.render_widget(
-        Paragraph::new(about).block(Block::default().borders(Borders::ALL).title(" About ")).wrap(Wrap { trim: true }),
+        Paragraph::new(about)
+            .block(Block::default().borders(Borders::ALL).title(" About "))
+            .wrap(Wrap { trim: true }),
         mid[1],
     );
     let keys = match app.mode {
@@ -371,8 +397,11 @@ fn action_buttons(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<(u16, u16, 
 fn draw_table(f: &mut Frame, app: &App) {
     let area = f.area();
     let Some(hand) = app.current() else { return };
-    let (buttons, boxes) =
-        if hand.hero_to_act() { action_buttons(app, area.width.saturating_sub(2)) } else { (Vec::new(), Vec::new()) };
+    let (buttons, boxes) = if hand.hero_to_act() {
+        action_buttons(app, area.width.saturating_sub(2))
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let actions_h = 3 + buttons.len().max(1) as u16;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -553,7 +582,10 @@ fn draw_table(f: &mut Frame, app: &App) {
                     s.decisions.len()
                 );
             }
-            Line::from(Span::styled(truncate(&text, area.width as usize), Style::default().fg(Color::LightMagenta)))
+            Line::from(Span::styled(
+                truncate(&text, area.width as usize),
+                Style::default().fg(Color::LightMagenta),
+            ))
         }
     };
     f.render_widget(Paragraph::new(status).block(Block::default().borders(Borders::TOP)), rows[3]);
@@ -676,10 +708,8 @@ fn draw_review(f: &mut Frame, app: &App) {
         }
         cols[1]
     } else {
-        let mut lines: Vec<Vec<Span>> = vec![vec![Span::styled(
-            format!("{}: ", empty_msg.trim()),
-            Style::default().fg(Color::DarkGray),
-        )]];
+        let mut lines: Vec<Vec<Span>> =
+            vec![vec![Span::styled(format!("{}: ", empty_msg.trim()), Style::default().fg(Color::DarkGray))]];
         let mut x = lines[0][0].content.chars().count() as u16;
         let mut boxes = Vec::new();
         for (i, d) in decisions.iter().enumerate() {
@@ -706,7 +736,8 @@ fn draw_review(f: &mut Frame, app: &App) {
             .constraints([Constraint::Length(strip_h), Constraint::Min(6)])
             .split(rows[2]);
         for (i, &(line, x, w)) in boxes.iter().enumerate() {
-            app.hits.add(Rect { x: parts[0].x + x, y: parts[0].y + line, width: w, height: 1 }, Hit::Decision(i));
+            app.hits
+                .add(Rect { x: parts[0].x + x, y: parts[0].y + line, width: w, height: 1 }, Hit::Decision(i));
         }
         f.render_widget(
             Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())

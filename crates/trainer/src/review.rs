@@ -744,9 +744,7 @@ impl<'a> Worker<'a> {
                     })
                     .collect::<Vec<_>>()
                     .join(" · ");
-                let notes = vec![
-                    "3-way pot: approximate solve (no equilibrium guarantee for 3 players; opponents treated as independent; sampled runouts; simplified later streets).".to_string(),
-                ];
+                let notes = vec![multiway_note(street, s.multiway_exact_removal)];
                 let review = grade(
                     &info,
                     &context_multi(&states[k]),
@@ -843,6 +841,14 @@ impl SolveSink for Shared {
     }
 }
 
+/// What a 3-way solve approximates (shown with its results).
+pub(crate) fn multiway_note(street: Street, exact_removal: bool) -> String {
+    format!(
+        "{street}: 3-way pot, approximate solve (no equilibrium guarantee for 3 players; {}sampled runouts; simplified later streets).",
+        if exact_removal { "" } else { "opponents' hands treated as independent; " }
+    )
+}
+
 /// Heads-up solver inputs as reviews and study mode use them: the root
 /// street gets the full menu; a flop solve uses `flop_future_menu` for the
 /// turn and river, and samples them in fast mode.
@@ -893,11 +899,9 @@ pub(crate) fn multi_config(
         future_menu: Some(s.multiway_future_menu.clone()),
         big_blind: BB,
         chance: match root.street {
-            Street::Flop => ChanceMode::Sampled {
-                turn: s.multiway_turn_samples,
-                river: s.multiway_river_samples,
-                seed,
-            },
+            Street::Flop => {
+                ChanceMode::Sampled { turn: s.multiway_turn_samples, river: s.multiway_river_samples, seed }
+            }
             Street::Turn => ChanceMode::Sampled { turn: 0, river: s.multiway_river_samples * 2, seed },
             _ => ChanceMode::Exact,
         },
@@ -906,6 +910,7 @@ pub(crate) fn multi_config(
         max_memory_bytes: (s.max_memory_gb * 1e9) as u64,
         rake_rate,
         rake_cap: rake_cap as f64,
+        exact_removal: s.multiway_exact_removal,
     }
 }
 
@@ -939,7 +944,8 @@ pub(crate) fn run_hu(
                 needed as f64 / 1e9,
                 s.max_memory_gb
             ));
-            cfg.chance = ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed: 7 };
+            cfg.chance =
+                ChanceMode::Sampled { turn: s.flop_turn_samples, river: s.flop_river_samples, seed: 7 };
             Solver::new(cfg).map_err(|e| e.to_string())?
         }
         Err(e) => return Err(e.to_string()),

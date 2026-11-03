@@ -357,4 +357,3 @@ fn check_schedule_aims_at_predicted_convergence() {
     // No progress: fall back to the max gap.
     assert_eq!(gap(Some((20, 1.0)), (40, 1.2), 0.5, 20), 20);
 }
-
