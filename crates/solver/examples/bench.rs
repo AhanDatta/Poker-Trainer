@@ -1,7 +1,8 @@
 //! Benchmarks realistic heads-up single-raised-pot solves.
 //!
 //! Usage: cargo run --release -p solver --example bench -- [river|turn|flop-fast|flop-exact|flop-exact-lean] [board]
-//! Env: ITERS (max iterations), TARGET (% pot), NOISO=1, STORAGE=f32|compressed|auto, NOBATCH=1
+//! Env: ITERS (max iterations), TARGET (% pot), NOISO=1, STORAGE=f32|compressed|auto, NOBATCH=1,
+//! GPU=1 (with --features gpu; river roots only for now)
 
 use holdem::card::parse_cards;
 use holdem::{PostflopMenu, Range, Street, StreetSizes};
@@ -128,6 +129,9 @@ fn run(name: &str, board: &str, chance: ChanceMode, future_menu: Option<Postflop
         s.isomorphic_pairs(),
         t0.elapsed()
     );
+    if std::env::var("GPU").is_ok() {
+        use_gpu(&mut s);
+    }
     let t1 = Instant::now();
     let iters: u32 = env("ITERS", 1000);
     let opts = SolveOptions {
@@ -141,19 +145,42 @@ fn run(name: &str, board: &str, chance: ChanceMode, future_menu: Option<Postflop
     });
     let el = t1.elapsed();
     println!(
-        "   done: {} iterations, {:.3}% pot, {:.2?} ({:.1} ms/iter), peak RSS {:.2} GB",
+        "   done: {} iterations, {:.3}% pot, {:.2?} ({:.2} ms/iter), peak RSS {:.2} GB",
         p.iteration,
         p.exploitability_pct,
         el,
         el.as_secs_f64() * 1000.0 / p.iteration as f64,
         peak_rss_gb()
     );
+    #[cfg(feature = "gpu")]
+    if let Some(e) = s.gpu_error() {
+        println!("   GPU failed, solve restarted on the CPU: {e}");
+    }
     let root = s.query(&[]).unwrap();
     let rs = root.range_strategy();
     println!(
         "   root (OOP) strategy: {:?}",
         root.actions.iter().zip(rs).map(|(a, f)| format!("{a:?} {:.1}%", f * 100.0)).collect::<Vec<_>>()
     );
+}
+
+/// `GPU=1`: solve on the GPU (needs `--features gpu`; river roots only for now).
+#[cfg(feature = "gpu")]
+fn use_gpu(s: &mut Solver) {
+    let t = Instant::now();
+    match s.use_gpu() {
+        Ok(()) => println!("   on the GPU (setup {:.2?})", t.elapsed()),
+        Err(e) => {
+            eprintln!("GPU unavailable: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn use_gpu(_: &mut Solver) {
+    eprintln!("GPU=1 needs a build with --features gpu");
+    std::process::exit(1);
 }
 
 fn main() {
