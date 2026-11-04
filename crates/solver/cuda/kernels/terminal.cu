@@ -1,7 +1,11 @@
 // Terminal values: folds and showdowns, one thread block per terminal.
 //
 // CPU twins: `eval::fold_batch` / `eval::eval_fold` and
-// `eval::showdown_batch` (+ `add_ties`). Card removal is inclusion-exclusion:
+// `eval::showdown_batch` / `eval::eval_showdown` (+ `add_ties`). The CPU
+// batches the terminals of river subtrees and evaluates the others (folds
+// before the river, showdowns right after an all-in runout) one at a time;
+// the two round differently, and the plan's `scalar` flag says which one a
+// terminal follows. Card removal is inclusion-exclusion:
 // the opponent reach compatible with hand {c1, c2} is
 // `total - minus[c1] - minus[c2] + reach(identical combo)`, where
 // `minus[c]` is the reach of opponent hands holding card c.
@@ -67,6 +71,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
                                                                            u32 payoff_len,
                                                                            const u32* slots_ptr,
                                                                            u32 slots_len,
+                                                                           const u32* scalar_ptr,
+                                                                           u32 scalar_len,
                                                                            const u32* alive_ptr,
                                                                            u32 alive_len,
                                                                            const float* reach_ptr,
@@ -94,6 +100,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
   const auto list = view(list_ptr, list_len);
   const auto payoff = view(payoff_ptr, payoff_len);
   const auto slots = view(slots_ptr, slots_len);
+  const auto scalar = view(scalar_ptr, scalar_len);
   const auto alive = view(alive_ptr, alive_len);
   const auto reach_all = view(reach_ptr, reach_len);
   const auto values = view(values_ptr, values_len);
@@ -135,11 +142,14 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
     __syncthreads();
 
     const double pay = payoff[k];
+    const bool one_at_a_time = scalar[node] != 0u;
     for (u32 h = threadIdx.x; h < hands; h += kThreads) {
       const auto cards = unpack_cards(my_cards[h]);
-      const double compatible =
-          add_rn(sub_rn(sub_rn(total, minus[cards.first]), minus[cards.second]), same_reach(same, reach, h));
-      out[h] = to_f32(mul_rn(pay, compatible));
+      const double m1 = minus[cards.first];
+      const double m2 = minus[cards.second];
+      // `eval_fold`: total - (m1 + m2) + same; batched: total - m1 - m2 + same.
+      const double blocked = one_at_a_time ? sub_rn(total, add_rn(m1, m2)) : sub_rn(sub_rn(total, m1), m2);
+      out[h] = to_f32(mul_rn(pay, add_rn(blocked, same_reach(same, reach, h))));
     }
     __syncthreads();  // shared memory is reused by the next terminal
   }
@@ -159,6 +169,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
                                                                                u32 tie_len,
                                                                                const u32* slots_ptr,
                                                                                u32 slots_len,
+                                                                               const u32* scalar_ptr,
+                                                                               u32 scalar_len,
                                                                                const u32* alive_ptr,
                                                                                u32 alive_len,
                                                                                const float* reach_ptr,
@@ -208,6 +220,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
   const auto lose = view(lose_ptr, lose_len);
   const auto tie = view(tie_ptr, tie_len);
   const auto slots = view(slots_ptr, slots_len);
+  const auto scalar = view(scalar_ptr, scalar_len);
   const auto alive = view(alive_ptr, alive_len);
   const auto reach_all = view(reach_ptr, reach_len);
   const auto values = view(values_ptr, values_len);
@@ -287,6 +300,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
 
     const auto table_ranges = row(ranges, table, hands);
     const auto table_ranks = row(ranks_all, table, hands);
+    const bool one_at_a_time = scalar[node] != 0u;
     for (u32 h = threadIdx.x; h < hands; h += kThreads) {
       const u32 packed = table_ranges[h];
       if (packed == kNone) {
@@ -303,15 +317,28 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
       const u32 first_len = static_cast<u32>(first.size()) - 1;
       const u32 second_len = static_cast<u32>(second.size()) - 1;
 
-      // CPU: r = win * (sum - ma - mb); r += lose * (sum - ma - mb).
-      const double weaker =
-          sub_rn(sub_rn(prefix[range.lo], first[ranks.first_lo]), second[ranks.second_lo]);
-      const double stronger = sub_rn(sub_rn(sub_rn(prefix[n_opp], prefix[range.hi]),
-                                            sub_rn(first[first_len], first[ranks.first_hi])),
-                                     sub_rn(second[second_len], second[ranks.second_hi]));
-      double result = mul_rn(win[k], weaker);
-      result = add_rn(result, mul_rn(lose[k], stronger));
-      float value = to_f32(result);
+      // Reach of the weaker / stronger opponent hands, and of those among
+      // them holding each of the hand's two cards.
+      const double weaker_all = prefix[range.lo];
+      const double weaker_first = first[ranks.first_lo];
+      const double weaker_second = second[ranks.second_lo];
+      const double stronger_all = sub_rn(prefix[n_opp], prefix[range.hi]);
+      const double stronger_first = sub_rn(first[first_len], first[ranks.first_hi]);
+      const double stronger_second = sub_rn(second[second_len], second[ranks.second_hi]);
+      float value = 0.0f;
+      if (one_at_a_time) {
+        // `eval_showdown`: out = (win * (sum - (ma + mb))) as f32, then
+        // out += (lose * (sum - (ma + mb))) as f32.
+        const double weaker = sub_rn(weaker_all, add_rn(weaker_first, weaker_second));
+        const double stronger = sub_rn(stronger_all, add_rn(stronger_first, stronger_second));
+        value = add_rn(to_f32(mul_rn(win[k], weaker)), to_f32(mul_rn(lose[k], stronger)));
+      } else {
+        // `showdown_batch`: r = win * (sum - ma - mb); r += lose * (sum - ma
+        // - mb); out = r as f32.
+        const double weaker = sub_rn(sub_rn(weaker_all, weaker_first), weaker_second);
+        const double stronger = sub_rn(sub_rn(stronger_all, stronger_first), stronger_second);
+        value = to_f32(add_rn(mul_rn(win[k], weaker), mul_rn(lose[k], stronger)));
+      }
 
       if (tie[k] != 0.0) {
         // CPU `add_ties`: eq = eq_sum - (ma + mb) + same; out += (tie * eq) as f32.

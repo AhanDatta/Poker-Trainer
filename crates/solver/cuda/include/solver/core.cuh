@@ -135,8 +135,15 @@ struct CardPair {
   return CardPair{packed & 0xFFu, (packed >> 8) & 0xFFu};
 }
 
+/// Whether a hand holds `card` (so a deal of that card is impossible for it).
+[[nodiscard]] __host__ __device__ constexpr auto holds(CardPair hand, u32 card) noexcept -> bool {
+  return hand.first == card || hand.second == card;
+}
+
 static_assert(unpack_cards(3u | (51u << 8)).first == 3u);
 static_assert(unpack_cards(3u | (51u << 8)).second == 51u);
+static_assert(holds(unpack_cards(3u | (51u << 8)), 51u));
+static_assert(!holds(unpack_cards(3u | (51u << 8)), 4u));
 
 /// Where one of the traverser's hands falls in a board's strength-sorted
 /// list of opponent hands (the host packs `lo | hi << 16`): opponent

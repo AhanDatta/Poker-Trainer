@@ -12,8 +12,11 @@
 
 use super::*;
 use crate::cfr::{self, Discount, Mode};
-use crate::gpu::testutil::{arb_river_config, device, mid_street_config, river_config, turn_config};
-use crate::{Action, DcfrParams, NodeInfo, SolveConfig, SolveOptions, Solver, Step};
+use crate::gpu::testutil::{
+    allin_turn_config, arb_river_config, arb_turn_config, device, iso_turn_config, mid_street_config,
+    river_config, sampled_flop_config, turn_config,
+};
+use crate::{Action, DcfrParams, NodeInfo, SolveConfig, SolveOptions, Solver, Step, StorageMode};
 use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -95,20 +98,39 @@ fn solve_both(cfg: SolveConfig, iterations: u32) -> Option<(Solver, Solver)> {
     Some((cpu, on_gpu))
 }
 
-fn compare_nodes(cpu: &Solver, gpu: &Solver, strat_tol: f32, ev_tol: f32) {
-    let paths: [&[Step]; 3] = [&[], &[Step::Action(Action::Check)], &[Step::Action(Action::Fold)]];
-    for path in paths {
+/// Compares the root, the node after a check, and the first river node
+/// after check-check for each card in `rivers` (on turn spots; a
+/// non-canonical card goes through the isomorphism).
+fn compare_nodes(cpu: &Solver, gpu: &Solver, strat_tol: f32, ev_tol: f32, rivers: &[&str]) {
+    let check = Step::Action(Action::Check);
+    let mut paths: Vec<Vec<Step>> = vec![vec![], vec![check], vec![Step::Action(Action::Fold)]];
+    for card in rivers {
+        paths.push(vec![check, check, Step::Card(card.parse().unwrap())]);
+    }
+    for path in &paths {
         if let (Ok(a), Ok(b)) = (gpu.query(path), cpu.query(path)) {
             assert_same_node(&a, &b, strat_tol, ev_tol, &format!("{path:?}"));
+        } else if path.len() > 2 {
+            panic!("river path {path:?} not found");
         }
     }
 }
 
+/// Spots with chance nodes, the river cards to compare after check-check.
+fn chance_spots() -> Vec<(SolveConfig, &'static [&'static str])> {
+    vec![
+        (turn_config(), &["Ks", "2h"]),
+        (iso_turn_config(), &["Kc", "Kh", "3s"]),
+        (allin_turn_config(), &["Ah"]),
+        (sampled_flop_config(), &[]),
+    ]
+}
+
 #[test]
 fn traversal_values_match_cpu_from_random_storage() {
-    for (k, cfg) in
-        [river_config(), mid_street_config(false), mid_street_config(true)].into_iter().enumerate()
-    {
+    let river_spots = [river_config(), mid_street_config(false), mid_street_config(true)];
+    let spots = river_spots.into_iter().chain(chance_spots().into_iter().map(|(c, _)| c));
+    for (k, cfg) in spots.enumerate() {
         let Some(gpu) = device() else { return };
         let mut s = Solver::new(cfg).unwrap();
         randomize_storage(&mut s, 11 + k as u64);
@@ -135,7 +157,14 @@ fn traversal_values_match_cpu_from_random_storage() {
 #[test]
 fn one_cfr_iteration_matches_cpu_from_random_storage() {
     for t in [1u32, 2, 4, 7] {
-        for (k, cfg) in [river_config(), mid_street_config(true)].into_iter().enumerate() {
+        let spots = [
+            river_config(),
+            mid_street_config(true),
+            turn_config(),
+            iso_turn_config(),
+            sampled_flop_config(),
+        ];
+        for (k, cfg) in spots.into_iter().enumerate() {
             let Some(gpu) = device() else { return };
             let mut cpu = Solver::new(cfg.clone()).unwrap();
             let mut on_gpu = Solver::new(cfg).unwrap();
@@ -168,8 +197,29 @@ fn one_cfr_iteration_matches_cpu_from_random_storage() {
 fn solves_match_cpu() {
     for cfg in [river_config(), mid_street_config(false), mid_street_config(true)] {
         let Some((cpu, gpu)) = solve_both(cfg.clone(), 5) else { return };
-        compare_nodes(&cpu, &gpu, 5e-5, 0.25);
+        compare_nodes(&cpu, &gpu, 5e-5, 0.25, &[]);
     }
+    for (cfg, rivers) in chance_spots() {
+        let Some((cpu, gpu)) = solve_both(cfg.clone(), 5) else { return };
+        compare_nodes(&cpu, &gpu, 5e-5, 0.25, rivers);
+    }
+}
+
+/// With the CPU's batched river evaluator switched off (every terminal
+/// one at a time), the GPU follows that path instead.
+#[test]
+fn matches_cpu_without_river_batching() {
+    let Some(_) = device() else { return };
+    let mut cpu = Solver::new(turn_config()).unwrap();
+    let mut gpu = Solver::new(turn_config()).unwrap();
+    cpu.set_batch_river(false);
+    gpu.set_batch_river(false);
+    gpu.use_gpu().unwrap();
+    let pc = cpu.solve(&opts(4), |_| true);
+    let pg = gpu.solve(&opts(4), |_| true);
+    assert!(gpu.uses_gpu() && gpu.gpu_error().is_none());
+    assert!((pc.exploitability - pg.exploitability).abs() < 1e-4 * (1.0 + pc.exploitability.abs()));
+    compare_nodes(&cpu, &gpu, 5e-5, 0.25, &["Ks"]);
 }
 
 #[test]
@@ -183,12 +233,14 @@ fn continues_a_cpu_solve() {
     s.solve(&opts(6), |_| true);
     assert!(s.uses_gpu() && s.gpu_error().is_none());
     assert_eq!(s.iterations(), 6);
-    compare_nodes(&reference, &s, 5e-5, 0.25);
+    compare_nodes(&reference, &s, 5e-5, 0.25, &[]);
 }
 
 #[test]
-fn declines_trees_with_chance_nodes_and_stays_on_cpu() {
-    let mut s = Solver::new(turn_config()).unwrap();
+fn declines_compressed_storage_and_stays_on_cpu() {
+    let mut cfg = turn_config();
+    cfg.storage = StorageMode::Compressed;
+    let mut s = Solver::new(cfg).unwrap();
     assert!(matches!(s.use_gpu(), Err(GpuError::InvalidInput(_))));
     assert!(!s.uses_gpu());
     let p = s.solve(&opts(2), |_| true);
@@ -239,6 +291,76 @@ proptest! {
         // ~2500 chips of EV.
         let root = cpu.query(&[]).unwrap();
         let ev_scale = root.ev.iter().fold(0f32, |m, x| m.max(x.abs()));
-        compare_nodes(&cpu, &gpu, 5e-5, 0.25 * (1.0 + ev_scale / 2500.0));
+        compare_nodes(&cpu, &gpu, 5e-5, 0.25 * (1.0 + ev_scale / 2500.0), &[]);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(10))]
+
+    /// Random turn spots: values from random storage and short solves agree.
+    #[test]
+    fn random_turn_spots_match_cpu(cfg in arb_turn_config(), seed in any::<u64>()) {
+        let Ok(mut s) = Solver::new(cfg.clone()) else { return Ok(()) };
+        let Some(gpu) = device() else { return Ok(()) };
+        randomize_storage(&mut s, seed);
+        let mut engine = engine_for(&mut s, gpu);
+        for p in 0..2 {
+            for mode in [Mode::Average, Mode::BestResponse] {
+                let mut cpu = vec![0f32; s.hands.len(p)];
+                cfr::traverse(&s.ctx(), 0, p, &s.hands.weights[p ^ 1], mode, &mut cpu);
+                let got = engine.root_hand_values(p, mode).unwrap();
+                assert_relative(&got, &cpu, 1e-5, &format!("player {p}, {mode:?}"));
+            }
+        }
+        drop(engine);
+        let Some((cpu, gpu)) = solve_both(cfg, 4) else { return Ok(()) };
+        let root = cpu.query(&[]).unwrap();
+        let ev_scale = root.ev.iter().fold(0f32, |m, x| m.max(x.abs()));
+        compare_nodes(&cpu, &gpu, 5e-5, 0.25 * (1.0 + ev_scale / 2500.0), &[]);
+    }
+}
+
+/// Every decision node, chance node and one-at-a-time terminal, evaluated
+/// by the CPU from the reach the GPU computed for it, has the GPU's values.
+/// Localizes a mismatch to a node kind (batched river showdowns are left
+/// out: the CPU only ever evaluates those inside `river::run`, which the
+/// decision-node checks cover).
+#[test]
+fn every_node_matches_cpu_given_gpu_reach() {
+    for cfg in [turn_config(), iso_turn_config(), allin_turn_config(), sampled_flop_config()] {
+        let Some(gpu) = device() else { return };
+        let mut s = Solver::new(cfg).unwrap();
+        randomize_storage(&mut s, 101);
+        let mut engine = engine_for(&mut s, gpu);
+        for mode in [Mode::Average, Mode::BestResponse] {
+            for p in 0..2 {
+                engine.traverse(p, mode).unwrap();
+                let values = engine.gpu.stream.clone_dtoh(&engine.values).unwrap();
+                let reach = engine.gpu.stream.clone_dtoh(&engine.reach).unwrap();
+                let pp = &engine.plan.players[p];
+                let (n, nq) = (pp.hands as usize, pp.opp_hands as usize);
+                let ctx = s.ctx();
+                let mut checked = 0;
+                for (id, node) in s.tree.nodes.iter().enumerate() {
+                    let terminal =
+                        matches!(node.kind, crate::tree::Kind::Fold(_) | crate::tree::Kind::Showdown);
+                    if terminal && engine.plan.scalar[id] == 0 {
+                        continue;
+                    }
+                    let slot = pp.slot[id] as usize;
+                    let r = &reach[slot * nq..(slot + 1) * nq];
+                    if r.iter().all(|&x| x == 0.0) {
+                        continue;
+                    }
+                    let mut cpu = vec![0f32; n];
+                    cfr::traverse(&ctx, id, p, r, mode, &mut cpu);
+                    let what = format!("{mode:?}, player {p}, node {id} ({:?} {:?})", node.kind, node.street);
+                    assert_relative(&values[id * n..(id + 1) * n], &cpu, 1e-5, &what);
+                    checked += 1;
+                }
+                assert!(checked > 100, "only {checked} nodes checked");
+            }
+        }
     }
 }

@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use crate::gpu::{Gpu, GpuError};
-use crate::{BettingState, SolveConfig, StorageMode};
+use crate::{BettingState, ChanceMode, SolveConfig, StorageMode};
 
 /// The device, or `None` (the test skips) on a machine without one. Any
 /// other failure to initialize fails the test.
@@ -69,8 +69,8 @@ pub(crate) fn river_config() -> SolveConfig {
     )
 }
 
-/// The same turn spot `batched_river_matches_recursion` uses (has chance
-/// nodes, so the GPU must decline it for now).
+/// The turn spot of `batched_river_matches_recursion`: 48 river cards, no
+/// suit isomorphism (the board has all four suits).
 pub(crate) fn turn_config() -> SolveConfig {
     config(
         "Qh9d4c2s",
@@ -80,6 +80,48 @@ pub(crate) fn turn_config() -> SolveConfig {
         4000,
         PostflopMenu::default(),
     )
+}
+
+/// A turn board where clubs and hearts are interchangeable (neither is on
+/// the board and the ranges are suit-symmetric), so river cards of one of
+/// them are solved through the other's.
+pub(crate) fn iso_turn_config() -> SolveConfig {
+    config(
+        "Qs9s4d2d",
+        "AQ, KQ, QJs, JTs, 99, 44, T9s, 87s, A5s, KJs, 65s",
+        "AA, KK, AQ, QT, 99, JJ, TT, 98s, KJs, 65s, AJs, 33",
+        600,
+        4000,
+        PostflopMenu::default(),
+    )
+}
+
+/// A short-stacked turn: a pot-sized bet is all-in, so after a call the
+/// chance node's children are showdowns rather than river decisions.
+pub(crate) fn allin_turn_config() -> SolveConfig {
+    config(
+        "Kc8d5h3s",
+        "AA, KK, KQ, 88, 55, A5s, 76s, QJs, JTs, 44, 98s",
+        "AK, KQ, KJ, 99, 33, A4s, T9s, 87s, 66, 76s",
+        1000,
+        900,
+        menu(&["100%"], &[]),
+    )
+}
+
+/// A flop with a stratified sample of 3 turns and 2 rivers per branch:
+/// two levels of chance nodes and sampling factors, still small.
+pub(crate) fn sampled_flop_config() -> SolveConfig {
+    let mut c = config(
+        "Ks7s2d",
+        "AK, KQ, 77, 22, A5s, QJs, T9s",
+        "AA, KK, AQ, QQ, JJ, 98s, 65s, A2s",
+        500,
+        3000,
+        menu(&["50%"], &["3x"]),
+    );
+    c.chance = ChanceMode::Sampled { turn: 3, river: 2, seed: 7 };
+    c
 }
 
 /// OOP facing a half-pot bet: ties pay something (unequal commitments),
@@ -123,6 +165,29 @@ fn random_range(seed: u64, density: f64) -> Vec<f32> {
     (0..1326)
         .map(|_| if rng.random::<f64>() < density { rng.random_range(0.05f32..=1.0) } else { 0.0 })
         .collect()
+}
+
+/// A random turn spot: board, sparse ranges, pot, stack, optionally raked
+/// (smaller than the river strategy's so the CPU side stays fast).
+pub(crate) fn arb_turn_config() -> impl Strategy<Value = SolveConfig> {
+    let board = prop::sample::subsequence((0u8..52).collect::<Vec<u8>>(), 4).prop_shuffle();
+    let ranges = ((any::<u64>(), 0.02f64..0.12), (any::<u64>(), 0.02f64..0.12));
+    let stakes = (100 as Chips..2000, 100 as Chips..5000);
+    (board, ranges, stakes, any::<bool>()).prop_map(|(board, ((s0, d0), (s1, d1)), (pot, stack), raked)| {
+        let board: Vec<Card> = board.into_iter().map(Card::from_index).collect();
+        let mut c = SolveConfig::new(
+            board,
+            [random_range(s0, d0), random_range(s1, d1)],
+            BettingState::street_start(Street::Turn, pot, [stack, stack], 100),
+            menu(&["50%", "100%"], &["100%"]),
+        );
+        c.storage = StorageMode::F32;
+        if raked {
+            c.rake_rate = 0.05;
+            c.rake_cap = 300.0;
+        }
+        c
+    })
 }
 
 /// A random river spot: board, ranges (sparse to dense), pot and stack

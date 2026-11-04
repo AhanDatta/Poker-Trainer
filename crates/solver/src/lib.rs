@@ -561,8 +561,10 @@ impl Solver {
         Ok(progress)
     }
 
-    /// Moves the solve to the GPU (experimental: for now only river roots
-    /// with `f32` storage). The current regrets and strategy sums are
+    /// Moves the solve to the GPU (experimental: river, turn and flop roots
+    /// with `f32` storage; compressed storage, which large flop trees use,
+    /// is declined, as is a tree that doesn't fit in free GPU memory). The
+    /// current regrets and strategy sums are
     /// uploaded, so a solve can continue on the GPU; results are copied back
     /// when `solve` returns, after which `query` and the other read methods
     /// work as usual. If the GPU fails during a solve, the solver discards

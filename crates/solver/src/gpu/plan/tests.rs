@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::eval::{eval_fold, eval_showdown};
-use crate::gpu::testutil::{arb_river_config, mid_street_config, river_config, turn_config};
+use crate::gpu::testutil::{
+    allin_turn_config, arb_river_config, arb_turn_config, iso_turn_config, mid_street_config, river_config,
+    sampled_flop_config, turn_config,
+};
 use crate::{SolveConfig, Solver};
 use proptest::prelude::*;
 use rand::rngs::StdRng;
@@ -116,10 +119,40 @@ fn river_plans_validate() {
     }
 }
 
+/// Turn and flop trees: every chance node scheduled, its children dealt a
+/// card, isomorphic cards present exactly when the spot has a symmetry.
 #[test]
-fn trees_with_chance_nodes_are_declined() {
-    let s = Solver::new(turn_config()).unwrap();
-    assert!(matches!(Plan::build(&s.ctx()), Err(GpuError::InvalidInput(_))));
+fn chance_plans_validate() {
+    for (name, cfg, iso) in [
+        ("turn", turn_config(), false),
+        ("isomorphic turn", iso_turn_config(), true),
+        ("all-in turn", allin_turn_config(), false),
+        // Sampled chance nodes don't use isomorphism, but all-in runouts are
+        // enumerated exactly and clubs/hearts are interchangeable on Ks7s2d.
+        ("sampled flop", sampled_flop_config(), true),
+    ] {
+        let (s, plan) = plan_for(cfg);
+        let chance_nodes =
+            s.tree.nodes.iter().filter(|n| matches!(n.kind, crate::tree::Kind::Chance)).count();
+        assert!(chance_nodes > 0, "{name}: no chance nodes");
+        for pp in &plan.players {
+            assert_eq!(pp.chance_nodes.len(), chance_nodes, "{name}");
+        }
+        assert_eq!(!plan.iso_child.is_empty(), iso, "{name}: isomorphic cards");
+        assert!(plan.num_tables > 1, "{name}: one strength table per final board");
+    }
+}
+
+/// The all-in turn has chance nodes whose children are showdowns.
+#[test]
+fn chance_children_can_be_terminals() {
+    let (_, plan) = plan_for(allin_turn_config());
+    let terminal_children = (0..plan.num_nodes as usize)
+        .filter(|&i| plan.actor[i] == CHANCE)
+        .flat_map(|i| plan.children(i).unwrap())
+        .filter(|&c| plan.actor[c] == NONE)
+        .count();
+    assert!(terminal_children > 0);
 }
 
 #[test]
@@ -176,6 +209,40 @@ fn validate_rejects_corrupted_plans() {
         mutate(&mut bad);
         assert!(matches!(bad.validate(), Err(GpuError::InvalidInput(_))), "{what}: accepted");
     }
+
+    // Chance-node fields, on an isomorphic turn tree.
+    let (_, plan) = plan_for(iso_turn_config());
+    plan.validate().unwrap();
+    let chance = (0..plan.num_nodes as usize).find(|&i| plan.actor[i] == CHANCE).unwrap();
+    let dealt = plan.first_child[chance] as usize;
+    let mutations: Vec<(&str, Mutation)> = vec![
+        ("dealt card missing", Box::new(move |p| p.card[dealt] = NONE)),
+        ("dealt card out of the deck", Box::new(move |p| p.card[dealt] = 52)),
+        ("zero chance factor", Box::new(move |p| p.chance_factor[chance] = 0.0)),
+        ("non-finite chance factor", Box::new(move |p| p.chance_factor[chance] = f32::INFINITY)),
+        ("isomorphic card's child out of range", Box::new(|p| p.iso_child[0] = 60)),
+        ("bad suit pair", Box::new(|p| p.iso_pair[0] = 6)),
+        (
+            "isomorphic range past the list",
+            Box::new(move |p| p.iso_count[chance] = p.iso_child.len() as u32 + 1),
+        ),
+        ("isomorphic cards on a decision node", Box::new(|p| p.iso_count[0] = 1)),
+        (
+            "permutation out of range",
+            Box::new(|p| {
+                let row = p.iso_pair[0] as usize * p.players[1].hands as usize;
+                p.players[1].perm[row] = p.players[1].hands;
+            }),
+        ),
+        ("chance child slot shifted", Box::new(move |p| p.players[0].child_slot[chance] += 1)),
+        ("chance node in the opponent list", Box::new(move |p| p.actor[chance] = 1)),
+        ("opponent card out of the deck", Box::new(|p| p.players[0].opp_cards[0] = pack_cards(1, 60))),
+    ];
+    for (what, mutate) in mutations {
+        let mut bad = plan.clone();
+        mutate(&mut bad);
+        assert!(matches!(bad.validate(), Err(GpuError::InvalidInput(_))), "{what}: accepted");
+    }
 }
 
 /// Guards against vacuous property tests: most generated spots must be
@@ -216,9 +283,58 @@ proptest! {
     }
 
     #[test]
+    fn random_turn_plans_validate(cfg in arb_turn_config()) {
+        let Ok(s) = Solver::new(cfg) else { return Ok(()) };
+        let plan = Plan::build(&s.ctx()).unwrap();
+        prop_assert!(plan.validate().is_ok());
+    }
+
+    #[test]
     fn random_river_plans_validate(cfg in arb_river_config()) {
         let Ok(s) = Solver::new(cfg) else { return Ok(()) };
         let plan = Plan::build(&s.ctx()).unwrap();
         prop_assert!(plan.validate().is_ok());
+    }
+}
+
+/// Terminals follow the CPU evaluator that handles them: batched inside
+/// river subtrees, one at a time before the river and right after an all-in
+/// runout, and one at a time everywhere when batching is off.
+#[test]
+fn scalar_flags_follow_the_cpu_evaluators() {
+    use crate::tree::Kind;
+    let (_, plan) = plan_for(river_config());
+    assert!(plan.scalar.iter().all(|&x| x == 0), "river root: everything is batched");
+
+    let (s, plan) = plan_for(allin_turn_config());
+    let mut seen = [0usize; 3];
+    for (id, node) in s.tree.nodes.iter().enumerate() {
+        let scalar = plan.scalar[id] == 1;
+        match node.kind {
+            Kind::Fold(_) if node.street == holdem::Street::Turn => {
+                assert!(scalar, "turn fold {id}");
+                seen[0] += 1;
+            }
+            Kind::Showdown => {
+                // After an all-in call the chance node's child is the
+                // showdown itself; otherwise a river decision node comes first.
+                let parent_is_chance = (0..s.tree.nodes.len()).any(|q| {
+                    matches!(s.tree.nodes[q].kind, Kind::Chance) && s.tree.nodes[q].children().contains(&id)
+                });
+                assert_eq!(scalar, parent_is_chance, "showdown {id}");
+                seen[if parent_is_chance { 1 } else { 2 }] += 1;
+            }
+            Kind::Fold(_) => assert!(!scalar, "river fold {id}"),
+            _ => assert!(!scalar, "non-terminal {id}"),
+        }
+    }
+    assert!(seen.iter().all(|&k| k > 0), "spot lacks a terminal kind: {seen:?}");
+
+    let mut s = Solver::new(turn_config()).unwrap();
+    s.set_batch_river(false);
+    let plan = Plan::build(&s.ctx()).unwrap();
+    for (id, node) in s.tree.nodes.iter().enumerate() {
+        let terminal = matches!(node.kind, Kind::Fold(_) | Kind::Showdown);
+        assert_eq!(plan.scalar[id] == 1, terminal, "batching off, node {id}");
     }
 }

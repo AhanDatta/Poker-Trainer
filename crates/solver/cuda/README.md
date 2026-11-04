@@ -12,15 +12,17 @@ MSVC as the host compiler. A built binary needs only the NVIDIA driver.
 ## Status
 
 Experimental. `Solver::use_gpu()` (with `--features gpu`) moves a solve to the
-GPU; for now only **river roots with `f32` storage** (trees without chance
-nodes). Turn and flop roots are declined with an error and stay on the CPU.
+GPU: river and turn roots, and flop roots small enough for `f32` storage
+(sampled runouts). **Compressed storage** (16-bit, which exact flop trees use)
+is not supported yet, and a tree that doesn't fit in free GPU memory (keeping a
+0.5 GB margin) is declined; both stay on the CPU.
 
 | File | Contents | CPU twin |
 |---|---|---|
 | `include/solver/core.cuh` | views, exact arithmetic, encodings shared with `src/gpu/plan.rs` | |
 | `include/solver/strategy.cuh` | per-hand regret matching and normalization | `cfr::regret_match_into`, `cfr::normalize_in_place` |
-| `kernels/traverse.cu` | level-by-level traversal: opponent split (top-down), own-node regret update and opponent sum (bottom-up) | `river::run`, `cfr::own_node_update` |
-| `kernels/terminal.cu` | fold and showdown values (card removal by inclusion–exclusion, prefix sums) | `eval::fold_batch`, `eval::showdown_batch` |
+| `kernels/traverse.cu` | level-by-level traversal: opponent and chance splits (top-down), own-node regret update, opponent and chance sums (bottom-up) | `river::run`, `cfr::chance`, `cfr::own_node_update` |
+| `kernels/terminal.cu` | fold and showdown values (card removal by inclusion–exclusion, prefix sums), with the rounding of the CPU evaluator that handles each terminal | `eval::fold_batch` / `eval_fold`, `eval::showdown_batch` / `eval_showdown` |
 | `kernels/regret.cu` | standalone regret matching | `cfr::regret_match_into` |
 | `kernels/selftest.cu` | deliberate out-of-bounds read for `tests/gpu_fault.rs` | |
 
@@ -78,19 +80,30 @@ Kernels mirror the CPU's arithmetic operation for operation:
 - **f32 work** (regret matching, regret and strategy-sum updates, node
   values) uses `mul_rn` / `add_rn` / `sub_rn` (`core.cuh`), which nvcc can't
   fuse into FMAs, in the CPU's order. Same inputs give bit-identical results.
+- **Two CPU evaluators.** The CPU batches the terminals of river subtrees
+  (`river::run`) and evaluates the others one at a time (folds before the
+  river, showdowns right after an all-in runout, or everything with batching
+  off); the two group and round their sums differently. The plan marks each
+  terminal with the CPU evaluator that handles it (`Plan::scalar`), and the
+  kernels use that one's operation order. Mirroring only the batched one left
+  the turn a rounding step off, which regret matching amplified to visible
+  regret differences.
 - **Terminal sums** run in **f64**, as on the CPU, even though the GPU's f64
   rate is 1/64 of its f32 rate: a showdown does a few thousand f64 adds, a tiny
   share of an iteration's work, so compensated f32 summation isn't needed. Only
   the summation order differs (tree reductions and prefix scans instead of one
   sweep), which can move a result by at most one f32 rounding step.
 
-Measured on the river tests: GPU and CPU solves agree **bit for bit** (every
-strategy, EV and regret identical after 5 iterations, on fixed and on 24 random
-spots). The tests still allow the CPU-vs-CPU tolerances of
+Measured: GPU and CPU solves agree **bit for bit** (every strategy, EV and
+regret identical after 5 iterations) on the river, turn, suit-isomorphic turn,
+all-in turn and sampled flop spots, on 24 random river and 10 random turn
+spots, and with river batching off. The tests still allow the CPU-vs-CPU tolerances of
 `batched_river_matches_recursion` (5e-5 in strategy, 0.25 chips in EV after 5
 iterations), because a different summation order may occasionally round
-differently. Seeding a kernel bug (wrong regret discount, dropped tie term, one
-card's removal skipped) makes several of these tests fail.
+differently. Seeding a kernel bug makes several of these tests fail: wrong
+regret discount, dropped tie term, one card's removal skipped, dealt card not
+blocking opponent or own hands, isomorphic cards skipped or unpermuted, chance
+factor dropped, wrong evaluator rounding.
 
 ## Performance
 
@@ -104,19 +117,42 @@ iterations, exploitability and root strategy.
 |---|---|---|---|---|
 | river `Ks7d2c9h4s` (5 runs) | 80 | 9.9 ms (9.6–10.9) | 10.6 ms (9.8–11.8) | 13.5 ms (13.2–14.5) + 0.15–0.3 s setup |
 | river, fixed 3000 / 1000 iterations | | 0.132 ms/iter | 0.135 ms/iter | 0.155–0.167 ms/iter (CPU 0.129–0.138 in the same 1000-iteration runs) |
-| turn `Ks7d2c9h` (3 runs) | 168 | 3.09 s (3.00–3.29), 18.4 ms/iter | 3.08 s (2.97–3.13), 18.3 ms/iter | not yet |
-| flop-fast `Ks7d2c`, 8 × 6 sampled (2 runs) | 116 | 4.67 s, 40.2 ms/iter | 4.60 s, 39.7 ms/iter | not yet |
-| flop-exact `Ks7s2d` (2 runs) | 184 | 152.7–155.9 s, 830–847 ms/iter | 151.2–155.2 s, 822–843 ms/iter | not yet |
+| turn `Ks7d2c9h` (3 runs) | 168 | 3.09 s (3.00–3.29), 18.4 ms/iter | 3.08 s (2.97–3.13), 18.3 ms/iter | 1.95 s (1.94–1.95), 11.6 ms/iter, + 0.4–0.46 s setup |
+| flop-fast `Ks7d2c`, 8 × 6 sampled (2 runs) | 116 | 4.67 s, 40.2 ms/iter | 4.60 s, 39.7 ms/iter | 2.47 s (2.45–2.49), 21.3 ms/iter, + 0.5–0.6 s setup |
+| flop-exact `Ks7s2d` (2 runs) | 184 | 152.7–155.9 s, 830–847 ms/iter | 151.2–155.2 s, 822–843 ms/iter | not yet (16-bit storage) |
 
 Peak memory (this branch's bench; `main`'s can't measure it on Windows): river
 0.01 GB, turn 0.15 GB, flop-fast 0.26 GB, flop-exact 2.98 GB (16-bit storage).
 The GPU river process peaks at 0.16 GB, mostly the CUDA runtime.
 
+The GPU rows for the turn and the flop come from a second session (same
+binaries, CPU and GPU interleaved), in which the CPU ran 10–15% slower than in
+the first (turn 3.42–3.76 s, flop-fast 4.85–5.29 s), probably from background
+load; the GPU times varied by under 2%. Against either CPU session the GPU is
+**1.6–1.8× faster on the turn and 1.9–2.1× on the sampled flop**, with the same
+iterations, exploitability and root strategy. The setup (CUDA context, plan,
+upload) is paid once per solve.
+
 The GPU loses on the river, as expected. The tree has 14 decision nodes, so
 an iteration is about 60 small kernel launches, and launch latency, not
 arithmetic, sets the time. Creating the CUDA context costs another 0.15–0.3 s
-once per process. Turn and flop trees put hundreds to thousands of nodes into
-each launch; that is where the GPU has to pay off.
+once per process.
+
+Where the GPU time goes (Nsight Systems, 60 turn iterations, 122 traversals,
+10.5 ms of kernel time per iteration of 11.6 ms wall):
+
+| Kernel | Share | Per traversal |
+|---|---|---|
+| `showdown_values` | 46% | 2.4 ms (about 4,300 showdowns) |
+| `fold_values` | 30% | 1.6 ms (about 3,600 folds) |
+| `opponent_split` | 11% | 0.6 ms |
+| `own_update` | 7% | 0.4 ms |
+| `opponent_sum` | 4% | 0.2 ms |
+| `chance_split` + `chance_sum` | 1% | 0.06 ms |
+
+The terminals dominate. Each terminal block recomputes reach totals and per-card
+sums that terminals sharing a reach slot could share, and the f64 scans are
+sync-heavy; that is the first target for optimization.
 
 ## Running the GPU checks
 

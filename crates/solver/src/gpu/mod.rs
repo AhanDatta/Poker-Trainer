@@ -67,6 +67,9 @@ pub enum GpuError {
     Driver(DriverError),
     /// Inputs rejected on the host before any launch.
     InvalidInput(String),
+    /// The solve needs more device memory than is free (bytes; a margin
+    /// is kept for the display and the CUDA runtime).
+    OutOfMemory { needed: u64, available: u64 },
 }
 
 impl fmt::Display for GpuError {
@@ -84,6 +87,12 @@ impl fmt::Display for GpuError {
             GpuError::NoDevice => write!(f, "no CUDA device found"),
             GpuError::Driver(e) => write!(f, "CUDA error: {e}"),
             GpuError::InvalidInput(s) => write!(f, "invalid GPU input: {s}"),
+            GpuError::OutOfMemory { needed, available } => write!(
+                f,
+                "the solve needs {:.2} GB of GPU memory, {:.2} GB is available",
+                *needed as f64 / 1e9,
+                *available as f64 / 1e9
+            ),
         }
     }
 }
@@ -172,6 +181,8 @@ struct Kernels {
     opponent_split: CudaFunction,
     own_update: CudaFunction,
     opponent_sum: CudaFunction,
+    chance_split: CudaFunction,
+    chance_sum: CudaFunction,
     fold_values: CudaFunction,
     showdown_values: CudaFunction,
 }
@@ -220,6 +231,8 @@ impl Gpu {
             opponent_split: traverse.load_function("opponent_split")?,
             own_update: traverse.load_function("own_update")?,
             opponent_sum: traverse.load_function("opponent_sum")?,
+            chance_split: traverse.load_function("chance_split")?,
+            chance_sum: traverse.load_function("chance_sum")?,
             fold_values: terminal.load_function("fold_values")?,
             showdown_values: terminal.load_function("showdown_values")?,
         };

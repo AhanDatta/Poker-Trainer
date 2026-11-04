@@ -70,6 +70,9 @@ struct DevicePlayer {
     same: Buffer<u32>,
     opp_card_off: Buffer<u32>,
     opp_card_hands: Buffer<u32>,
+    chance_nodes: Buffer<u32>,
+    opp_cards: Buffer<u32>,
+    perm: Buffer<u32>,
     opp_weights: Buffer<f32>,
     opp_off: Buffer<u32>,
     opp_len: Buffer<u32>,
@@ -100,6 +103,9 @@ impl DevicePlayer {
             same: gpu.upload(&pp.same)?,
             opp_card_off: gpu.upload(&pp.opp_card_off)?,
             opp_card_hands: gpu.upload(&pp.opp_card_hands)?,
+            chance_nodes: gpu.upload(&pp.chance_nodes)?,
+            opp_cards: gpu.upload(&pp.opp_cards)?,
+            perm: gpu.upload(&pp.perm)?,
             opp_weights: gpu.upload(&pp.opp_weights)?,
             opp_off: gpu.upload(&t.opp_off)?,
             opp_len: gpu.upload(&t.opp_len)?,
@@ -167,13 +173,45 @@ fn per_terminal_grid(terminals: u32, shared_mem_bytes: u32) -> LaunchConfig {
     }
 }
 
+/// The per-node arrays of the plan on the device.
+struct DeviceTree {
+    actions: Buffer<u32>,
+    first_child: Buffer<u32>,
+    offsets: Buffer<u32>,
+    cards: Buffer<u32>,
+    chance_factor: Buffer<f32>,
+    iso_start: Buffer<u32>,
+    iso_count: Buffer<u32>,
+    iso_child: Buffer<u32>,
+    iso_pair: Buffer<u32>,
+    scalar: Buffer<u32>,
+}
+
+impl DeviceTree {
+    fn upload(gpu: &Gpu, plan: &Plan) -> Result<DeviceTree, GpuError> {
+        Ok(DeviceTree {
+            actions: gpu.upload(&plan.actions)?,
+            first_child: gpu.upload(&plan.first_child)?,
+            offsets: gpu.upload(&plan.offset)?,
+            cards: gpu.upload(&plan.card)?,
+            chance_factor: gpu.upload(&plan.chance_factor)?,
+            iso_start: gpu.upload(&plan.iso_start)?,
+            iso_count: gpu.upload(&plan.iso_count)?,
+            iso_child: gpu.upload(&plan.iso_child)?,
+            iso_pair: gpu.upload(&plan.iso_pair)?,
+            scalar: gpu.upload(&plan.scalar)?,
+        })
+    }
+}
+
+/// Device memory left free for the display and the CUDA runtime.
+const MEMORY_MARGIN: u64 = 512 << 20;
+
 /// A game tree with its regrets and strategy sums on the GPU.
 pub(crate) struct Engine {
     gpu: Gpu,
     plan: Plan,
-    actions: Buffer<u32>,
-    first_child: Buffer<u32>,
-    offsets: Buffer<u32>,
+    tree: DeviceTree,
     players: [DevicePlayer; 2],
     regrets: CudaSlice<f32>,
     sums: CudaSlice<f32>,
@@ -199,10 +237,15 @@ impl Engine {
         let reach_len = plan.players.iter().map(|pp| pp.num_slots as usize * pp.opp_hands as usize).max();
         let values_len = plan.players.iter().map(|pp| plan.num_nodes as usize * pp.hands as usize).max();
         let slots_len = plan.players.iter().map(|pp| pp.num_slots as usize).max();
+        let scratch = (reach_len.unwrap_or(1) + values_len.unwrap_or(1) + slots_len.unwrap_or(1)) as u64 * 4;
+        let needed = plan.device_bytes() + 2 * 4 * len as u64 + scratch;
+        let (free, _total) = gpu.stream.context().mem_get_info()?;
+        let available = (free as u64).saturating_sub(MEMORY_MARGIN);
+        if needed > available {
+            return Err(GpuError::OutOfMemory { needed, available });
+        }
         let engine = Engine {
-            actions: gpu.upload(&plan.actions)?,
-            first_child: gpu.upload(&plan.first_child)?,
-            offsets: gpu.upload(&plan.offset)?,
+            tree: DeviceTree::upload(&gpu, &plan)?,
             players: [
                 DevicePlayer::upload(&gpu, &plan.players[0])?,
                 DevicePlayer::upload(&gpu, &plan.players[1])?,
@@ -279,8 +322,7 @@ impl Engine {
     /// Enqueues one traversal by player `p`; its root values end up in row 0
     /// of the value buffer.
     fn traverse(&mut self, p: usize, mode: Mode) -> Result<(), GpuError> {
-        let Engine { gpu, plan, actions, first_child, offsets, players, regrets, sums, reach, values, alive } =
-            self;
+        let Engine { gpu, plan, tree, players, regrets, sums, reach, values, alive } = self;
         let (Some(pp), Some(dp)) = (plan.players.get(p), players.get(p)) else {
             return Err(invalid("player out of range"));
         };
@@ -310,23 +352,43 @@ impl Engine {
             unsafe { l.launch(cfg) }?;
         }
 
-        // 2. Top-down: the opponent's strategy splits its reach.
-        for lv in pp.levels.iter().filter(|lv| lv.opp_count > 0) {
-            let mut l = stream.launch_builder(&kernels.opponent_split);
-            push(&mut l, &dp.opp_nodes);
-            l.arg(&lv.opp_start).arg(&lv.opp_count);
-            push(&mut l, actions);
-            push(&mut l, offsets);
-            push(&mut l, &dp.slots);
-            push(&mut l, &dp.child_slots);
-            l.arg(&*regrets).arg(&plan.storage_len);
-            push_mut(&mut l, sums, &plan.storage_len);
-            push_mut(&mut l, reach, &reach_len);
-            push_mut(&mut l, alive, &alive_len);
-            l.arg(&opp_hands).arg(&m.mode).arg(&m.strategy_discount).arg(&m.reach_weighted);
-            // SAFETY: arguments match `opponent_split`; every index the
-            // kernel reads comes from the validated plan.
-            unsafe { l.launch(per_hand_grid(opp_hands, lv.opp_count)) }?;
+        // 2. Top-down: the opponent's strategy, and the dealt cards, split
+        // the opponent's reach.
+        for lv in &pp.levels {
+            if lv.opp_count > 0 {
+                let mut l = stream.launch_builder(&kernels.opponent_split);
+                push(&mut l, &dp.opp_nodes);
+                l.arg(&lv.opp_start).arg(&lv.opp_count);
+                push(&mut l, &tree.actions);
+                push(&mut l, &tree.offsets);
+                push(&mut l, &dp.slots);
+                push(&mut l, &dp.child_slots);
+                l.arg(&*regrets).arg(&plan.storage_len);
+                push_mut(&mut l, sums, &plan.storage_len);
+                push_mut(&mut l, reach, &reach_len);
+                push_mut(&mut l, alive, &alive_len);
+                l.arg(&opp_hands).arg(&m.mode).arg(&m.strategy_discount).arg(&m.reach_weighted);
+                // SAFETY: arguments match `opponent_split`; every index the
+                // kernel reads comes from the validated plan.
+                unsafe { l.launch(per_hand_grid(opp_hands, lv.opp_count)) }?;
+            }
+            if lv.chance_count > 0 {
+                let mut l = stream.launch_builder(&kernels.chance_split);
+                push(&mut l, &dp.chance_nodes);
+                l.arg(&lv.chance_start).arg(&lv.chance_count);
+                push(&mut l, &tree.actions);
+                push(&mut l, &tree.first_child);
+                push(&mut l, &tree.cards);
+                push(&mut l, &tree.chance_factor);
+                push(&mut l, &dp.slots);
+                push(&mut l, &dp.child_slots);
+                push(&mut l, &dp.opp_cards);
+                push_mut(&mut l, reach, &reach_len);
+                push_mut(&mut l, alive, &alive_len);
+                l.arg(&opp_hands);
+                // SAFETY: arguments match `chance_split`; indices are validated.
+                unsafe { l.launch(per_hand_grid(opp_hands, lv.chance_count)) }?;
+            }
         }
 
         // 3. Terminals.
@@ -335,6 +397,7 @@ impl Engine {
             push(&mut l, &dp.folds);
             push(&mut l, &dp.fold_payoff);
             push(&mut l, &dp.slots);
+            push(&mut l, &tree.scalar);
             l.arg(&*alive).arg(&alive_len);
             l.arg(&*reach).arg(&reach_len);
             push_mut(&mut l, values, &values_len);
@@ -359,6 +422,7 @@ impl Engine {
             push(&mut l, &dp.lose);
             push(&mut l, &dp.tie);
             push(&mut l, &dp.slots);
+            push(&mut l, &tree.scalar);
             l.arg(&*alive).arg(&alive_len);
             l.arg(&*reach).arg(&reach_len);
             push_mut(&mut l, values, &values_len);
@@ -384,9 +448,9 @@ impl Engine {
                 let mut l = stream.launch_builder(&kernels.own_update);
                 push(&mut l, &dp.own_nodes);
                 l.arg(&lv.own_start).arg(&lv.own_count);
-                push(&mut l, actions);
-                push(&mut l, offsets);
-                push(&mut l, first_child);
+                push(&mut l, &tree.actions);
+                push(&mut l, &tree.offsets);
+                push(&mut l, &tree.first_child);
                 push(&mut l, &dp.slots);
                 l.arg(&*alive).arg(&alive_len);
                 push_mut(&mut l, regrets, &plan.storage_len);
@@ -400,14 +464,34 @@ impl Engine {
                 let mut l = stream.launch_builder(&kernels.opponent_sum);
                 push(&mut l, &dp.opp_nodes);
                 l.arg(&lv.opp_start).arg(&lv.opp_count);
-                push(&mut l, actions);
-                push(&mut l, first_child);
+                push(&mut l, &tree.actions);
+                push(&mut l, &tree.first_child);
                 push(&mut l, &dp.slots);
                 l.arg(&*alive).arg(&alive_len);
                 push_mut(&mut l, values, &values_len);
                 l.arg(&hands);
                 // SAFETY: arguments match `opponent_sum`; indices are validated.
                 unsafe { l.launch(per_hand_grid(hands, lv.opp_count)) }?;
+            }
+            if lv.chance_count > 0 {
+                let mut l = stream.launch_builder(&kernels.chance_sum);
+                push(&mut l, &dp.chance_nodes);
+                l.arg(&lv.chance_start).arg(&lv.chance_count);
+                push(&mut l, &tree.actions);
+                push(&mut l, &tree.first_child);
+                push(&mut l, &tree.cards);
+                push(&mut l, &tree.iso_start);
+                push(&mut l, &tree.iso_count);
+                push(&mut l, &tree.iso_child);
+                push(&mut l, &tree.iso_pair);
+                push(&mut l, &dp.perm);
+                push(&mut l, &dp.my_cards);
+                push(&mut l, &dp.slots);
+                l.arg(&*alive).arg(&alive_len);
+                push_mut(&mut l, values, &values_len);
+                l.arg(&hands);
+                // SAFETY: arguments match `chance_sum`; indices are validated.
+                unsafe { l.launch(per_hand_grid(hands, lv.chance_count)) }?;
             }
         }
         Ok(())

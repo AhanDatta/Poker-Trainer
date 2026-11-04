@@ -1,22 +1,25 @@
 // Level-synchronous traversal of the game tree for one traverser.
 //
-// CPU twin: `river::run` (and `cfr::own_node_update` for the regret
-// update). The host plan (src/gpu/plan.rs) lists the decision nodes of
-// every tree level; one launch handles one level:
+// CPU twins: `river::run` and `cfr::chance` (and `cfr::own_node_update` for
+// the regret update). The host plan (src/gpu/plan.rs) lists the
+// non-terminal nodes of every tree level; one launch handles one kind of
+// node on one level:
 //
 // 1. `begin_traversal`: the root's opponent reach and the "alive" flags.
-// 2. Top-down, `opponent_split` per level: the opponent's strategy splits
-//    its reach among the children (in CFR mode its strategy sums are
-//    updated on the way). A node whose opponent reach is all zero is dead:
-//    worth 0 and never updated, exactly as on the CPU.
+// 2. Top-down, per level: `opponent_split` (the opponent's strategy splits
+//    its reach among the children; in CFR mode its strategy sums are
+//    updated on the way) and `chance_split` (each dealt card's child gets
+//    the reach times the chance factor, minus opponent hands holding the
+//    card). A node whose opponent reach is all zero is dead: worth 0 and
+//    never updated, exactly as on the CPU.
 // 3. Terminals (terminal.cu).
-// 4. Bottom-up, `own_update` and `opponent_sum` per level: node values,
-//    and in CFR mode the traverser's regret updates.
+// 4. Bottom-up, per level: `own_update` (node values and, in CFR mode, the
+//    traverser's regret updates), `opponent_sum` and `chance_sum`.
 //
 // Reach lives in "slots" of `opp_hands` floats; the traverser's own nodes
-// pass their slot to their children unchanged, so only opponent nodes write
-// reach. Values live in one row of `hands` floats per tree node, and every
-// node's row is written exactly once per traversal.
+// pass their slot to their children unchanged, so only opponent and chance
+// nodes write reach. Values live in one row of `hands` floats per tree
+// node, and every node's row is written exactly once per traversal.
 //
 // Threads: x covers hands, y walks the level's nodes (grid-stride), so a
 // block always works on a single node and branches on node state are
@@ -288,5 +291,152 @@ extern "C" __global__ void opponent_sum(const u32* level_ptr,
       sum = add_rn(sum, row(values, child0 + a, hands)[h]);
     }
     out = sum;
+  }
+}
+
+/// Top-down step at the chance nodes of one level (CPU: `cfr::chance`):
+/// child `a` (dealt card `card[child]`) gets the opponent's reach times the
+/// chance factor, and 0 for opponent hands holding that card.
+extern "C" __global__ void chance_split(const u32* level_ptr,
+                                        u32 level_len,
+                                        u32 level_start,
+                                        u32 level_count,
+                                        const u32* actions_ptr,
+                                        u32 actions_len,
+                                        const u32* first_child_ptr,
+                                        u32 first_child_len,
+                                        const u32* cards_ptr,
+                                        u32 cards_len,
+                                        const float* factor_ptr,
+                                        u32 factor_len,
+                                        const u32* slots_ptr,
+                                        u32 slots_len,
+                                        const u32* child_slots_ptr,
+                                        u32 child_slots_len,
+                                        const u32* opp_cards_ptr,
+                                        u32 opp_cards_len,
+                                        float* reach_ptr,
+                                        u32 reach_len,
+                                        u32* alive_ptr,
+                                        u32 alive_len,
+                                        u32 opp_hands) {
+  using namespace solver;
+  const auto level = view(level_ptr, level_len).subspan(level_start, level_count);
+  const auto actions = view(actions_ptr, actions_len);
+  const auto first_child = view(first_child_ptr, first_child_len);
+  const auto cards = view(cards_ptr, cards_len);
+  const auto factors = view(factor_ptr, factor_len);
+  const auto slots = view(slots_ptr, slots_len);
+  const auto child_slots = view(child_slots_ptr, child_slots_len);
+  const auto opp_cards = view(opp_cards_ptr, opp_cards_len);
+  const auto reach = view(reach_ptr, reach_len);
+  const auto alive = view(alive_ptr, alive_len);
+
+  const u32 h = hand_index();
+  const bool valid = h < opp_hands;
+  const CardPair hand = valid ? unpack_cards(opp_cards[h]) : CardPair{kNone, kNone};
+  for (u32 k = blockIdx.y; k < level_count; k += gridDim.y) {
+    const u32 node = level[k];
+    const u32 slot = slots[node];
+    if (alive[slot] == 0u) {
+      continue;  // dead: no reach for the children
+    }
+    const u32 child0 = first_child[node];
+    const u32 first_child_slot = child_slots[node];
+    const float factor = factors[node];
+    const float parent = valid ? row(reach, slot, opp_hands)[h] : 0.0f;
+    for (const u32 a : indices(actions[node])) {
+      float child = 0.0f;
+      if (valid) {
+        child = holds(hand, cards[child0 + a]) ? 0.0f : mul_rn(parent, factor);
+        row(reach, first_child_slot + a, opp_hands)[h] = child;
+      }
+      // Every thread of the block reaches this (same node, same children).
+      if (__syncthreads_or(child != 0.0f) != 0 && threadIdx.x == 0) {
+        mark_alive(alive[first_child_slot + a]);
+      }
+    }
+  }
+}
+
+/// Bottom-up step at the chance nodes of one level (CPU: `cfr::chance`):
+/// the sum over dealt cards of the children's values, with the traverser's
+/// hands holding the card counting 0, plus each suit-isomorphic card's
+/// value read from its canonical child through the suit-swap permutation.
+/// Accumulated in f64 in the CPU's order.
+extern "C" __global__ void chance_sum(const u32* level_ptr,
+                                      u32 level_len,
+                                      u32 level_start,
+                                      u32 level_count,
+                                      const u32* actions_ptr,
+                                      u32 actions_len,
+                                      const u32* first_child_ptr,
+                                      u32 first_child_len,
+                                      const u32* cards_ptr,
+                                      u32 cards_len,
+                                      const u32* iso_start_ptr,
+                                      u32 iso_start_len,
+                                      const u32* iso_count_ptr,
+                                      u32 iso_count_len,
+                                      const u32* iso_child_ptr,
+                                      u32 iso_child_len,
+                                      const u32* iso_pair_ptr,
+                                      u32 iso_pair_len,
+                                      const u32* perm_ptr,
+                                      u32 perm_len,
+                                      const u32* my_cards_ptr,
+                                      u32 my_cards_len,
+                                      const u32* slots_ptr,
+                                      u32 slots_len,
+                                      const u32* alive_ptr,
+                                      u32 alive_len,
+                                      float* values_ptr,
+                                      u32 values_len,
+                                      u32 hands) {
+  using namespace solver;
+  const auto level = view(level_ptr, level_len).subspan(level_start, level_count);
+  const auto actions = view(actions_ptr, actions_len);
+  const auto first_child = view(first_child_ptr, first_child_len);
+  const auto cards = view(cards_ptr, cards_len);
+  const auto iso_start = view(iso_start_ptr, iso_start_len);
+  const auto iso_count = view(iso_count_ptr, iso_count_len);
+  const auto iso_child = view(iso_child_ptr, iso_child_len);
+  const auto iso_pair = view(iso_pair_ptr, iso_pair_len);
+  const auto perm = view(perm_ptr, perm_len);
+  const auto my_cards = view(my_cards_ptr, my_cards_len);
+  const auto slots = view(slots_ptr, slots_len);
+  const auto alive = view(alive_ptr, alive_len);
+  const auto values = view(values_ptr, values_len);
+
+  const u32 h = hand_index();
+  if (h >= hands) {
+    return;  // no block-wide synchronization in this kernel
+  }
+  // Value of `child` for hand `j`: 0 if `j` holds the child's card.
+  const auto child_value = [&](u32 child, u32 j) -> double {
+    if (holds(unpack_cards(my_cards[j]), cards[child])) {
+      return 0.0;
+    }
+    return static_cast<double>(row(values, child, hands)[j]);
+  };
+  for (u32 k = blockIdx.y; k < level_count; k += gridDim.y) {
+    const u32 node = level[k];
+    float& out = row(values, node, hands)[h];
+    if (alive[slots[node]] == 0u) {
+      out = 0.0f;
+      continue;
+    }
+    const u32 child0 = first_child[node];
+    double sum = 0.0;
+    for (const u32 a : indices(actions[node])) {
+      sum = add_rn(sum, child_value(child0 + a, h));
+    }
+    const auto isomorphic = iso_child.subspan(iso_start[node], iso_count[node]);
+    const auto pairs = iso_pair.subspan(iso_start[node], iso_count[node]);
+    for (const u32 e : indices(static_cast<u32>(isomorphic.size()))) {
+      const u32 j = row(perm, pairs[e], hands)[h];
+      sum = add_rn(sum, child_value(child0 + isomorphic[e], j));
+    }
+    out = to_f32(sum);
   }
 }
