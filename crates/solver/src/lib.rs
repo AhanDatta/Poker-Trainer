@@ -569,15 +569,16 @@ impl Solver {
     /// when `solve` returns, after which `query` and the other read methods
     /// work as usual. If the GPU fails during a solve, the solver discards
     /// the GPU state, restarts the solve from scratch on the CPU, and
-    /// [`Self::gpu_error`] says what happened.
+    /// [`Self::gpu_error`] says what happened. `precision` picks how
+    /// terminal sums are accumulated ([`gpu::GpuPrecision`]).
     #[cfg(feature = "gpu")]
-    pub fn use_gpu(&mut self) -> Result<(), gpu::GpuError> {
+    pub fn use_gpu(&mut self, precision: gpu::GpuPrecision) -> Result<(), gpu::GpuError> {
         let plan = gpu::Plan::build(&self.ctx())?;
         let device = gpu::Gpu::new()?;
         let (regrets, sums) = self.store.f32_buffers_mut().ok_or_else(|| {
             gpu::GpuError::InvalidInput("compressed storage isn't supported on the GPU yet".into())
         })?;
-        self.gpu = Some(Box::new(gpu::Engine::new(device, plan, regrets, sums)?));
+        self.gpu = Some(Box::new(gpu::Engine::new(device, plan, regrets, sums, precision)?));
         self.gpu_error = None;
         Ok(())
     }

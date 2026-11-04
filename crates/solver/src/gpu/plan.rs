@@ -22,6 +22,12 @@ pub(crate) const CHANCE: u32 = 2;
 /// Cards in the deck.
 pub(crate) const CARDS: usize = 52;
 
+/// Largest normalized payoff and range weight the plan accepts: with at most
+/// 1326 hands, every product the terminal kernels form stays below 1e22,
+/// far inside f32's (and so double-single's) range of 3.4e38.
+pub(crate) const MAX_PAYOFF: f64 = 1e12;
+pub(crate) const MAX_WEIGHT: f32 = 1e6;
+
 /// Suit pairs (`iso::PAIRS`), the rows of a permutation table.
 pub(crate) const SUIT_PAIRS: usize = 6;
 
@@ -624,7 +630,9 @@ impl Plan {
         ensure(pp.showdown_table.iter().all(|&t| t < self.num_tables), || {
             "showdown table out of range".into()
         })?;
-        let finite = |v: &[f64]| v.iter().all(|x| x.is_finite());
+        // Finite, and small enough that double-single products (payoff times
+        // a sum of at most 1326 reach values) stay far inside f32's range.
+        let finite = |v: &[f64]| v.iter().all(|x| x.is_finite() && x.abs() <= MAX_PAYOFF);
         ensure(
             finite(&pp.fold_payoff)
                 && finite(&pp.win)
@@ -652,7 +660,9 @@ impl Plan {
         }
         ensure(pp.same.iter().all(|&j| j == NONE || j < nq), || "identical-combo index out of range".into())?;
         ensure(pp.opp_weights.len() == nq as usize, || "opponent weights".into())?;
-        ensure(pp.opp_weights.iter().all(|w| w.is_finite() && *w >= 0.0), || "bad opponent weight".into())?;
+        ensure(pp.opp_weights.iter().all(|w| w.is_finite() && (0.0..=MAX_WEIGHT).contains(w)), || {
+            "bad opponent weight".into()
+        })?;
         check_offsets(&pp.opp_card_off, pp.opp_card_hands.len(), "opponent card lists")?;
         ensure(pp.opp_card_hands.iter().all(|&j| j < nq), || "opponent card list entry out of range".into())?;
 

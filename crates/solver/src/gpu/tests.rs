@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::cfr::regret_match_into;
+use crate::gpu::DoubleFloatOp;
 use proptest::prelude::*;
 
 /// The device, or `None` (test skipped) on a machine without one. Any other
@@ -188,5 +189,127 @@ proptest! {
         for (i, (x, y)) in got.iter().zip(&cpu).enumerate() {
             prop_assert!(x == y, "value {} differs: gpu {:e} vs cpu {:e}", i, x, y);
         }
+    }
+}
+
+// ---- Double-single arithmetic (double_float.cuh) against host f64 ----
+
+/// Documented accuracy of a double-single operation: 2^-44 of the operands'
+/// magnitude (the representation holds 48 bits; each operation loses a few)
+/// plus an absolute floor of a few 2^-149 (f32's subnormal spacing: below
+/// about 1e-31 the low half underflows, so tiny values keep less relative
+/// precision than f64 would give them).
+const DS_EPS: f64 = 1.0 / (1u64 << 44) as f64;
+const DS_FLOOR: f64 = 8.0 * 1.401_298_464_324_817e-45;
+
+/// A finite f64 with uniformly random sign, mantissa and binary exponent in
+/// `exponents` (so magnitudes spread over many orders, as reach and payoffs
+/// do).
+fn spread(exponents: std::ops::Range<i32>) -> impl Strategy<Value = f64> {
+    (any::<bool>(), 1.0f64..2.0, exponents).prop_map(|(neg, m, e)| if neg { -m } else { m } * 2f64.powi(e))
+}
+
+fn check_op(g: &Gpu, op: DoubleFloatOp, x: &[f64], y: &[f64]) {
+    let got = g.double_float_check(x, y, op).unwrap();
+    for ((&a, &b), &r) in x.iter().zip(y).zip(&got) {
+        let (exact, scale) = match op {
+            DoubleFloatOp::Add => (a + b, a.abs() + b.abs()),
+            DoubleFloatOp::Sub => (a - b, a.abs() + b.abs()),
+            DoubleFloatOp::Mul => (a * b, (a * b).abs()),
+            DoubleFloatOp::AddF32 => {
+                let b = f64::from(b as f32);
+                (a + b, a.abs() + b.abs())
+            }
+            DoubleFloatOp::RoundToF32 => panic!("rounding is checked by its own test"),
+        };
+        assert!(r.is_finite(), "{op:?}({a:e}, {b:e}) = {r}");
+        assert!(
+            (r - exact).abs() <= DS_EPS * scale + DS_FLOOR,
+            "{op:?}({a:e}, {b:e}) = {r:e}, exact {exact:e}"
+        );
+    }
+}
+
+#[test]
+fn double_float_edge_cases() {
+    let Some(g) = gpu() else { return };
+    // 1e-40 is subnormal in f32: covered by the absolute floor.
+    let x = [0.0, 1.0, 1.0, 1e-40, 1e30, 0.1, -2.5, 1.0 / 3.0, 1234.5678, 1e-20, 7.0];
+    let y = [0.0, -1.0, 1e-10, 1e-40, -1e30, 0.2, 4.0, 3.0, -1234.5677, 1e-20, -7.0];
+    for op in [DoubleFloatOp::Add, DoubleFloatOp::Sub, DoubleFloatOp::AddF32] {
+        check_op(&g, op, &x, &y);
+    }
+    // Products stay in f32's exponent range (the plan bounds payoffs and
+    // weights so the kernels' products are far inside it); 1e30 * 1e30
+    // would overflow, as it would in f32.
+    let (xm, ym): (Vec<f64>, Vec<f64>) =
+        x.iter().zip(&y).filter(|(a, b)| (*a * *b).abs() < 1e37).map(|(&a, &b)| (a, b)).unzip();
+    assert_eq!(xm.len(), x.len() - 1);
+    check_op(&g, DoubleFloatOp::Mul, &xm, &ym);
+    // Exact cancellation gives exactly zero.
+    assert_eq!(g.double_float_check(&[1.0, 7.0], &[-1.0, -7.0], DoubleFloatOp::Add).unwrap(), vec![0.0, 0.0]);
+    // A tiny addend survives (in f32 it would vanish entirely).
+    let r = g.double_float_check(&[1.0], &[1e-10], DoubleFloatOp::Add).unwrap()[0];
+    assert!(((r - 1.0) - 1e-10).abs() < 1e-14, "1 + 1e-10 = {r:e}");
+    assert_eq!((1.0f32 + 1e-10f32) - 1.0, 0.0);
+}
+
+#[test]
+fn double_float_rounds_to_the_nearest_f32() {
+    let Some(g) = gpu() else { return };
+    let x: Vec<f64> =
+        (0..10_000).map(|i| (i as f64 * 0.618_033_988_749_9).fract() * 2f64.powi(i % 40 - 20)).collect();
+    let got = g.double_float_check(&x, &x, DoubleFloatOp::RoundToF32).unwrap();
+    let mut off = 0;
+    for (&a, &r) in x.iter().zip(&got) {
+        let nearest = a as f32;
+        if r as f32 != nearest {
+            // Only a double rounding at an exact tie may pick the neighbour.
+            let ulp = f64::from(nearest.abs()) * f64::from(f32::EPSILON);
+            assert!((r - f64::from(nearest)).abs() <= ulp, "to_f32({a:e}) = {r:e}, nearest {nearest:e}");
+            off += 1;
+        }
+    }
+    assert!(off <= x.len() / 1000, "{off} of {} rounded off the nearest f32", x.len());
+}
+
+#[test]
+fn double_float_long_sums() {
+    let Some(g) = gpu() else { return };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+    use rand::{Rng, SeedableRng};
+    for n in [1usize, 2, 255, 1000, 10_000] {
+        let values: Vec<f32> = (0..n)
+            .map(|_| rng.random_range(-6.0f32..2.0).exp() * if rng.random::<bool>() { 1.0 } else { 0.0 })
+            .collect();
+        let exact: f64 = values.iter().map(|&v| f64::from(v)).sum();
+        let scale: f64 = values.iter().map(|&v| f64::from(v).abs()).sum();
+        let got = g.double_float_sum(&values).unwrap();
+        // Sequential accumulation: about one 2^-48 error per add.
+        assert!((got - exact).abs() <= 1e-10 * scale.max(1e-30), "n {n}: {got:e} vs {exact:e}");
+        // Plain f32 accumulation is far worse on the long sums.
+        let f32_sum: f32 = values.iter().sum();
+        if n >= 1000 {
+            assert!((f64::from(f32_sum) - exact).abs() > 100.0 * (got - exact).abs(), "n {n}");
+        }
+    }
+    assert_eq!(g.double_float_sum(&[]).unwrap(), 0.0);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    #[test]
+    fn double_float_matches_f64(
+        pairs in prop::collection::vec((spread(-60..30), spread(-60..30)), 1..512),
+        products in prop::collection::vec((spread(-40..30), spread(-40..30)), 1..512),
+    ) {
+        let Some(g) = gpu() else { return Ok(()) };
+        let (x, y): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
+        for op in [DoubleFloatOp::Add, DoubleFloatOp::Sub, DoubleFloatOp::AddF32] {
+            check_op(&g, op, &x, &y);
+        }
+        let (x, y): (Vec<f64>, Vec<f64>) = products.into_iter().unzip();
+        check_op(&g, DoubleFloatOp::Mul, &x, &y);
     }
 }

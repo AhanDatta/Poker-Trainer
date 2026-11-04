@@ -34,6 +34,33 @@ mod plan;
 mod testutil;
 
 pub(crate) use engine::Engine;
+
+/// Operations of the double-single test kernel (`Op` in
+/// double_float_check.cu).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DoubleFloatOp {
+    Add = 0,
+    Sub = 1,
+    Mul = 2,
+    AddF32 = 3,
+    RoundToF32 = 4,
+}
+
+/// How the GPU accumulates terminal sums (showdowns and folds).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GpuPrecision {
+    /// Double-single arithmetic (pairs of f32, about 44 bits) on the GPU's
+    /// fast f32 units. Agrees with `Exact` except for rare one-rounding-step
+    /// differences in terminal values, which CFR then carries forward.
+    #[default]
+    Fast,
+    /// f64, in the CPU's operation order: bit-identical to the CPU solver in
+    /// every test so far, and slower (this GPU runs f64 at 1/64 of its f32
+    /// rate).
+    Exact,
+}
 pub(crate) use plan::Plan;
 
 /// Kernel images built by `build.rs` from `cuda/kernels/*.cu`.
@@ -41,6 +68,8 @@ static REGRET_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/regret.fa
 static SELFTEST_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/selftest.fatbin"));
 static TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse.fatbin"));
 static TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.fatbin"));
+static DOUBLE_FLOAT_CHECK_IMAGE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/double_float_check.fatbin"));
 
 /// Whether the kernels were built with device bounds assertions
 /// (`CCCL_ENABLE_DEVICE_ASSERTIONS`): on in debug/test builds, off in release
@@ -185,6 +214,8 @@ struct Kernels {
     chance_sum: CudaFunction,
     fold_values: CudaFunction,
     showdown_values: CudaFunction,
+    double_float_check: CudaFunction,
+    double_float_sum: CudaFunction,
 }
 
 /// A CUDA device with the solver's kernels loaded.
@@ -223,6 +254,7 @@ impl Gpu {
         let selftest = ctx.load_module(Ptx::from_binary(SELFTEST_IMAGE.to_vec()))?;
         let traverse = ctx.load_module(Ptx::from_binary(TRAVERSE_IMAGE.to_vec()))?;
         let terminal = ctx.load_module(Ptx::from_binary(TERMINAL_IMAGE.to_vec()))?;
+        let double_float = ctx.load_module(Ptx::from_binary(DOUBLE_FLOAT_CHECK_IMAGE.to_vec()))?;
         let kernels = Kernels {
             regret_match_f32: regret.load_function("regret_match_f32")?,
             regret_match_i16: regret.load_function("regret_match_i16")?,
@@ -235,6 +267,8 @@ impl Gpu {
             chance_sum: traverse.load_function("chance_sum")?,
             fold_values: terminal.load_function("fold_values")?,
             showdown_values: terminal.load_function("showdown_values")?,
+            double_float_check: double_float.load_function("double_float_check")?,
+            double_float_sum: double_float.load_function("double_float_sum")?,
         };
         Ok(Gpu { stream: ctx.default_stream(), kernels, name, compute_capability })
     }
@@ -270,6 +304,47 @@ impl Gpu {
         // elements (checked by `BlockShape`), which is all the kernel touches.
         unsafe { launch.launch(shape.per_hand_launch()) }?;
         Ok(self.stream.clone_dtoh(&d_strategy)?)
+    }
+
+    /// `op(x[i], y[i])` in double-single arithmetic, read back exactly as
+    /// f64 (tests of `double_float.cuh`).
+    #[doc(hidden)]
+    pub fn double_float_check(&self, x: &[f64], y: &[f64], op: DoubleFloatOp) -> Result<Vec<f64>, GpuError> {
+        if x.len() != y.len() {
+            return Err(invalid("operand lengths differ"));
+        }
+        if x.is_empty() {
+            return Ok(Vec::new());
+        }
+        let len = u32::try_from(x.len()).map_err(|_| invalid("too many operands"))?;
+        let dx = self.stream.clone_htod(x)?;
+        let dy = self.stream.clone_htod(y)?;
+        let mut out = self.stream.alloc_zeros::<f64>(x.len())?;
+        let op = op as u32;
+        let mut launch = self.stream.launch_builder(&self.kernels.double_float_check);
+        launch.arg(&dx).arg(&dy).arg(&mut out).arg(&len).arg(&op);
+        let cfg = LaunchConfig::for_num_elems(len);
+        // SAFETY: arguments match `double_float_check(const double*, const
+        // double*, double*, u32 len, u32 op)`; all buffers hold `len` values.
+        unsafe { launch.launch(cfg) }?;
+        Ok(self.stream.clone_dtoh(&out)?)
+    }
+
+    /// The sequential double-single sum of `values`, read back exactly.
+    #[doc(hidden)]
+    pub fn double_float_sum(&self, values: &[f32]) -> Result<f64, GpuError> {
+        let len = u32::try_from(values.len()).map_err(|_| invalid("too many values"))?;
+        let padded: &[f32] = if values.is_empty() { &[0.0] } else { values };
+        let dv = self.stream.clone_htod(padded)?;
+        let mut out = self.stream.alloc_zeros::<f64>(1)?;
+        let mut launch = self.stream.launch_builder(&self.kernels.double_float_sum);
+        launch.arg(&dv).arg(&len).arg(&mut out);
+        let cfg = LaunchConfig { grid_dim: (1, 1, 1), block_dim: (1, 1, 1), shared_mem_bytes: 0 };
+        // SAFETY: arguments match `double_float_sum(const float*, u32, double*)`;
+        // the input holds `len` values (at least one element allocated).
+        unsafe { launch.launch(cfg) }?;
+        let v = self.stream.clone_dtoh(&out)?;
+        v.first().copied().ok_or_else(|| invalid("empty sum output"))
     }
 
     /// Launches a kernel that reads one element past the end of its input,

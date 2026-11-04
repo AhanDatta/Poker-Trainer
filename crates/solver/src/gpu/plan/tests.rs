@@ -201,6 +201,8 @@ fn validate_rejects_corrupted_plans() {
         ),
         ("too much shared memory", Box::new(|p| p.players[0].tables.max_opp = 5000)),
         ("non-finite payoff", Box::new(|p| p.players[0].win[0] = f64::NAN)),
+        ("payoff too large for double-single", Box::new(|p| p.players[1].lose[0] = 1e13)),
+        ("weight too large for double-single", Box::new(|p| p.players[0].opp_weights[0] = 1e7)),
         ("negative weight", Box::new(|p| p.players[1].opp_weights[0] = -1.0)),
         ("showdown table out of range", Box::new(|p| p.players[0].showdown_table[0] = p.num_tables)),
     ];

@@ -9,7 +9,7 @@ use super::plan::{
     showdown_shared_bytes, Plan, PlayerPlan, MODE_AVERAGE, MODE_BEST_RESPONSE, MODE_CFR,
     SHOWDOWN_SHARED_LIMIT,
 };
-use super::{invalid, Gpu, GpuError};
+use super::{invalid, Gpu, GpuError, GpuPrecision};
 use crate::cfr::{Discount, Mode};
 use cudarc::driver::{CudaSlice, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 
@@ -225,11 +225,19 @@ pub(crate) struct Engine {
     /// One row of values per node (sized for the larger hand count).
     values: CudaSlice<f32>,
     alive: CudaSlice<u32>,
+    /// 1 for f64 terminal sums, 0 for double-single (the kernels' `exact`).
+    exact: u32,
 }
 
 impl Engine {
     /// Uploads a validated plan and the current `f32` storage.
-    pub(crate) fn new(gpu: Gpu, plan: Plan, regrets: &[f32], sums: &[f32]) -> Result<Engine, GpuError> {
+    pub(crate) fn new(
+        gpu: Gpu,
+        plan: Plan,
+        regrets: &[f32],
+        sums: &[f32],
+        precision: GpuPrecision,
+    ) -> Result<Engine, GpuError> {
         plan.validate()?;
         let len = plan.storage_len as usize;
         if regrets.len() != len || sums.len() != len {
@@ -260,6 +268,7 @@ impl Engine {
             reach: gpu.zeros(reach_len.unwrap_or(1))?,
             values: gpu.zeros(values_len.unwrap_or(1))?,
             alive: gpu.zeros(slots_len.unwrap_or(1))?,
+            exact: u32::from(precision == GpuPrecision::Exact),
             gpu,
             plan,
         };
@@ -327,7 +336,7 @@ impl Engine {
     /// Enqueues one traversal by player `p`; its root values end up in row 0
     /// of the value buffer.
     fn traverse(&mut self, p: usize, mode: Mode) -> Result<(), GpuError> {
-        let Engine { gpu, plan, tree, players, regrets, sums, reach, values, alive } = self;
+        let Engine { gpu, plan, tree, players, regrets, sums, reach, values, alive, exact } = self;
         let (Some(pp), Some(dp)) = (plan.players.get(p), players.get(p)) else {
             return Err(invalid("player out of range"));
         };
@@ -411,7 +420,7 @@ impl Engine {
             push(&mut l, &dp.same);
             push(&mut l, &dp.opp_card_off);
             push(&mut l, &dp.opp_card_hands);
-            l.arg(&hands).arg(&opp_hands);
+            l.arg(&hands).arg(&opp_hands).arg(&*exact);
             // SAFETY: arguments match `fold_values`; indices are validated,
             // and the dynamic shared memory holds `opp_hands` floats.
             unsafe { l.launch(per_terminal_grid(dp.folds.len, THREADS, fold_shared)) }?;
@@ -445,7 +454,7 @@ impl Engine {
             push(&mut l, &dp.card_pos);
             push(&mut l, &dp.ranges);
             push(&mut l, &dp.ranks);
-            l.arg(&hands).arg(&opp_hands).arg(&pp.tables.max_opp);
+            l.arg(&hands).arg(&opp_hands).arg(&pp.tables.max_opp).arg(&*exact);
             // SAFETY: arguments match `showdown_values`; indices are
             // validated and the dynamic shared memory is sized for `max_opp`.
             unsafe { l.launch(per_terminal_grid(dp.showdowns.len, THREADS, shared)) }?;
