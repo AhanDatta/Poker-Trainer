@@ -88,11 +88,13 @@ Kernels mirror the CPU's arithmetic operation for operation:
   kernels use that one's operation order. Mirroring only the batched one left
   the turn a rounding step off, which regret matching amplified to visible
   regret differences.
-- **Terminal sums** run in **f64**, as on the CPU, even though the GPU's f64
-  rate is 1/64 of its f32 rate: a showdown does a few thousand f64 adds, a tiny
-  share of an iteration's work, so compensated f32 summation isn't needed. Only
-  the summation order differs (tree reductions and prefix scans instead of one
-  sweep), which can move a result by at most one f32 rounding step.
+- **Terminal sums** run in **f64**, as on the CPU. The GPU's f64 rate is 1/64
+  of its f32 rate, and the profile shows it matters (the first version
+  assumed the f64 work would be negligible; it wasn't): the terminal kernels are
+  written to do about one f64 add per summed value (see Performance). Only the
+  summation order differs from the CPU (chunked sums and a block scan instead
+  of one sweep), which could move a result by one f32 rounding step; in every
+  test so far it hasn't.
 
 Measured: GPU and CPU solves agree **bit for bit** (every strategy, EV and
 regret identical after 5 iterations) on the river, turn, suit-isomorphic turn,
@@ -117,42 +119,74 @@ iterations, exploitability and root strategy.
 |---|---|---|---|---|
 | river `Ks7d2c9h4s` (5 runs) | 80 | 9.9 ms (9.6–10.9) | 10.6 ms (9.8–11.8) | 13.5 ms (13.2–14.5) + 0.15–0.3 s setup |
 | river, fixed 3000 / 1000 iterations | | 0.132 ms/iter | 0.135 ms/iter | 0.155–0.167 ms/iter (CPU 0.129–0.138 in the same 1000-iteration runs) |
-| turn `Ks7d2c9h` (3 runs) | 168 | 3.09 s (3.00–3.29), 18.4 ms/iter | 3.08 s (2.97–3.13), 18.3 ms/iter | 1.95 s (1.94–1.95), 11.6 ms/iter, + 0.4–0.46 s setup |
-| flop-fast `Ks7d2c`, 8 × 6 sampled (2 runs) | 116 | 4.67 s, 40.2 ms/iter | 4.60 s, 39.7 ms/iter | 2.47 s (2.45–2.49), 21.3 ms/iter, + 0.5–0.6 s setup |
+| turn `Ks7d2c9h` (3 runs) | 168 | 3.09 s (3.00–3.29), 18.4 ms/iter | 3.08 s (2.97–3.13), 18.3 ms/iter | **1.20 s** (1.19–1.37), 7.2 ms/iter, + 0.35–0.37 s setup |
+| flop-fast `Ks7d2c`, 8 × 6 sampled (2 runs) | 116 | 4.67 s, 40.2 ms/iter | 4.60 s, 39.7 ms/iter | **1.58 s**, 13.6 ms/iter, + 0.55–0.65 s setup |
 | flop-exact `Ks7s2d` (2 runs) | 184 | 152.7–155.9 s, 830–847 ms/iter | 151.2–155.2 s, 822–843 ms/iter | not yet (16-bit storage) |
 
 Peak memory (this branch's bench; `main`'s can't measure it on Windows): river
 0.01 GB, turn 0.15 GB, flop-fast 0.26 GB, flop-exact 2.98 GB (16-bit storage).
 The GPU river process peaks at 0.16 GB, mostly the CUDA runtime.
 
-The GPU rows for the turn and the flop come from a second session (same
-binaries, CPU and GPU interleaved), in which the CPU ran 10–15% slower than in
-the first (turn 3.42–3.76 s, flop-fast 4.85–5.29 s), probably from background
-load; the GPU times varied by under 2%. Against either CPU session the GPU is
-**1.6–1.8× faster on the turn and 1.9–2.1× on the sampled flop**, with the same
-iterations, exploitability and root strategy. The setup (CUDA context, plan,
-upload) is paid once per solve.
+The GPU rows for the turn and the flop come from a later session that ran the
+CPU, the first GPU version (before the terminal optimization below) and the
+current one interleaved. In that session the CPU took 2.79–3.22 s on the turn
+(median 3.19 s) and 4.27–4.35 s on the sampled flop; the first GPU version
+1.94–2.01 s and 2.45–2.46 s. So the GPU is now **about 2.7× faster than the CPU
+on the turn and the sampled flop** (1.6× faster than the first GPU version),
+with the same iterations, exploitability and root strategy; counting the
+one-time setup (CUDA context, plan, upload), the turn takes 1.7–1.8 s against
+2.9–3.3 s. The river stays slightly slower than the CPU (11.9 ms against about
+10 ms): its 14-node tree can't fill the GPU and launch latency sets the time.
 
-The GPU loses on the river, as expected. The tree has 14 decision nodes, so
-an iteration is about 60 small kernel launches, and launch latency, not
-arithmetic, sets the time. Creating the CUDA context costs another 0.15–0.3 s
-once per process.
+### Where the GPU time goes
 
-Where the GPU time goes (Nsight Systems, 60 turn iterations, 122 traversals,
-10.5 ms of kernel time per iteration of 11.6 ms wall):
+Nsight Systems, 60 turn iterations (122 traversals), kernel time per traversal:
 
-| Kernel | Share | Per traversal |
-|---|---|---|
-| `showdown_values` | 46% | 2.4 ms (about 4,300 showdowns) |
-| `fold_values` | 30% | 1.6 ms (about 3,600 folds) |
-| `opponent_split` | 11% | 0.6 ms |
-| `own_update` | 7% | 0.4 ms |
-| `opponent_sum` | 4% | 0.2 ms |
-| `chance_split` + `chance_sum` | 1% | 0.06 ms |
+| Kernel | First version | Now | Change |
+|---|---|---|---|
+| `showdown_values` (now also the paired folds) | 2.40 ms | 1.55 ms | f64 work cut to about one add per summed value |
+| `fold_values` | 1.58 ms | 0.41 ms | half the folds paired with showdowns; per-card sums sequential |
+| `opponent_split` | 0.59 ms | 0.59 ms | |
+| `own_update` | 0.38 ms | 0.38 ms | |
+| `opponent_sum` | 0.22 ms | 0.22 ms | |
+| `chance_split` + `chance_sum` | 0.06 ms | 0.06 ms | |
+| total per iteration | 10.5 ms | 6.4 ms | −39% |
 
-The terminals dominate. Each terminal block recomputes reach totals and per-card
-sums that terminals sharing a reach slot could share, and the f64 scans are
-sync-heavy; that is the first target for optimization.
+What changed in the terminal kernels:
+
+- **f64 operation count.** The GPU does f64 at 2 operations per cycle per SM
+  (128 for f32). The first version summed each card's opponent hands with
+  warp shuffle reductions and scanned with warp-wide prefix scans: about 5
+  f64 adds per summed value. Now each thread sums a contiguous chunk (or one
+  card's list) sequentially and only the 256 chunk totals go through a
+  block-wide scan or reduction.
+- **Folds paired with showdowns.** A fold and a showdown that are both
+  children of one of the traverser's nodes share the opponent reach; the
+  showdown kernel now evaluates the fold from its own sums (the CPU's
+  `showdown_batch` grouping), which removes about half of the fold blocks.
+
+Tried and rejected (measured slower or no better): 512-thread showdown blocks
+(10% slower), computing the paired fold inside the showdown's per-hand loop
+(30% slower), caching the board's card offsets in shared memory (no gain),
+loop strides from `blockDim.x` instead of a compile-time constant (a few
+percent slower).
+
+What remains, and why it isn't simple to cut:
+
+- The traversal kernels (`opponent_split`, `own_update`, `opponent_sum`, 1.2
+  ms per traversal) already move about 70% of the GPU's 256 GB/s; the turn
+  tree's 16 million regret/strategy cells are read and written every
+  traversal. 16-bit storage (phase 3) would halve that traffic.
+- The terminal kernels are still bound by f64 arithmetic. A timing probe with
+  every f64 replaced by f32 (wrong results, same structure) ran showdowns in
+  0.47 ms instead of 1.60 ms and folds in 0.09 ms instead of 0.41 ms per
+  traversal. Emulating f64 with pairs of f32 ("double-single" arithmetic,
+  about 44 bits of precision on the fast f32 units) would recover much of
+  that, at the cost of rare one-rounding-step differences from the CPU (no
+  longer bit for bit; within the test tolerances).
+- Hardware performance counters need administrator rights on Windows
+  (`ERR_NVGPUCTRPERM`); with them enabled, Nsight Compute could say exactly
+  which stalls remain.
 
 ## Running the GPU checks
 

@@ -10,39 +10,36 @@
 // `total - minus[c1] - minus[c2] + reach(identical combo)`, where
 // `minus[c]` is the reach of opponent hands holding card c.
 //
-// Sums are accumulated in f64 like the CPU's (the order differs: tree
-// reductions and scans instead of one sequential sweep); the f64 work is a
-// tiny share of the solve, so the GPU's slow f64 rate doesn't matter here.
-// Final combinations use the CPU's operation order without fused
-// multiply-adds.
+// Sums are accumulated in f64 like the CPU's (in a different order). The
+// GPU does f64 at 1/64 of its f32 rate, so the kernels keep the f64 work
+// close to one add per summed value: sums and prefix sums run sequentially
+// per thread over contiguous chunks (or one card's list), with only the
+// chunk totals combined by a block-wide scan or reduction. Final
+// combinations use the CPU's operation order without fused multiply-adds.
 //
 // Showdowns replace the CPU's sequential strength sweep by prefix sums over
-// the board's strength-sorted opponent hands (plus one prefix sum per card
-// over the opponent hands holding it). Where each of the traverser's hands
+// the board's strength-sorted opponent hands, plus one prefix sum per card
+// over the opponent hands holding it. Where each of the traverser's hands
 // sits in those lists depends only on the board, so the host precomputes it
-// (src/gpu/plan.rs, `Tables`).
+// (src/gpu/plan.rs, `Tables`). A fold that shares its opponent reach with
+// the showdown (both children of one traverser node) is read off the same
+// sums, as the CPU's `showdown_batch` does.
 
 #include <solver/core.cuh>
 
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
-#include <cub/warp/warp_reduce.cuh>
-#include <cub/warp/warp_scan.cuh>
+#include <cuda/std/algorithm>
+#include <cuda/std/utility>
 
 namespace solver {
 namespace {
 
+/// Threads per block (a compile-time constant: loops stride by it, which
+/// measured a few percent faster than striding by `blockDim.x`). 512-thread showdown
+/// blocks, to fill the warp slots that the shared-memory limit of 3 blocks
+/// per SM leaves empty, measured 10% slower.
 inline constexpr u32 kThreads = 256;
-inline constexpr u32 kWarpSize = 32;
-inline constexpr u32 kWarps = kThreads / kWarpSize;
-
-[[nodiscard]] __device__ auto warp_id() noexcept -> u32 {
-  return threadIdx.x / kWarpSize;
-}
-
-[[nodiscard]] __device__ auto lane_id() noexcept -> u32 {
-  return threadIdx.x % kWarpSize;
-}
 
 /// Writes 0 for every hand (a dead terminal is worth nothing).
 __device__ void zero_row(cuda::std::span<float> out) noexcept {
@@ -59,12 +56,29 @@ __device__ void zero_row(cuda::std::span<float> out) noexcept {
   return j == kNone ? 0.0 : static_cast<double>(reach[j]);
 }
 
+/// This thread's contiguous chunk of `[0, len)` when the block splits it
+/// into `kThreads` nearly equal chunks.
+[[nodiscard]] __device__ auto my_chunk(u32 len) noexcept -> cuda::std::pair<u32, u32> {
+  const u32 per = (len + kThreads - 1) / kThreads;
+  const u32 begin = cuda::std::min(threadIdx.x * per, len);
+  return {begin, cuda::std::min(begin + per, len)};
+}
+
+/// Compatible opponent reach of a hand for a fold: `eval_fold` computes
+/// `total - (m1 + m2) + same`, the batched evaluators `total - m1 - m2 + same`.
+[[nodiscard]] __device__ auto fold_compatible(bool one_at_a_time, double total, double m1, double m2, double same)
+    -> double {
+  const double blocked = one_at_a_time ? sub_rn(total, add_rn(m1, m2)) : sub_rn(sub_rn(total, m1), m2);
+  return add_rn(blocked, same);
+}
+
 }  // namespace
 }  // namespace solver
 
 using solver::u32;
 
-/// Fold terminals: `value[h] = payoff * compatible_reach(h)`.
+/// Fold terminals: `value[h] = payoff * compatible_reach(h)`. Dynamic shared
+/// memory: `opp_hands` floats (the opponent's reach).
 extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const u32* list_ptr,
                                                                            u32 list_len,
                                                                            const double* payoff_ptr,
@@ -91,11 +105,10 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
                                                                            u32 opp_hands) {
   using namespace solver;
   using BlockReduce = cub::BlockReduce<double, kThreads>;
-  using WarpReduce = cub::WarpReduce<double>;
   __shared__ typename BlockReduce::TempStorage reduce_storage;
-  __shared__ typename WarpReduce::TempStorage warp_storage[kWarps];
   __shared__ double minus_storage[kCards];
   __shared__ double total;
+  extern __shared__ float fold_shared[];
 
   const auto list = view(list_ptr, list_len);
   const auto payoff = view(payoff_ptr, payoff_len);
@@ -109,6 +122,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
   const auto card_off = view(card_off_ptr, card_off_len);
   const auto card_hands = view(card_hands_ptr, card_hands_len);
   const auto minus = cuda::std::span<double, kCards>{minus_storage};
+  const auto weights = cuda::std::span<float>{fold_shared, opp_hands};
 
   for (u32 k = blockIdx.x; k < list.size(); k += gridDim.x) {
     const u32 node = list[k];
@@ -120,24 +134,29 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
     }
     const auto reach = row(reach_all, slot, opp_hands);
 
+    // Copy the reach to shared memory; the total from per-thread chunks.
     double partial = 0.0;
     for (u32 j = threadIdx.x; j < opp_hands; j += kThreads) {
-      partial += reach[j];
+      weights[j] = reach[j];
+    }
+    __syncthreads();
+    const auto [begin, end] = my_chunk(opp_hands);
+    for (u32 j = begin; j < end; ++j) {
+      partial = add_rn(partial, static_cast<double>(weights[j]));
     }
     const double block_total = BlockReduce{reduce_storage}.Sum(partial);
     if (threadIdx.x == 0) {
       total = block_total;
     }
-    // minus[c]: one warp per card.
-    for (u32 c = warp_id(); c < kCards; c += kWarps) {
+    // minus[c]: one thread per card, summing that card's list sequentially.
+    for (u32 c = threadIdx.x; c < kCards; c += kThreads) {
       double m = 0.0;
-      for (u32 e = card_off[c] + lane_id(); e < card_off[c + 1]; e += kWarpSize) {
-        m += reach[card_hands[e]];
+      const u32 last = card_off[c + 1];
+#pragma unroll 8
+      for (u32 e = card_off[c]; e < last; ++e) {
+        m = add_rn(m, static_cast<double>(weights[card_hands[e]]));
       }
-      const double card_total = WarpReduce{warp_storage[warp_id()]}.Sum(m);
-      if (lane_id() == 0) {
-        minus[c] = card_total;
-      }
+      minus[c] = m;
     }
     __syncthreads();
 
@@ -145,11 +164,9 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
     const bool one_at_a_time = scalar[node] != 0u;
     for (u32 h = threadIdx.x; h < hands; h += kThreads) {
       const auto cards = unpack_cards(my_cards[h]);
-      const double m1 = minus[cards.first];
-      const double m2 = minus[cards.second];
-      // `eval_fold`: total - (m1 + m2) + same; batched: total - m1 - m2 + same.
-      const double blocked = one_at_a_time ? sub_rn(total, add_rn(m1, m2)) : sub_rn(sub_rn(total, m1), m2);
-      out[h] = to_f32(mul_rn(pay, add_rn(blocked, same_reach(same, reach, h))));
+      const double compatible =
+          fold_compatible(one_at_a_time, total, minus[cards.first], minus[cards.second], same_reach(same, reach, h));
+      out[h] = to_f32(mul_rn(pay, compatible));
     }
     __syncthreads();  // shared memory is reused by the next terminal
   }
@@ -157,6 +174,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
 
 /// Showdown terminals: `value[h] = win * weaker(h) + lose * stronger(h)`,
 /// plus `tie * tied(h)` when ties pay something (mid-street roots, rake).
+/// A paired fold (`paired_fold[k]`, payoff `paired_payoff[k]`) shares the
+/// showdown's opponent reach and is evaluated from the same sums.
 extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(const u32* list_ptr,
                                                                                u32 list_len,
                                                                                const u32* table_of_ptr,
@@ -167,6 +186,10 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
                                                                                u32 lose_len,
                                                                                const double* tie_ptr,
                                                                                u32 tie_len,
+                                                                               const u32* paired_fold_ptr,
+                                                                               u32 paired_fold_len,
+                                                                               const double* paired_payoff_ptr,
+                                                                               u32 paired_payoff_len,
                                                                                const u32* slots_ptr,
                                                                                u32 slots_len,
                                                                                const u32* scalar_ptr,
@@ -202,9 +225,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
                                                                                u32 max_opp) {
   using namespace solver;
   using BlockScan = cub::BlockScan<double, kThreads>;
-  using WarpScan = cub::WarpScan<double>;
   __shared__ typename BlockScan::TempStorage scan_storage;
-  __shared__ typename WarpScan::TempStorage warp_storage[kWarps];
   // Dynamic shared memory, sized by the host for `max_opp` opponent hands:
   // prefix[max_opp + 1] and card_prefix[2 * max_opp + 52] (f64), then the
   // gathered weights[max_opp] (f32).
@@ -219,6 +240,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
   const auto win = view(win_ptr, win_len);
   const auto lose = view(lose_ptr, lose_len);
   const auto tie = view(tie_ptr, tie_len);
+  const auto paired_fold = view(paired_fold_ptr, paired_fold_len);
+  const auto paired_payoff = view(paired_payoff_ptr, paired_payoff_len);
   const auto slots = view(slots_ptr, slots_len);
   const auto scalar = view(scalar_ptr, scalar_len);
   const auto alive = view(alive_ptr, alive_len);
@@ -238,9 +261,13 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
   for (u32 k = blockIdx.x; k < list.size(); k += gridDim.x) {
     const u32 node = list[k];
     const u32 slot = slots[node];
+    const u32 fold_node = paired_fold[k];
     const auto out = row(values, node, hands);
     if (alive[slot] == 0u) {
       zero_row(out);
+      if (fold_node != kNone) {
+        zero_row(row(values, fold_node, hands));
+      }
       continue;  // uniform: every thread of the block skips together
     }
     const auto reach = row(reach_all, slot, opp_hands);
@@ -252,55 +279,59 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
     const auto prefix = prefix_all.first(n_opp + 1);
     const auto weights = weights_all.first(n_opp);
 
-    // prefix[j] = reach of the j weakest opponent hands.
-    double running = 0.0;
-    for (u32 base = 0; base < n_opp; base += kThreads) {
-      const u32 j = base + threadIdx.x;
-      const float w = j < n_opp ? reach[order[j]] : 0.0f;
-      if (j < n_opp) {
-        weights[j] = w;
-      }
-      double before = 0.0;
-      double tile_total = 0.0;
-      BlockScan{scan_storage}.ExclusiveSum(static_cast<double>(w), before, tile_total);
-      if (j < n_opp) {
-        prefix[j] = running + before;
-      }
-      running += tile_total;
-      __syncthreads();  // scan storage is reused by the next tile
-    }
-    if (threadIdx.x == 0) {
-      prefix[n_opp] = running;
-    }
-
-    // Card c's opponent hands, in strength order, occupy positions
-    // card_off[c]..card_off[c+1] of card_pos; their prefix sums go to
-    // card_prefix[card_off[c] + c ..= card_off[c+1] + c]. One warp per card.
-    for (u32 c = warp_id(); c < kCards; c += kWarps) {
-      const u32 begin = card_off[c];
-      const u32 len = card_off[c + 1] - begin;
-      const auto segment = card_prefix_all.subspan(begin + c, len + 1);
-      double carry = 0.0;
-      for (u32 base = 0; base < len; base += kWarpSize) {
-        const u32 e = base + lane_id();
-        const double w = e < len ? static_cast<double>(weights[card_pos[begin + e]]) : 0.0;
-        double before = 0.0;
-        double chunk_total = 0.0;
-        WarpScan{warp_storage[warp_id()]}.ExclusiveSum(w, before, chunk_total);
-        if (e < len) {
-          segment[e] = carry + before;
-        }
-        carry += chunk_total;
-      }
-      if (lane_id() == 0) {
-        segment[len] = carry;
-      }
+    // Opponent reach in strength order, weakest first.
+    for (u32 j = threadIdx.x; j < n_opp; j += kThreads) {
+      weights[j] = reach[order[j]];
     }
     __syncthreads();
 
+    // prefix[j] = reach of the j weakest opponent hands: each thread sums
+    // its chunk, one block scan offsets the chunks, then the chunk's
+    // prefixes are written sequentially.
+    const auto [begin, end] = my_chunk(n_opp);
+    double chunk_total = 0.0;
+    for (u32 j = begin; j < end; ++j) {
+      chunk_total = add_rn(chunk_total, static_cast<double>(weights[j]));
+    }
+    double running = 0.0;
+    double all = 0.0;
+    BlockScan{scan_storage}.ExclusiveSum(chunk_total, running, all);
+    for (u32 j = begin; j < end; ++j) {
+      prefix[j] = running;
+      running = add_rn(running, static_cast<double>(weights[j]));
+    }
+    if (threadIdx.x == 0) {
+      prefix[n_opp] = all;
+    }
+
+    // Card c's opponent hands, in strength order, are card_pos[card_off[c]
+    // .. card_off[c+1]]; their prefix sums go to card_prefix[card_off[c] + c
+    // ..= card_off[c+1] + c]. One thread per card, sequentially.
+    for (u32 c = threadIdx.x; c < kCards; c += kThreads) {
+      const u32 first_entry = card_off[c];
+      const u32 len = card_off[c + 1] - first_entry;
+      const auto segment = card_prefix_all.subspan(first_entry + c, len + 1);
+      double sum = 0.0;
+#pragma unroll 8
+      for (u32 e = 0; e < len; ++e) {
+        segment[e] = sum;
+        sum = add_rn(sum, static_cast<double>(weights[card_pos[first_entry + e]]));
+      }
+      segment[len] = sum;
+    }
+    __syncthreads();
+
+    // The prefix sums of card `c`'s list.
+    const auto card_prefix = [&](u32 c) {
+      return card_prefix_all.subspan(card_off[c] + c, card_off[c + 1] - card_off[c] + 1);
+    };
     const auto table_ranges = row(ranges, table, hands);
     const auto table_ranks = row(ranks_all, table, hands);
     const bool one_at_a_time = scalar[node] != 0u;
+    const bool has_fold = fold_node != kNone;
+    const auto fold_out = has_fold ? row(values, fold_node, hands) : cuda::std::span<float>{};
+    const bool fold_one_at_a_time = has_fold && scalar[fold_node] != 0u;
+    const double fold_pay = paired_payoff[k];
     for (u32 h = threadIdx.x; h < hands; h += kThreads) {
       const u32 packed = table_ranges[h];
       if (packed == kNone) {
@@ -310,12 +341,10 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
       const auto range = unpack_range(packed);
       const auto ranks = unpack_ranks(table_ranks[h]);
       const auto cards = unpack_cards(my_cards[h]);
-      const auto first = card_prefix_all.subspan(card_off[cards.first] + cards.first,
-                                                 card_off[cards.first + 1] - card_off[cards.first] + 1);
-      const auto second = card_prefix_all.subspan(card_off[cards.second] + cards.second,
-                                                  card_off[cards.second + 1] - card_off[cards.second] + 1);
-      const u32 first_len = static_cast<u32>(first.size()) - 1;
-      const u32 second_len = static_cast<u32>(second.size()) - 1;
+      const auto first = card_prefix(cards.first);
+      const auto second = card_prefix(cards.second);
+      const double first_all = first[first.size() - 1];
+      const double second_all = second[second.size() - 1];
 
       // Reach of the weaker / stronger opponent hands, and of those among
       // them holding each of the hand's two cards.
@@ -323,8 +352,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
       const double weaker_first = first[ranks.first_lo];
       const double weaker_second = second[ranks.second_lo];
       const double stronger_all = sub_rn(prefix[n_opp], prefix[range.hi]);
-      const double stronger_first = sub_rn(first[first_len], first[ranks.first_hi]);
-      const double stronger_second = sub_rn(second[second_len], second[ranks.second_hi]);
+      const double stronger_first = sub_rn(first_all, first[ranks.first_hi]);
+      const double stronger_second = sub_rn(second_all, second[ranks.second_hi]);
       float value = 0.0f;
       if (one_at_a_time) {
         // `eval_showdown`: out = (win * (sum - (ma + mb))) as f32, then
@@ -349,6 +378,19 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
         value = add_rn(value, to_f32(mul_rn(tie[k], eq)));
       }
       out[h] = value;
+    }
+    // The paired fold, for every hand (the CPU's `showdown_batch`): payoff *
+    // (sum - minus[a] - minus[b] + same) over the same reach. A separate
+    // pass: computing it inside the loop above measured 30% slower.
+    if (has_fold) {
+      for (u32 h = threadIdx.x; h < hands; h += kThreads) {
+        const auto cards = unpack_cards(my_cards[h]);
+        const auto first = card_prefix(cards.first);
+        const auto second = card_prefix(cards.second);
+        const double compatible = fold_compatible(fold_one_at_a_time, prefix[n_opp], first[first.size() - 1],
+                                                  second[second.size() - 1], same_reach(same, reach, h));
+        fold_out[h] = to_f32(mul_rn(fold_pay, compatible));
+      }
     }
     __syncthreads();  // shared memory is reused by the next terminal
   }

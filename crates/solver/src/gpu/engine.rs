@@ -13,7 +13,8 @@ use super::{invalid, Gpu, GpuError};
 use crate::cfr::{Discount, Mode};
 use cudarc::driver::{CudaSlice, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
 
-/// Threads per block, as the kernels assume (`kThreads` in terminal.cu).
+/// Threads per block, as the kernels assume (`kThreads` in terminal.cu;
+/// the traversal kernels take any size).
 const THREADS: u32 = 256;
 /// Most blocks along grid y (hardware limit 65535); kernels stride beyond.
 const MAX_GRID_Y: u32 = 65_535;
@@ -66,6 +67,8 @@ struct DevicePlayer {
     win: Buffer<f64>,
     lose: Buffer<f64>,
     tie: Buffer<f64>,
+    showdown_fold: Buffer<u32>,
+    showdown_fold_payoff: Buffer<f64>,
     my_cards: Buffer<u32>,
     same: Buffer<u32>,
     opp_card_off: Buffer<u32>,
@@ -99,6 +102,8 @@ impl DevicePlayer {
             win: gpu.upload(&pp.win)?,
             lose: gpu.upload(&pp.lose)?,
             tie: gpu.upload(&pp.tie)?,
+            showdown_fold: gpu.upload(&pp.showdown_fold)?,
+            showdown_fold_payoff: gpu.upload(&pp.showdown_fold_payoff)?,
             my_cards: gpu.upload(&pp.my_cards)?,
             same: gpu.upload(&pp.same)?,
             opp_card_off: gpu.upload(&pp.opp_card_off)?,
@@ -165,10 +170,10 @@ fn per_hand_grid(hands: u32, nodes: u32) -> LaunchConfig {
 }
 
 /// Grid for one-block-per-terminal kernels.
-fn per_terminal_grid(terminals: u32, shared_mem_bytes: u32) -> LaunchConfig {
+fn per_terminal_grid(terminals: u32, threads: u32, shared_mem_bytes: u32) -> LaunchConfig {
     LaunchConfig {
         grid_dim: (terminals.clamp(1, MAX_TERMINAL_BLOCKS), 1, 1),
-        block_dim: (THREADS, 1, 1),
+        block_dim: (threads, 1, 1),
         shared_mem_bytes,
     }
 }
@@ -393,6 +398,7 @@ impl Engine {
 
         // 3. Terminals.
         if dp.folds.len > 0 {
+            let fold_shared = opp_hands.checked_mul(4).ok_or_else(|| invalid("fold shared memory"))?;
             let mut l = stream.launch_builder(&kernels.fold_values);
             push(&mut l, &dp.folds);
             push(&mut l, &dp.fold_payoff);
@@ -406,8 +412,9 @@ impl Engine {
             push(&mut l, &dp.opp_card_off);
             push(&mut l, &dp.opp_card_hands);
             l.arg(&hands).arg(&opp_hands);
-            // SAFETY: arguments match `fold_values`; indices are validated.
-            unsafe { l.launch(per_terminal_grid(dp.folds.len, 0)) }?;
+            // SAFETY: arguments match `fold_values`; indices are validated,
+            // and the dynamic shared memory holds `opp_hands` floats.
+            unsafe { l.launch(per_terminal_grid(dp.folds.len, THREADS, fold_shared)) }?;
         }
         if dp.showdowns.len > 0 {
             let shared = showdown_shared_bytes(pp.tables.max_opp);
@@ -421,6 +428,8 @@ impl Engine {
             push(&mut l, &dp.win);
             push(&mut l, &dp.lose);
             push(&mut l, &dp.tie);
+            push(&mut l, &dp.showdown_fold);
+            push(&mut l, &dp.showdown_fold_payoff);
             push(&mut l, &dp.slots);
             push(&mut l, &tree.scalar);
             l.arg(&*alive).arg(&alive_len);
@@ -439,7 +448,7 @@ impl Engine {
             l.arg(&hands).arg(&opp_hands).arg(&pp.tables.max_opp);
             // SAFETY: arguments match `showdown_values`; indices are
             // validated and the dynamic shared memory is sized for `max_opp`.
-            unsafe { l.launch(per_terminal_grid(dp.showdowns.len, shared)) }?;
+            unsafe { l.launch(per_terminal_grid(dp.showdowns.len, THREADS, shared)) }?;
         }
 
         // 4. Bottom-up: values and the traverser's regret updates.

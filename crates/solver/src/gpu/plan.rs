@@ -104,6 +104,12 @@ pub(crate) struct PlayerPlan {
     pub win: Vec<f64>,
     pub lose: Vec<f64>,
     pub tie: Vec<f64>,
+    /// Per showdown: a fold terminal with the same opponent reach (both
+    /// children of one of the traverser's nodes, as the CPU groups them),
+    /// evaluated by the showdown kernel from the same sums and left out of
+    /// `folds`; `NONE` if there is none.
+    pub showdown_fold: Vec<u32>,
+    pub showdown_fold_payoff: Vec<f64>,
     /// The traverser's hands' cards, packed `c1 | c2 << 8`.
     pub my_cards: Vec<u32>,
     /// Index of the opponent's identical combo, or `NONE`.
@@ -341,6 +347,8 @@ impl Plan {
                 + b(&pp.win)
                 + b(&pp.lose)
                 + b(&pp.tie)
+                + b(&pp.showdown_fold)
+                + b(&pp.showdown_fold_payoff)
                 + b(&pp.my_cards)
                 + b(&pp.same)
                 + b(&pp.opp_cards)
@@ -571,11 +579,26 @@ impl Plan {
         ensure(pp.fold_payoff.len() == pp.folds.len(), || "fold payoffs".into())?;
         let ns = pp.showdowns.len();
         ensure(
-            pp.showdown_table.len() == ns && pp.win.len() == ns && pp.lose.len() == ns && pp.tie.len() == ns,
+            pp.showdown_table.len() == ns
+                && pp.win.len() == ns
+                && pp.lose.len() == ns
+                && pp.tie.len() == ns
+                && pp.showdown_fold.len() == ns
+                && pp.showdown_fold_payoff.len() == ns,
             || "showdown arrays".into(),
         )?;
+        // A paired fold shares its showdown's opponent reach.
+        for (&showdown, &fold) in pp.showdowns.iter().zip(&pp.showdown_fold) {
+            if fold != NONE {
+                ensure(
+                    at(&pp.slot, fold as usize, "slot")? == at(&pp.slot, showdown as usize, "slot")?,
+                    || format!("fold {fold} paired with showdown {showdown} has another reach"),
+                )?;
+            }
+        }
+        let paired = pp.showdown_fold.iter().filter(|&&f| f != NONE);
         let mut terminal_seen = vec![false; nn];
-        for &id in pp.folds.iter().chain(&pp.showdowns) {
+        for &id in pp.folds.iter().chain(&pp.showdowns).chain(paired) {
             let i = id as usize;
             ensure(self.node(i)?.actor == NONE, || format!("terminal list entry {id} isn't a terminal"))?;
             let seen =
@@ -602,9 +625,14 @@ impl Plan {
             "showdown table out of range".into()
         })?;
         let finite = |v: &[f64]| v.iter().all(|x| x.is_finite());
-        ensure(finite(&pp.fold_payoff) && finite(&pp.win) && finite(&pp.lose) && finite(&pp.tie), || {
-            "non-finite payoff".into()
-        })?;
+        ensure(
+            finite(&pp.fold_payoff)
+                && finite(&pp.win)
+                && finite(&pp.lose)
+                && finite(&pp.tie)
+                && finite(&pp.showdown_fold_payoff),
+            || "non-finite payoff".into(),
+        )?;
 
         // Hands.
         ensure(pp.my_cards.len() == n as usize && pp.same.len() == n as usize, || "hand arrays".into())?;
@@ -775,6 +803,7 @@ impl PlayerPlan {
             pp.levels.push(range);
         }
         pp.num_slots = u32::try_from(next_slot).map_err(|_| invalid("too many reach slots"))?;
+        pp.pair_folds_with_showdowns(ctx, plan, p)?;
 
         pp.my_cards = side(&hs.cards, p)?.iter().map(|&(a, b)| pack_cards(a, b)).collect();
         pp.opp_cards = side(&hs.cards, o)?.iter().map(|&(a, b)| pack_cards(a, b)).collect();
@@ -802,6 +831,55 @@ impl PlayerPlan {
         pp.opp_card_hands = list;
         pp.tables = Tables::build(ctx.tables, hs, p)?;
         Ok(pp)
+    }
+}
+
+impl PlayerPlan {
+    /// Moves each fold that shares its opponent reach with a showdown (the
+    /// fold and the call, both children of one of the traverser's nodes)
+    /// into that showdown's `showdown_fold`, like the CPU's `showdown_batch`
+    /// grouping. Only batched terminals are paired: the CPU evaluates the
+    /// others one at a time.
+    fn pair_folds_with_showdowns(&mut self, ctx: &Ctx, plan: &Plan, p: usize) -> Result<(), GpuError> {
+        let nodes = &ctx.tree.nodes;
+        self.showdown_fold = vec![NONE; self.showdowns.len()];
+        self.showdown_fold_payoff = vec![0.0; self.showdowns.len()];
+        let mut showdown_index = vec![NONE; nodes.len()];
+        for (k, &id) in self.showdowns.iter().enumerate() {
+            *showdown_index.get_mut(id as usize).ok_or_else(|| invalid("showdown out of range"))? =
+                to_u32(k, "showdowns")?;
+        }
+        let mut paired = vec![false; nodes.len()];
+        for node in nodes.iter().filter(|n| matches!(n.kind, Kind::Player(q) if q as usize == p)) {
+            let batched = |c: usize| at(&plan.scalar, c, "scalar").is_ok_and(|s| s == 0);
+            let fold =
+                node.children().find(|&c| matches!(nodes.get(c), Some(n) if matches!(n.kind, Kind::Fold(_))));
+            let showdown = node
+                .children()
+                .find(|&c| matches!(nodes.get(c), Some(n) if matches!(n.kind, Kind::Showdown)));
+            let (Some(fold), Some(showdown)) = (fold, showdown) else { continue };
+            if !batched(fold) || !batched(showdown) {
+                continue;
+            }
+            let k = at(&showdown_index, showdown, "showdown index")? as usize;
+            let fold_node = nodes.get(fold).ok_or_else(|| invalid("fold out of range"))?;
+            *self.showdown_fold.get_mut(k).ok_or_else(|| invalid("showdown out of range"))? =
+                to_u32(fold, "fold")?;
+            *self.showdown_fold_payoff.get_mut(k).ok_or_else(|| invalid("showdown out of range"))? =
+                fold_payoff(ctx, fold_node, p);
+            *paired.get_mut(fold).ok_or_else(|| invalid("fold out of range"))? = true;
+        }
+        let mut folds = Vec::with_capacity(self.folds.len());
+        let mut payoffs = Vec::with_capacity(self.folds.len());
+        for (&id, &pay) in self.folds.iter().zip(&self.fold_payoff) {
+            if !at(&paired, id as usize, "paired")? {
+                folds.push(id);
+                payoffs.push(pay);
+            }
+        }
+        self.folds = folds;
+        self.fold_payoff = payoffs;
+        Ok(())
     }
 }
 

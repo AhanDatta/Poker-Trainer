@@ -338,3 +338,63 @@ fn scalar_flags_follow_the_cpu_evaluators() {
         assert_eq!(plan.scalar[id] == 1, terminal, "batching off, node {id}");
     }
 }
+
+/// Folds are paired with the showdown that shares their reach exactly where
+/// the CPU groups them (both children of one of the traverser's nodes, both
+/// batched), and leave the fold list.
+#[test]
+fn folds_pair_with_their_showdowns() {
+    use crate::tree::Kind;
+    for cfg in [river_config(), turn_config(), allin_turn_config()] {
+        let (s, plan) = plan_for(cfg);
+        for (p, pp) in plan.players.iter().enumerate() {
+            let mut expected = 0;
+            for node in &s.tree.nodes {
+                let Kind::Player(q) = node.kind else { continue };
+                if q as usize != p {
+                    continue;
+                }
+                let kind = |c: usize| s.tree.nodes[c].kind;
+                let fold = node.children().find(|&c| matches!(kind(c), Kind::Fold(_)));
+                let showdown = node.children().find(|&c| matches!(kind(c), Kind::Showdown));
+                if let (Some(f), Some(sd)) = (fold, showdown) {
+                    if plan.scalar[f] == 0 && plan.scalar[sd] == 0 {
+                        expected += 1;
+                        let k = pp.showdowns.iter().position(|&x| x as usize == sd).unwrap();
+                        assert_eq!(pp.showdown_fold[k] as usize, f);
+                        assert!(!pp.folds.contains(&(f as u32)), "paired fold {f} still listed");
+                    }
+                }
+            }
+            let paired = pp.showdown_fold.iter().filter(|&&f| f != NONE).count();
+            assert_eq!(paired, expected, "player {p}");
+            assert!(paired > 0, "player {p}: spot has no pairs");
+        }
+    }
+}
+
+#[test]
+fn validate_rejects_bad_pairings() {
+    let (_, plan) = plan_for(river_config());
+    let k = plan.players[0].showdown_fold.iter().position(|&f| f != NONE).unwrap();
+    let paired = plan.players[0].showdown_fold[k];
+    let unpaired = plan.players[0].folds[0];
+    let mut listed_twice = plan.clone();
+    listed_twice.players[0].folds.push(paired);
+    listed_twice.players[0].fold_payoff.push(0.0);
+    assert!(matches!(listed_twice.validate(), Err(GpuError::InvalidInput(_))), "fold listed twice accepted");
+    // Swap a paired and an unpaired fold: each terminal is still listed once,
+    // but the newly paired fold has another opponent reach.
+    let mut other_reach = plan.clone();
+    let pp = &mut other_reach.players[0];
+    assert_ne!(pp.slot[unpaired as usize], pp.slot[paired as usize]);
+    pp.showdown_fold[k] = unpaired;
+    pp.folds[0] = paired;
+    match other_reach.validate() {
+        Err(GpuError::InvalidInput(msg)) => assert!(msg.contains("another reach"), "{msg}"),
+        other => panic!("mispaired fold accepted: {other:?}"),
+    }
+    let mut bad_payoff = plan;
+    bad_payoff.players[0].showdown_fold_payoff[k] = f64::INFINITY;
+    assert!(matches!(bad_payoff.validate(), Err(GpuError::InvalidInput(_))), "infinite payoff accepted");
+}
