@@ -21,6 +21,47 @@ fn future(raise: &str, max_raises: u32) -> PostflopMenu {
     }
 }
 
+/// Peak working set (Windows has no `/proc`): `K32GetProcessMemoryInfo`
+/// from kernel32, declared here so the example needs no extra crate.
+#[cfg(windows)]
+fn peak_rss_gb() -> f64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn K32GetProcessMemoryInfo(
+            process: *mut std::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+    }
+    let mut c = ProcessMemoryCounters::default();
+    let size = std::mem::size_of::<ProcessMemoryCounters>() as u32;
+    c.cb = size;
+    // SAFETY: `c` is a correctly sized, writable PROCESS_MEMORY_COUNTERS and
+    // the pseudo-handle from GetCurrentProcess needs no closing.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, size) };
+    if ok != 0 {
+        c.peak_working_set_size as f64 / 1e9
+    } else {
+        0.0
+    }
+}
+
+#[cfg(not(windows))]
 fn peak_rss_gb() -> f64 {
     std::fs::read_to_string("/proc/self/status")
         .ok()

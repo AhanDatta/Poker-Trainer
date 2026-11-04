@@ -24,6 +24,8 @@
 
 mod cfr;
 mod eval;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 mod hands;
 mod iso;
 pub mod multi;

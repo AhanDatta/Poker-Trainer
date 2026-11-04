@@ -6,10 +6,29 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# CUDA backend (needs the CUDA Toolkit at build time, the NVIDIA driver at run
+# time). Off by default so the default build stays pure Rust.
+gpu = ["dep:cudarc", "dep:cc"]
+
 [dependencies]
 holdem.workspace = true
 rand.workspace = true
 rayon.workspace = true
+# Driver API only, loaded dynamically (no link-time CUDA dependency). `nvrtc`
+# is enabled solely for the module-image type used by `load_module`; NVRTC
+# itself is never called. Bindings for CUDA 13.0 run on any 13.x driver.
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = [
+    "std",
+    "driver",
+    "nvrtc",
+    "dynamic-loading",
+    "cuda-13000",
+] }
+
+[build-dependencies]
+# Locates MSVC's cl.exe for nvcc on Windows (gpu feature only).
+cc = { version = "1.2", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true
