@@ -274,6 +274,12 @@ pub struct Solver {
     iterations: u32,
     exploitability: f64,
     batch_river: bool,
+    /// The GPU engine after a successful `use_gpu`.
+    #[cfg(feature = "gpu")]
+    gpu: Option<Box<gpu::Engine>>,
+    /// Why the GPU was abandoned during a solve.
+    #[cfg(feature = "gpu")]
+    gpu_error: Option<String>,
 }
 
 impl Solver {
@@ -362,6 +368,10 @@ impl Solver {
             iterations: 0,
             exploitability: f64::INFINITY,
             batch_river: true,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            #[cfg(feature = "gpu")]
+            gpu_error: None,
         })
     }
 
@@ -455,9 +465,62 @@ impl Solver {
         cancel: &std::sync::atomic::AtomicBool,
         mut on_progress: impl FnMut(&Progress) -> bool,
     ) -> Progress {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            let result = self
+                .run_solve(
+                    opts,
+                    cancel,
+                    &mut on_progress,
+                    &mut Self::gpu_iteration,
+                    &mut Self::gpu_exploitability,
+                )
+                .and_then(|p| self.download_from_gpu().map(|()| p));
+            match result {
+                Ok(p) => return p,
+                Err(e) => self.fall_back_to_cpu(e),
+            }
+        }
+        match self.run_solve(
+            opts,
+            cancel,
+            &mut on_progress,
+            &mut Self::cpu_iteration,
+            &mut Self::cpu_exploitability,
+        ) {
+            Ok(p) => p,
+            Err(never) => match never {},
+        }
+    }
+
+    /// One DCFR iteration on the CPU: player 0's update, then player 1's.
+    fn cpu_iteration(&mut self) -> Result<(), std::convert::Infallible> {
+        let d = Discount::new(self.iterations, &self.config.dcfr);
+        let ctx = self.ctx();
+        for p in 0..2 {
+            let mut out = vec![0f32; self.hands.len(p)];
+            cfr::traverse(&ctx, 0, p, &self.hands.weights[p ^ 1], Mode::Cfr(d), &mut out);
+        }
+        Ok(())
+    }
+
+    fn cpu_exploitability(&mut self) -> Result<f64, std::convert::Infallible> {
+        Ok(cfr::exploitability(&self.ctx(), self.raked()))
+    }
+
+    /// The solve loop shared by the backends: `iterate` runs iteration
+    /// `self.iterations` (already incremented), `measure` returns the
+    /// exploitability of the current average strategy.
+    fn run_solve<E>(
+        &mut self,
+        opts: &SolveOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: &mut dyn FnMut(&Progress) -> bool,
+        iterate: &mut dyn FnMut(&mut Solver) -> Result<(), E>,
+        measure: &mut dyn FnMut(&mut Solver) -> Result<f64, E>,
+    ) -> Result<Progress, E> {
         let pot = self.config.root.pot as f64;
         let check_every = opts.check_every.max(1);
-        let raked = self.raked();
         let mut progress = Progress {
             iteration: self.iterations,
             max_iterations: opts.max_iterations,
@@ -471,18 +534,13 @@ impl Solver {
         while self.iterations < opts.max_iterations {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 progress.finished = true;
-                return progress;
+                return Ok(progress);
             }
             self.iterations += 1;
-            let d = Discount::new(self.iterations, &self.config.dcfr);
-            let ctx = self.ctx();
-            for p in 0..2 {
-                let mut out = vec![0f32; self.hands.len(p)];
-                cfr::traverse(&ctx, 0, p, &self.hands.weights[p ^ 1], Mode::Cfr(d), &mut out);
-            }
+            iterate(self)?;
             let last = self.iterations >= opts.max_iterations;
             if self.iterations >= next_check || last {
-                let e = cfr::exploitability(&ctx, raked);
+                let e = measure(self)?;
                 self.exploitability = e;
                 progress.iteration = self.iterations;
                 progress.exploitability = e;
@@ -492,7 +550,7 @@ impl Solver {
                 let keep_going = on_progress(&progress);
                 if done || !keep_going {
                     progress.finished = true;
-                    return progress;
+                    return Ok(progress);
                 }
                 let t = self.iterations;
                 next_check = t + next_check_gap(last_check, (t, e), target, check_every);
@@ -500,7 +558,80 @@ impl Solver {
             }
         }
         progress.finished = true;
-        progress
+        Ok(progress)
+    }
+
+    /// Moves the solve to the GPU (experimental: for now only river roots
+    /// with `f32` storage). The current regrets and strategy sums are
+    /// uploaded, so a solve can continue on the GPU; results are copied back
+    /// when `solve` returns, after which `query` and the other read methods
+    /// work as usual. If the GPU fails during a solve, the solver discards
+    /// the GPU state, restarts the solve from scratch on the CPU, and
+    /// [`Self::gpu_error`] says what happened.
+    #[cfg(feature = "gpu")]
+    pub fn use_gpu(&mut self) -> Result<(), gpu::GpuError> {
+        let plan = gpu::Plan::build(&self.ctx())?;
+        let device = gpu::Gpu::new()?;
+        let (regrets, sums) = self.store.f32_buffers_mut().ok_or_else(|| {
+            gpu::GpuError::InvalidInput("compressed storage isn't supported on the GPU yet".into())
+        })?;
+        self.gpu = Some(Box::new(gpu::Engine::new(device, plan, regrets, sums)?));
+        self.gpu_error = None;
+        Ok(())
+    }
+
+    /// Whether solves currently run on the GPU.
+    #[cfg(feature = "gpu")]
+    pub fn uses_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// Why the GPU was abandoned during a solve, if it was.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_error(&self) -> Option<&str> {
+        self.gpu_error.as_deref()
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_engine(&mut self) -> Result<&mut gpu::Engine, gpu::GpuError> {
+        self.gpu.as_deref_mut().ok_or_else(|| gpu::GpuError::InvalidInput("no GPU engine".into()))
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_iteration(&mut self) -> Result<(), gpu::GpuError> {
+        let d = Discount::new(self.iterations, &self.config.dcfr);
+        self.gpu_engine()?.cfr_iteration(d)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_exploitability(&mut self) -> Result<f64, gpu::GpuError> {
+        let raked = self.raked();
+        self.gpu_engine()?.exploitability(raked)
+    }
+
+    /// Copies the GPU's regrets and strategy sums into host storage.
+    #[cfg(feature = "gpu")]
+    fn download_from_gpu(&mut self) -> Result<(), gpu::GpuError> {
+        let Some(engine) = &self.gpu else { return Ok(()) };
+        let (regrets, sums) = self.store.f32_buffers_mut().ok_or_else(|| {
+            gpu::GpuError::InvalidInput("compressed storage isn't supported on the GPU yet".into())
+        })?;
+        engine.download(regrets, sums)
+    }
+
+    /// After a GPU failure: drops the GPU state and resets the solve, so it
+    /// restarts on the CPU from a clean slate.
+    #[cfg(feature = "gpu")]
+    fn fall_back_to_cpu(&mut self, e: gpu::GpuError) {
+        self.gpu = None;
+        self.gpu_error = Some(e.to_string());
+        self.store = Storage::new(
+            self.tree.storage_len as usize,
+            self.tree.num_player_nodes as usize,
+            self.stats.compressed,
+        );
+        self.iterations = 0;
+        self.exploitability = f64::INFINITY;
     }
 
     fn average_strategy(&self, id: usize, n: usize) -> Vec<f32> {

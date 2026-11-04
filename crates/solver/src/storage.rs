@@ -63,6 +63,16 @@ impl<T: Copy + Default + Send + Sync> SharedBuf<T> {
         debug_assert!(off + len <= self.data.len());
         std::slice::from_raw_parts_mut(self.ptr.add(off), len)
     }
+
+    /// The whole buffer. `&mut self` rules out any other live slice.
+    #[cfg(feature = "gpu")]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        let len = self.len();
+        // SAFETY: `ptr` points to `len` initialized elements owned by
+        // `data`, and the exclusive borrow of `self` means no slice handed
+        // out by `get`/`get_mut` is alive.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+    }
 }
 
 /// Whether to store regrets/strategies as `f32` or compressed 16-bit values.
@@ -146,6 +156,15 @@ impl Storage {
 
     pub fn is_compressed(&self) -> bool {
         matches!(self, Storage::Compressed { .. })
+    }
+
+    /// The `f32` regrets and strategy sums (`None` for compressed storage).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn f32_buffers_mut(&mut self) -> Option<(&mut [f32], &mut [f32])> {
+        match self {
+            Storage::F32 { regrets, strat } => Some((regrets.as_mut_slice(), strat.as_mut_slice())),
+            Storage::Compressed { .. } => None,
+        }
     }
 
     /// Copies all values from a storage of the same shape (tests).

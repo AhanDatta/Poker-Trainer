@@ -28,9 +28,19 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests;
 
+mod engine;
+mod plan;
+#[cfg(test)]
+mod testutil;
+
+pub(crate) use engine::Engine;
+pub(crate) use plan::Plan;
+
 /// Kernel images built by `build.rs` from `cuda/kernels/*.cu`.
 static REGRET_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/regret.fatbin"));
 static SELFTEST_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/selftest.fatbin"));
+static TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse.fatbin"));
+static TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.fatbin"));
 
 /// Whether the kernels were built with device bounds assertions
 /// (`CCCL_ENABLE_DEVICE_ASSERTIONS`): on in debug/test builds, off in release
@@ -158,6 +168,12 @@ struct Kernels {
     regret_match_f32: CudaFunction,
     regret_match_i16: CudaFunction,
     selftest_out_of_bounds: CudaFunction,
+    begin_traversal: CudaFunction,
+    opponent_split: CudaFunction,
+    own_update: CudaFunction,
+    opponent_sum: CudaFunction,
+    fold_values: CudaFunction,
+    showdown_values: CudaFunction,
 }
 
 /// A CUDA device with the solver's kernels loaded.
@@ -194,10 +210,18 @@ impl Gpu {
         // with an error (not a panic).
         let regret = ctx.load_module(Ptx::from_binary(REGRET_IMAGE.to_vec()))?;
         let selftest = ctx.load_module(Ptx::from_binary(SELFTEST_IMAGE.to_vec()))?;
+        let traverse = ctx.load_module(Ptx::from_binary(TRAVERSE_IMAGE.to_vec()))?;
+        let terminal = ctx.load_module(Ptx::from_binary(TERMINAL_IMAGE.to_vec()))?;
         let kernels = Kernels {
             regret_match_f32: regret.load_function("regret_match_f32")?,
             regret_match_i16: regret.load_function("regret_match_i16")?,
             selftest_out_of_bounds: selftest.load_function("selftest_out_of_bounds")?,
+            begin_traversal: traverse.load_function("begin_traversal")?,
+            opponent_split: traverse.load_function("opponent_split")?,
+            own_update: traverse.load_function("own_update")?,
+            opponent_sum: traverse.load_function("opponent_sum")?,
+            fold_values: terminal.load_function("fold_values")?,
+            showdown_values: terminal.load_function("showdown_values")?,
         };
         Ok(Gpu { stream: ctx.default_stream(), kernels, name, compute_capability })
     }
