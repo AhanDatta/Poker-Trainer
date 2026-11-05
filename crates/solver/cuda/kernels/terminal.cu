@@ -413,153 +413,160 @@ __device__ void showdown_values_impl(const ShowdownArgs& args) {
 
 using solver::u32;
 
+// The C entry points: each kernel once per precision (`*_exact`: f64
+// accumulators, `*_fast`: double-single), so each is compiled for its own
+// register budget. One entry point picking the precision at run time held
+// the fast path to the exact path's registers: 9% slower showdowns on the
+// turn. The macros only stamp out the two entry points' identical
+// parameter lists.
+
 /// Fold terminals `[segment_start, segment_start + segment_count)` of the
-/// list: `value[h] = payoff * compatible_reach(h)`. `exact` picks
-/// f64 (exact) or double-single (fast) accumulators. Dynamic shared memory:
+/// list: `value[h] = payoff * compatible_reach(h)`. Dynamic shared memory:
 /// `opp_hands` floats.
-extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const u32* list_ptr,
-                                                                           u32 list_len,
-                                                                           const double* payoff_ptr,
-                                                                           u32 payoff_len,
-                                                                           const u32* slots_ptr,
-                                                                           u32 slots_len,
-                                                                           const u32* scalar_ptr,
-                                                                           u32 scalar_len,
-                                                                           const u32* alive_ptr,
-                                                                           u32 alive_len,
-                                                                           const float* reach_ptr,
-                                                                           u32 reach_len,
-                                                                           const u32* rows_ptr,
-                                                                           u32 rows_len,
-                                                                           float* values_ptr,
-                                                                           u32 values_len,
-                                                                           const u32* my_cards_ptr,
-                                                                           u32 my_cards_len,
-                                                                           const u32* same_ptr,
-                                                                           u32 same_len,
-                                                                           const u32* card_off_ptr,
-                                                                           u32 card_off_len,
-                                                                           const u32* card_hands_ptr,
-                                                                           u32 card_hands_len,
-                                                                           u32 segment_start,
-                                                                           u32 segment_count,
-                                                                           u32 hands,
-                                                                           u32 opp_hands,
-                                                                           u32 exact) {
-  using namespace solver;
-  const FoldArgs args{
-      .list = view(list_ptr, list_len).subspan(segment_start, segment_count),
-      .payoff = view(payoff_ptr, payoff_len).subspan(segment_start, segment_count),
-      .slots = view(slots_ptr, slots_len),
-      .scalar = view(scalar_ptr, scalar_len),
-      .alive = view(alive_ptr, alive_len),
-      .reach = view(reach_ptr, reach_len),
-      .values = view(values_ptr, values_len),
-      .rows = view(rows_ptr, rows_len),
-      .my_cards = view(my_cards_ptr, my_cards_len),
-      .same = view(same_ptr, same_len),
-      .card_off = view(card_off_ptr, card_off_len),
-      .card_hands = view(card_hands_ptr, card_hands_len),
-      .hands = hands,
-      .opp_hands = opp_hands,
-  };
-  if (exact != 0u) {
-    fold_values_impl<double>(args);
-  } else {
-    fold_values_impl<DoubleFloat>(args);
+#define SOLVER_FOLD_ENTRY(NAME, ACC)                                                  \
+  extern "C" __global__ void __launch_bounds__(solver::kThreads) NAME(                \
+      const u32* list_ptr,                                                            \
+      u32 list_len,                                                                   \
+      const double* payoff_ptr,                                                       \
+      u32 payoff_len,                                                                 \
+      const u32* slots_ptr,                                                           \
+      u32 slots_len,                                                                  \
+      const u32* scalar_ptr,                                                          \
+      u32 scalar_len,                                                                 \
+      const u32* alive_ptr,                                                           \
+      u32 alive_len,                                                                  \
+      const float* reach_ptr,                                                         \
+      u32 reach_len,                                                                  \
+      const u32* rows_ptr,                                                            \
+      u32 rows_len,                                                                   \
+      float* values_ptr,                                                              \
+      u32 values_len,                                                                 \
+      const u32* my_cards_ptr,                                                        \
+      u32 my_cards_len,                                                               \
+      const u32* same_ptr,                                                            \
+      u32 same_len,                                                                   \
+      const u32* card_off_ptr,                                                        \
+      u32 card_off_len,                                                               \
+      const u32* card_hands_ptr,                                                      \
+      u32 card_hands_len,                                                             \
+      u32 segment_start,                                                              \
+      u32 segment_count,                                                              \
+      u32 hands,                                                                      \
+      u32 opp_hands) {                                                                \
+    using namespace solver;                                                           \
+    const FoldArgs args{                                                              \
+        .list = view(list_ptr, list_len).subspan(segment_start, segment_count),       \
+        .payoff = view(payoff_ptr, payoff_len).subspan(segment_start, segment_count), \
+        .slots = view(slots_ptr, slots_len),                                          \
+        .scalar = view(scalar_ptr, scalar_len),                                       \
+        .alive = view(alive_ptr, alive_len),                                          \
+        .reach = view(reach_ptr, reach_len),                                          \
+        .values = view(values_ptr, values_len),                                       \
+        .rows = view(rows_ptr, rows_len),                                             \
+        .my_cards = view(my_cards_ptr, my_cards_len),                                 \
+        .same = view(same_ptr, same_len),                                             \
+        .card_off = view(card_off_ptr, card_off_len),                                 \
+        .card_hands = view(card_hands_ptr, card_hands_len),                           \
+        .hands = hands,                                                               \
+        .opp_hands = opp_hands,                                                       \
+    };                                                                                \
+    fold_values_impl<ACC>(args);                                                      \
   }
-}
+
+SOLVER_FOLD_ENTRY(fold_values_exact, double)
+SOLVER_FOLD_ENTRY(fold_values_fast, DoubleFloat)
+#undef SOLVER_FOLD_ENTRY
 
 /// Showdown terminals `[segment_start, segment_start + segment_count)` of
-/// the list: `value[h] = win * weaker(h) + lose * stronger(h)`,
-/// plus `tie * tied(h)` when ties pay something (mid-street roots, rake).
-/// A paired fold (`paired_fold[k]`, payoff `paired_payoff[k]`) shares the
-/// showdown's opponent reach and is evaluated from the same sums. `exact`
-/// picks f64 (exact) or double-single (fast) accumulators.
-extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(const u32* list_ptr,
-                                                                               u32 list_len,
-                                                                               const u32* table_of_ptr,
-                                                                               u32 table_of_len,
-                                                                               const double* win_ptr,
-                                                                               u32 win_len,
-                                                                               const double* lose_ptr,
-                                                                               u32 lose_len,
-                                                                               const double* tie_ptr,
-                                                                               u32 tie_len,
-                                                                               const u32* paired_fold_ptr,
-                                                                               u32 paired_fold_len,
-                                                                               const double* paired_payoff_ptr,
-                                                                               u32 paired_payoff_len,
-                                                                               const u32* slots_ptr,
-                                                                               u32 slots_len,
-                                                                               const u32* scalar_ptr,
-                                                                               u32 scalar_len,
-                                                                               const u32* alive_ptr,
-                                                                               u32 alive_len,
-                                                                               const float* reach_ptr,
-                                                                               u32 reach_len,
-                                                                               const u32* rows_ptr,
-                                                                               u32 rows_len,
-                                                                               float* values_ptr,
-                                                                               u32 values_len,
-                                                                               const u32* my_cards_ptr,
-                                                                               u32 my_cards_len,
-                                                                               const u32* same_ptr,
-                                                                               u32 same_len,
-                                                                               const u32* opp_off_ptr,
-                                                                               u32 opp_off_len,
-                                                                               const u32* opp_len_ptr,
-                                                                               u32 opp_len_len,
-                                                                               const u32* opp_order_ptr,
-                                                                               u32 opp_order_len,
-                                                                               const u32* card_base_ptr,
-                                                                               u32 card_base_len,
-                                                                               const u32* card_off_ptr,
-                                                                               u32 card_off_len,
-                                                                               const u32* card_pos_ptr,
-                                                                               u32 card_pos_len,
-                                                                               const u32* ranges_ptr,
-                                                                               u32 ranges_len,
-                                                                               const u32* ranks_ptr,
-                                                                               u32 ranks_len,
-                                                                               u32 segment_start,
-                                                                               u32 segment_count,
-                                                                               u32 hands,
-                                                                               u32 opp_hands,
-                                                                               u32 max_opp,
-                                                                               u32 exact) {
-  using namespace solver;
-  const ShowdownArgs args{
-      .list = view(list_ptr, list_len).subspan(segment_start, segment_count),
-      .table_of = view(table_of_ptr, table_of_len).subspan(segment_start, segment_count),
-      .win = view(win_ptr, win_len).subspan(segment_start, segment_count),
-      .lose = view(lose_ptr, lose_len).subspan(segment_start, segment_count),
-      .tie = view(tie_ptr, tie_len).subspan(segment_start, segment_count),
-      .paired_fold = view(paired_fold_ptr, paired_fold_len).subspan(segment_start, segment_count),
-      .paired_payoff = view(paired_payoff_ptr, paired_payoff_len).subspan(segment_start, segment_count),
-      .slots = view(slots_ptr, slots_len),
-      .scalar = view(scalar_ptr, scalar_len),
-      .alive = view(alive_ptr, alive_len),
-      .reach = view(reach_ptr, reach_len),
-      .values = view(values_ptr, values_len),
-      .rows = view(rows_ptr, rows_len),
-      .my_cards = view(my_cards_ptr, my_cards_len),
-      .same = view(same_ptr, same_len),
-      .opp_off = view(opp_off_ptr, opp_off_len),
-      .opp_len = view(opp_len_ptr, opp_len_len),
-      .opp_order = view(opp_order_ptr, opp_order_len),
-      .card_base = view(card_base_ptr, card_base_len),
-      .card_off = view(card_off_ptr, card_off_len),
-      .card_pos = view(card_pos_ptr, card_pos_len),
-      .ranges = view(ranges_ptr, ranges_len),
-      .ranks = view(ranks_ptr, ranks_len),
-      .hands = hands,
-      .opp_hands = opp_hands,
-      .max_opp = max_opp,
-  };
-  if (exact != 0u) {
-    showdown_values_impl<double>(args);
-  } else {
-    showdown_values_impl<DoubleFloat>(args);
+/// the list: `value[h] = win * weaker(h) + lose * stronger(h)`, plus
+/// `tie * tied(h)` when ties pay something (mid-street roots, rake). A
+/// paired fold (`paired_fold[k]`, payoff `paired_payoff[k]`) shares the
+/// showdown's opponent reach and is evaluated from the same sums.
+#define SOLVER_SHOWDOWN_ENTRY(NAME, ACC)                                                                   \
+  extern "C" __global__ void __launch_bounds__(solver::kThreads) NAME(                                     \
+      const u32* list_ptr,                                                                                 \
+      u32 list_len,                                                                                        \
+      const u32* table_of_ptr,                                                                             \
+      u32 table_of_len,                                                                                    \
+      const double* win_ptr,                                                                               \
+      u32 win_len,                                                                                         \
+      const double* lose_ptr,                                                                              \
+      u32 lose_len,                                                                                        \
+      const double* tie_ptr,                                                                               \
+      u32 tie_len,                                                                                         \
+      const u32* paired_fold_ptr,                                                                          \
+      u32 paired_fold_len,                                                                                 \
+      const double* paired_payoff_ptr,                                                                     \
+      u32 paired_payoff_len,                                                                               \
+      const u32* slots_ptr,                                                                                \
+      u32 slots_len,                                                                                       \
+      const u32* scalar_ptr,                                                                               \
+      u32 scalar_len,                                                                                      \
+      const u32* alive_ptr,                                                                                \
+      u32 alive_len,                                                                                       \
+      const float* reach_ptr,                                                                              \
+      u32 reach_len,                                                                                       \
+      const u32* rows_ptr,                                                                                 \
+      u32 rows_len,                                                                                        \
+      float* values_ptr,                                                                                   \
+      u32 values_len,                                                                                      \
+      const u32* my_cards_ptr,                                                                             \
+      u32 my_cards_len,                                                                                    \
+      const u32* same_ptr,                                                                                 \
+      u32 same_len,                                                                                        \
+      const u32* opp_off_ptr,                                                                              \
+      u32 opp_off_len,                                                                                     \
+      const u32* opp_len_ptr,                                                                              \
+      u32 opp_len_len,                                                                                     \
+      const u32* opp_order_ptr,                                                                            \
+      u32 opp_order_len,                                                                                   \
+      const u32* card_base_ptr,                                                                            \
+      u32 card_base_len,                                                                                   \
+      const u32* card_off_ptr,                                                                             \
+      u32 card_off_len,                                                                                    \
+      const u32* card_pos_ptr,                                                                             \
+      u32 card_pos_len,                                                                                    \
+      const u32* ranges_ptr,                                                                               \
+      u32 ranges_len,                                                                                      \
+      const u32* ranks_ptr,                                                                                \
+      u32 ranks_len,                                                                                       \
+      u32 segment_start,                                                                                   \
+      u32 segment_count,                                                                                   \
+      u32 hands,                                                                                           \
+      u32 opp_hands,                                                                                       \
+      u32 max_opp) {                                                                                       \
+    using namespace solver;                                                                                \
+    const ShowdownArgs args{                                                                               \
+        .list = view(list_ptr, list_len).subspan(segment_start, segment_count),                            \
+        .table_of = view(table_of_ptr, table_of_len).subspan(segment_start, segment_count),                \
+        .win = view(win_ptr, win_len).subspan(segment_start, segment_count),                               \
+        .lose = view(lose_ptr, lose_len).subspan(segment_start, segment_count),                            \
+        .tie = view(tie_ptr, tie_len).subspan(segment_start, segment_count),                               \
+        .paired_fold = view(paired_fold_ptr, paired_fold_len).subspan(segment_start, segment_count),       \
+        .paired_payoff = view(paired_payoff_ptr, paired_payoff_len).subspan(segment_start, segment_count), \
+        .slots = view(slots_ptr, slots_len),                                                               \
+        .scalar = view(scalar_ptr, scalar_len),                                                            \
+        .alive = view(alive_ptr, alive_len),                                                               \
+        .reach = view(reach_ptr, reach_len),                                                               \
+        .values = view(values_ptr, values_len),                                                            \
+        .rows = view(rows_ptr, rows_len),                                                                  \
+        .my_cards = view(my_cards_ptr, my_cards_len),                                                      \
+        .same = view(same_ptr, same_len),                                                                  \
+        .opp_off = view(opp_off_ptr, opp_off_len),                                                         \
+        .opp_len = view(opp_len_ptr, opp_len_len),                                                         \
+        .opp_order = view(opp_order_ptr, opp_order_len),                                                   \
+        .card_base = view(card_base_ptr, card_base_len),                                                   \
+        .card_off = view(card_off_ptr, card_off_len),                                                      \
+        .card_pos = view(card_pos_ptr, card_pos_len),                                                      \
+        .ranges = view(ranges_ptr, ranges_len),                                                            \
+        .ranks = view(ranks_ptr, ranks_len),                                                               \
+        .hands = hands,                                                                                    \
+        .opp_hands = opp_hands,                                                                            \
+        .max_opp = max_opp,                                                                                \
+    };                                                                                                     \
+    showdown_values_impl<ACC>(args);                                                                       \
   }
-}
+
+SOLVER_SHOWDOWN_ENTRY(showdown_values_exact, double)
+SOLVER_SHOWDOWN_ENTRY(showdown_values_fast, DoubleFloat)
+#undef SOLVER_SHOWDOWN_ENTRY

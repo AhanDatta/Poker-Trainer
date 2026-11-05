@@ -216,8 +216,9 @@ struct Kernels {
     chance_sum: CudaFunction,
     opponent_split_compressed: CudaFunction,
     own_update_compressed: CudaFunction,
-    fold_values: CudaFunction,
-    showdown_values: CudaFunction,
+    /// Terminal kernels per precision: `[exact, fast]`.
+    fold_values: [CudaFunction; 2],
+    showdown_values: [CudaFunction; 2],
     double_float_check: CudaFunction,
     double_float_sum: CudaFunction,
 }
@@ -273,8 +274,11 @@ impl Gpu {
             chance_sum: traverse.load_function("chance_sum")?,
             opponent_split_compressed: traverse_compressed.load_function("opponent_split_compressed")?,
             own_update_compressed: traverse_compressed.load_function("own_update_compressed")?,
-            fold_values: terminal.load_function("fold_values")?,
-            showdown_values: terminal.load_function("showdown_values")?,
+            fold_values: [terminal.load_function("fold_values_exact")?, terminal.load_function("fold_values_fast")?],
+            showdown_values: [
+                terminal.load_function("showdown_values_exact")?,
+                terminal.load_function("showdown_values_fast")?,
+            ],
             double_float_check: double_float.load_function("double_float_check")?,
             double_float_sum: double_float.load_function("double_float_sum")?,
         };

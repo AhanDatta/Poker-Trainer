@@ -275,7 +275,7 @@ pub(crate) struct Engine {
     /// Value rows (`Plan::num_rows`, sized for the larger hand count).
     values: CudaSlice<f32>,
     alive: CudaSlice<u32>,
-    /// 1 for f64 terminal sums, 0 for double-single (the kernels' `exact`).
+    /// 1 for f64 terminal sums, 0 for double-single (picks the terminal kernels).
     exact: u32,
 }
 
@@ -498,6 +498,11 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
+    /// The kernel of a `[exact, fast]` pair for this pass's precision.
+    fn by_precision<'k>(&self, pair: &'k [cudarc::driver::CudaFunction; 2]) -> Result<&'k cudarc::driver::CudaFunction, GpuError> {
+        pair.get(usize::from(self.exact == 0)).ok_or_else(|| invalid("kernel pair"))
+    }
+
     /// Root reach and alive flags (slot 0 alive, every other slot dead).
     fn begin(&mut self) -> Result<(), GpuError> {
         let opp_hands = self.pp.opp_hands;
@@ -611,7 +616,7 @@ impl Pass<'_> {
         let (hands, opp_hands) = (pp.hands, pp.opp_hands);
         if seg.folds.count > 0 {
             let fold_shared = opp_hands.checked_mul(4).ok_or_else(|| invalid("fold shared memory"))?;
-            let mut l = stream.launch_builder(&kernels.fold_values);
+            let mut l = stream.launch_builder(self.by_precision(&kernels.fold_values)?);
             push(&mut l, &dp.folds);
             push(&mut l, &dp.fold_payoff);
             push(&mut l, &dp.slots);
@@ -625,8 +630,8 @@ impl Pass<'_> {
             push(&mut l, &dp.opp_card_off);
             push(&mut l, &dp.opp_card_hands);
             l.arg(&seg.folds.start).arg(&seg.folds.count);
-            l.arg(&hands).arg(&opp_hands).arg(&self.exact);
-            // SAFETY: arguments match `fold_values`; indices (the segment's
+            l.arg(&hands).arg(&opp_hands);
+            // SAFETY: arguments match `fold_values_{exact,fast}`; indices (the segment's
             // range included) are validated, and the dynamic shared memory
             // holds `opp_hands` floats.
             unsafe { l.launch(per_terminal_grid(seg.folds.count, THREADS, fold_shared)) }?;
@@ -637,7 +642,7 @@ impl Pass<'_> {
                 return Err(invalid("showdown lists too long for shared memory"));
             }
             let shared = shared as u32;
-            let mut l = stream.launch_builder(&kernels.showdown_values);
+            let mut l = stream.launch_builder(self.by_precision(&kernels.showdown_values)?);
             push(&mut l, &dp.showdowns);
             push(&mut l, &dp.showdown_table);
             push(&mut l, &dp.win);
@@ -662,8 +667,8 @@ impl Pass<'_> {
             push(&mut l, &dp.ranges);
             push(&mut l, &dp.ranks);
             l.arg(&seg.showdowns.start).arg(&seg.showdowns.count);
-            l.arg(&hands).arg(&opp_hands).arg(&pp.tables.max_opp).arg(&self.exact);
-            // SAFETY: arguments match `showdown_values`; indices (the
+            l.arg(&hands).arg(&opp_hands).arg(&pp.tables.max_opp);
+            // SAFETY: arguments match `showdown_values_{exact,fast}`; indices (the
             // segment's range included) are validated and the dynamic shared
             // memory is sized for `max_opp`.
             unsafe { l.launch(per_terminal_grid(seg.showdowns.count, THREADS, shared)) }?;
