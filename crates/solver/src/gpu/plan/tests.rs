@@ -618,3 +618,69 @@ proptest! {
         prop_assert_eq!(plan.num_segments > 1, chunk_count(&s) > 0);
     }
 }
+
+/// Exactly the opponent nodes right below one of the traverser's nodes are
+/// fused, and each level lists its summed opponent nodes first.
+#[test]
+fn opponent_nodes_below_own_nodes_are_fused() {
+    for (name, cfg) in splittable_spots().into_iter().chain([("river", river_config())]) {
+        let (s, plan) = plan_for(cfg);
+        let nodes = &s.tree.nodes;
+        for (p, pp) in plan.players.iter().enumerate() {
+            let mut want = vec![0u32; nodes.len()];
+            for node in nodes {
+                if matches!(node.kind, Kind::Player(q) if q as usize == p) {
+                    for c in node.children() {
+                        if matches!(nodes[c].kind, Kind::Player(q) if q as usize != p) {
+                            want[c] = 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(pp.fused, want, "{name}, player {p}");
+            assert!(want.contains(&1), "{name}, player {p}: nothing fused");
+            let summed: u32 = pp.levels.iter().map(|l| l.opp_sum_count).sum();
+            let fused = want.iter().filter(|&&f| f == 1).count() as u32;
+            assert_eq!(summed + fused, pp.opp_nodes.len() as u32, "{name}, player {p}");
+        }
+        plan.clone().unfused().validate().unwrap();
+    }
+}
+
+#[test]
+fn validate_rejects_bad_fusion() {
+    let (_, plan) = plan_for(turn_config());
+    let nn = plan.num_nodes as usize;
+    let pp = &plan.players[1];
+    let parent = |c: usize| (0..nn).find(|&i| plan.children(i).unwrap().contains(&c));
+    // Player 1 traverses: the root is an opponent node; find an unfused
+    // opponent node below a chance node, a fused one, and a level with both.
+    let below_chance = (0..nn)
+        .find(|&i| plan.actor[i] == 0 && parent(i).is_some_and(|q| plan.actor[q] == CHANCE))
+        .unwrap();
+    let fused = (0..nn).find(|&i| pp.fused[i] == 1).unwrap();
+    let own = (0..nn).find(|&i| plan.actor[i] == 1).unwrap();
+    let terminal = (0..nn).find(|&i| plan.actor[i] == NONE).unwrap();
+    let mixed = pp.levels.iter().position(|l| l.opp_sum_count > 0 && l.opp_sum_count < l.opp_count).unwrap();
+    type Mutation = Box<dyn Fn(&mut Plan)>;
+    let mutations: Vec<(&str, Mutation)> = vec![
+        ("root fused", Box::new(|p| p.players[1].fused[0] = 1)),
+        ("fused below a chance node", Box::new(move |p| p.players[1].fused[below_chance] = 1)),
+        ("own node fused", Box::new(move |p| p.players[1].fused[own] = 1)),
+        ("terminal fused", Box::new(move |p| p.players[1].fused[terminal] = 1)),
+        ("fused flag 2", Box::new(move |p| p.players[1].fused[fused] = 2)),
+        ("fused node summed", Box::new(move |p| p.players[1].fused[fused] = 0)),
+        ("sum count past the level", Box::new(move |p| p.players[1].levels[mixed].opp_sum_count += 100)),
+        ("summed node left out", Box::new(move |p| p.players[1].levels[mixed].opp_sum_count -= 1)),
+        ("fused node summed by count", Box::new(move |p| p.players[1].levels[mixed].opp_sum_count += 1)),
+        ("flags missing", Box::new(|p| {
+            p.players[0].fused.pop();
+        })),
+    ];
+    for (what, mutate) in mutations {
+        let mut bad = plan.clone();
+        mutate(&mut bad);
+        assert!(matches!(bad.validate(), Err(GpuError::InvalidInput(_))), "{what}: accepted");
+    }
+}
+

@@ -54,11 +54,14 @@ pub(crate) fn showdown_shared_bytes(max_opp: u32) -> u64 {
 }
 
 /// One tree level: ranges into the opponent-node, own-node and chance-node
-/// lists.
+/// lists. The level's first `opp_sum_count` opponent nodes get their value
+/// row from `opponent_sum`; the rest are fused into their parents (see
+/// [`PlayerPlan::fused`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LevelRange {
     pub opp_start: u32,
     pub opp_count: u32,
+    pub opp_sum_count: u32,
     pub own_start: u32,
     pub own_count: u32,
     pub chance_start: u32,
@@ -115,6 +118,11 @@ pub(crate) struct PlayerPlan {
     pub opp_nodes: Vec<u32>,
     pub own_nodes: Vec<u32>,
     pub chance_nodes: Vec<u32>,
+    /// Per node: 1 for an opponent node whose parent is one of the
+    /// traverser's own nodes. Its value row is never written: the parent's
+    /// update sums its children's rows instead (`ChildValues` in core.cuh),
+    /// which saves writing the row and reading it back. 0 elsewhere.
+    pub fused: Vec<u32>,
     pub folds: Vec<u32>,
     pub fold_payoff: Vec<f64>,
     pub showdowns: Vec<u32>,
@@ -319,14 +327,14 @@ impl Plan {
         plan.scalar = Self::scalar_terminals(ctx, &levels)?;
         plan.players = [PlayerPlan::build(ctx, &plan, 0)?, PlayerPlan::build(ctx, &plan, 1)?];
         // The schedule's device arrays have the same total length however
-        // the tree is split: per player a slot, a child slot and a list entry
-        // per node, 12 bytes per fold and 44 per showdown (an upper bound:
+        // the tree is split: per player a slot, a child slot, a fused flag
+        // and a list entry per node, 12 bytes per fold and 44 per showdown (an upper bound:
         // paired folds move into the showdown arrays); plus a row per node.
         let nodes = &ctx.tree.nodes;
         let folds = nodes.iter().filter(|n| matches!(n.kind, Kind::Fold(_))).count() as u64;
         let showdowns = nodes.iter().filter(|n| matches!(n.kind, Kind::Showdown)).count() as u64;
         let nn = u64::from(num_nodes);
-        let schedule_bytes = 2 * (12 * nn + 12 * folds + 44 * showdowns + 64) + 4 * nn;
+        let schedule_bytes = 2 * (16 * nn + 12 * folds + 44 * showdowns + 64) + 4 * nn;
         let seg = plan.segment(ctx, scratch, plan.device_bytes() + schedule_bytes)?;
         plan.segment_of = seg.segment_of;
         plan.num_segments = seg.num_segments;
@@ -400,6 +408,7 @@ impl Plan {
                 + b(&pp.opp_nodes)
                 + b(&pp.own_nodes)
                 + b(&pp.chance_nodes)
+                + b(&pp.fused)
                 + b(&pp.folds)
                 + b(&pp.fold_payoff)
                 + b(&pp.showdowns)
@@ -461,6 +470,19 @@ impl Plan {
         let node = self.node(i)?;
         let first = node.first_child as usize;
         Ok(first..first + node.actions as usize)
+    }
+
+    /// The same plan with no opponent node fused (every opponent node's row
+    /// written by `opponent_sum`), for comparing the two.
+    #[cfg(test)]
+    pub(crate) fn unfused(mut self) -> Plan {
+        for pp in &mut self.players {
+            pp.fused.iter_mut().for_each(|f| *f = 0);
+            for lv in &mut pp.levels {
+                lv.opp_sum_count = lv.opp_count;
+            }
+        }
+        self
     }
 
     /// Checks every invariant the kernels rely on.

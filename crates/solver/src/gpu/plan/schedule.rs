@@ -303,6 +303,7 @@ impl PlayerPlan {
         let roots = plan.segment_roots()?;
         self.slot = vec![NONE; nn];
         self.child_slot = vec![NONE; nn];
+        self.fused = vec![0; nn];
         if let Some(s) = self.slot.first_mut() {
             *s = 0;
         }
@@ -344,6 +345,7 @@ impl PlayerPlan {
                     ..LevelRange::default()
                 };
                 let mut next = Vec::new();
+                let mut fused_here = Vec::new();
                 for &id in &frontier {
                     let i = id as usize;
                     let node = nodes.get(i).ok_or_else(|| invalid(format!("node {id} out of range")))?;
@@ -354,11 +356,16 @@ impl PlayerPlan {
                             self.own_nodes.push(id);
                             for c in node.children() {
                                 *self.slot.get_mut(c).ok_or_else(|| invalid("child out of range"))? = my_slot;
+                                if matches!(nodes.get(c).map(|n| n.kind), Some(Kind::Player(r)) if r as usize != p) {
+                                    *self.fused.get_mut(c).ok_or_else(|| invalid("child out of range"))? = 1;
+                                }
                             }
                         }
                         Kind::Player(_) | Kind::Chance => {
                             if matches!(node.kind, Kind::Chance) {
                                 self.chance_nodes.push(id);
+                            } else if at(&self.fused, i, "fused")? != 0 {
+                                fused_here.push(id);
                             } else {
                                 self.opp_nodes.push(id);
                             }
@@ -391,6 +398,9 @@ impl PlayerPlan {
                         }
                     }
                 }
+                // Summed opponent nodes first, then the fused ones.
+                range.opp_sum_count = to_u32(self.opp_nodes.len(), "opponent nodes")? - range.opp_start;
+                self.opp_nodes.extend_from_slice(&fused_here);
                 range.opp_count = to_u32(self.opp_nodes.len(), "opponent nodes")? - range.opp_start;
                 range.own_count = to_u32(self.own_nodes.len(), "own nodes")? - range.own_start;
                 range.chance_count = to_u32(self.chance_nodes.len(), "chance nodes")? - range.chance_start;
@@ -586,9 +596,33 @@ pub(super) fn validate_player_schedule(plan: &Plan, p: usize, pp: &PlayerPlan) -
     fresh_used.sort_unstable();
     ensure(fresh_used.windows(2).all(|w| w.first() != w.get(1)), || "a reach slot handed out twice in a segment".into())?;
 
+    // Fused opponent nodes: only below the traverser's own nodes (whose
+    // update reads them), never the root, and never with fused children
+    // (the sum reaches one level down).
+    ensure(pp.fused.len() == nn, || "fused flags have the wrong length".into())?;
+    let parent = plan.parents()?;
+    for (i, &f) in pp.fused.iter().enumerate() {
+        ensure(f <= 1, || format!("node {i}: fused flag {f}"))?;
+        if f == 0 {
+            continue;
+        }
+        let actor = plan.node(i)?.actor;
+        ensure(actor < 2 && actor as usize != p, || format!("fused node {i} isn't an opponent node"))?;
+        let pa = at(&parent, i, "parent")?;
+        ensure(pa != NONE, || "the root can't be fused".into())?;
+        let parent_actor = plan.node(pa as usize)?.actor;
+        ensure(parent_actor < 2 && parent_actor as usize == p, || {
+            format!("fused node {i}: its parent isn't the traverser's node")
+        })?;
+        for c in plan.children(i)? {
+            ensure(at(&pp.fused, c, "fused")? == 0, || format!("fused node {i} has a fused child {c}"))?;
+        }
+    }
+
     // Levels: every non-terminal node once, in its segment and the list of
     // its role; children in the same segment one level deeper; chunk roots
-    // at level 0 of their group.
+    // at level 0 of their group.  Each level's opponent nodes: the summed
+    // ones, then the fused ones.
     let role = |actor: u32| -> Role {
         match actor {
             CHANCE => Role::Chance,
@@ -607,12 +641,19 @@ pub(super) fn validate_player_schedule(plan: &Plan, p: usize, pp: &PlayerPlan) -
             expect_opp = lv.opp_start.checked_add(lv.opp_count).ok_or_else(|| invalid("level overflow"))?;
             expect_own = lv.own_start.checked_add(lv.own_count).ok_or_else(|| invalid("level overflow"))?;
             expect_chance = lv.chance_start.checked_add(lv.chance_count).ok_or_else(|| invalid("level overflow"))?;
+            ensure(lv.opp_sum_count <= lv.opp_count, || format!("segment {s}, level {d}: opponent sum count"))?;
             let opp = pp.opp_nodes.get(lv.opp_start as usize..expect_opp as usize);
             let own = pp.own_nodes.get(lv.own_start as usize..expect_own as usize);
             let chance = pp.chance_nodes.get(lv.chance_start as usize..expect_chance as usize);
             let (Some(opp), Some(own), Some(chance)) = (opp, own, chance) else {
                 return Err(invalid(format!("segment {s}, level {d} out of range")));
             };
+            for (k, &id) in opp.iter().enumerate() {
+                let want = u32::from(k as u64 >= u64::from(lv.opp_sum_count));
+                ensure(at(&pp.fused, id as usize, "fused")? == want, || {
+                    format!("segment {s}, level {d}: opponent node {id} in the wrong part of the level")
+                })?;
+            }
             let listed = opp
                 .iter()
                 .map(|x| (x, Role::Opponent))

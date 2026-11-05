@@ -396,7 +396,7 @@ fn every_node_matches_cpu_given_gpu_reach() {
                 let pp = &engine.plan.players[p];
                 let (n, nq) = (pp.hands as usize, pp.opp_hands as usize);
                 let ctx = s.ctx();
-                let mut checked = 0;
+                let (mut checked, mut fused_checked) = (0, 0);
                 for (id, node) in s.tree.nodes.iter().enumerate() {
                     let terminal =
                         matches!(node.kind, crate::tree::Kind::Fold(_) | crate::tree::Kind::Showdown);
@@ -411,10 +411,29 @@ fn every_node_matches_cpu_given_gpu_reach() {
                     let mut cpu = vec![0f32; n];
                     cfr::traverse(&ctx, id, p, r, mode, &mut cpu);
                     let what = format!("{mode:?}, player {p}, node {id} ({:?} {:?})", node.kind, node.street);
-                    assert_relative(&values[id * n..(id + 1) * n], &cpu, 1e-5, &what);
+                    let gpu_row = |i: usize| {
+                        let r = engine.plan.row[i] as usize;
+                        &values[r * n..(r + 1) * n]
+                    };
+                    // A fused node has no row of its own: its parent sees the
+                    // sum of its children's rows.
+                    let gpu: Vec<f32> = if pp.fused[id] == 1 {
+                        let mut sum = vec![0f32; n];
+                        for c in node.children() {
+                            for (x, &v) in sum.iter_mut().zip(gpu_row(c)) {
+                                *x += v;
+                            }
+                        }
+                        fused_checked += 1;
+                        sum
+                    } else {
+                        gpu_row(id).to_vec()
+                    };
+                    assert_relative(&gpu, &cpu, 1e-5, &what);
                     checked += 1;
                 }
                 assert!(checked > 100, "only {checked} nodes checked");
+                assert!(fused_checked > 10, "only {fused_checked} fused nodes checked");
             }
         }
     }
@@ -753,5 +772,30 @@ fn exact_solves_match_cpu_bit_for_bit() {
     cpu.solve(&opts(5), |_| true);
     no_batching.solve(&opts(5), |_| true);
     assert!(storage_bits(&mut cpu) == storage_bits(&mut no_batching), "without river batching");
+}
+
+/// Fusing opponent nodes into their parents' updates changes no bit:
+/// fused and unfused plans give identical solves, in both precisions, with
+/// f32 and 16-bit storage, whole and split.
+#[test]
+fn fused_and_unfused_solves_agree_bit_for_bit() {
+    let Some(_) = device() else { return };
+    for (cfg, _) in chance_spots() {
+        for precision in [GpuPrecision::Exact, GpuPrecision::Fast] {
+            for scratch in [Scratch::Unlimited, Scratch::ForceGroups { max_nodes: 1 }] {
+                let mut runs = Vec::new();
+                for fused in [true, false] {
+                    let mut s = Solver::new(cfg.clone()).unwrap();
+                    let plan = Plan::build_with(&s.ctx(), scratch).unwrap();
+                    let plan = if fused { plan } else { plan.unfused() };
+                    s.gpu = Some(Box::new(Engine::new(device().unwrap(), plan, s.store.gpu_view(), precision).unwrap()));
+                    let p = s.solve(&opts(4), |_| true);
+                    assert!(s.gpu_error().is_none(), "{:?}", s.gpu_error());
+                    runs.push((p.exploitability.to_bits(), storage_bits(&mut s)));
+                }
+                assert!(runs[0] == runs[1], "{precision:?}, {scratch:?}: fused and unfused solves differ");
+            }
+        }
+    }
 }
 

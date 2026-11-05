@@ -14,7 +14,10 @@
 //    never updated, exactly as on the CPU.
 // 3. Terminals (terminal.cu).
 // 4. Bottom-up, per level: `own_update` (node values and, in CFR mode, the
-//    traverser's regret updates), `opponent_sum` and `chance_sum`.
+//    traverser's regret updates), `opponent_sum` and `chance_sum`. An
+//    opponent node right below one of the traverser's nodes is "fused":
+//    its row is never written, and `own_update` sums its children's rows
+//    itself (`ChildValues`), saving the round trip through memory.
 //
 // Reach lives in "slots" of `opp_hands` floats; the traverser's own nodes
 // pass their slot to their children unchanged, so only opponent and chance
@@ -170,6 +173,8 @@ extern "C" __global__ void own_update(const u32* level_ptr,
                                       u32 regrets_len,
                                       const float* sums_ptr,
                                       u32 sums_len,
+                                      const u32* fused_ptr,
+                                      u32 fused_len,
                                       const u32* rows_ptr,
                                       u32 rows_len,
                                       float* values_ptr,
@@ -190,6 +195,7 @@ extern "C" __global__ void own_update(const u32* level_ptr,
   const auto rows = view(rows_ptr, rows_len);
   const auto values = view(values_ptr, values_len);
   const auto mode = static_cast<Mode>(mode_raw);
+  const ChildValues child_value{actions, first_child, view(fused_ptr, fused_len), rows, values, hands};
 
   const u32 h = hand_index();
   if (h >= hands) {
@@ -204,7 +210,7 @@ extern "C" __global__ void own_update(const u32* level_ptr,
     }
     const u32 num_actions = actions[node];
     const u32 child0 = first_child[node];
-    const auto cfv = [&](u32 a) -> float { return row(values, rows[child0 + a], hands)[h]; };
+    const auto cfv = [&](u32 a) -> float { return child_value(child0 + a, h); };
     switch (mode) {
       case Mode::BestResponse: {
         float best = cfv(0);

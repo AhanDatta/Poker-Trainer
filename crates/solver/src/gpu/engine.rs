@@ -115,6 +115,7 @@ struct DevicePlayer {
     opp_card_off: Buffer<u32>,
     opp_card_hands: Buffer<u32>,
     chance_nodes: Buffer<u32>,
+    fused: Buffer<u32>,
     opp_cards: Buffer<u32>,
     perm: Buffer<u32>,
     opp_weights: Buffer<f32>,
@@ -150,6 +151,7 @@ impl DevicePlayer {
             opp_card_off: gpu.upload(&pp.opp_card_off)?,
             opp_card_hands: gpu.upload(&pp.opp_card_hands)?,
             chance_nodes: gpu.upload(&pp.chance_nodes)?,
+            fused: gpu.upload(&pp.fused)?,
             opp_cards: gpu.upload(&pp.opp_cards)?,
             perm: gpu.upload(&pp.perm)?,
             opp_weights: gpu.upload(&pp.opp_weights)?,
@@ -694,6 +696,7 @@ impl Pass<'_> {
                         l.arg(&*self.alive).arg(&self.alive_len);
                         push_mut(&mut l, regrets, &plan.storage_len);
                         l.arg(&*sums).arg(&plan.storage_len);
+                        push(&mut l, &dp.fused);
                         push(&mut l, &tree.rows);
                         push_mut(&mut l, self.values, &self.values_len);
                         l.arg(&hands).arg(&m.mode).arg(&m.positive_discount).arg(&m.negative_discount);
@@ -714,6 +717,7 @@ impl Pass<'_> {
                         push_mut(&mut l, regret_scale, &plan.num_scale_slots);
                         l.arg(&*sums).arg(&plan.storage_len);
                         l.arg(&*strategy_scale).arg(&plan.num_scale_slots);
+                        push(&mut l, &dp.fused);
                         push(&mut l, &tree.rows);
                         push_mut(&mut l, self.values, &self.values_len);
                         l.arg(&hands).arg(&m.mode).arg(&m.positive_discount).arg(&m.negative_discount);
@@ -723,10 +727,12 @@ impl Pass<'_> {
                     }
                 }
             }
-            if lv.opp_count > 0 {
+            // Only the summed opponent nodes: the fused ones are read
+            // through their children by the own updates above.
+            if lv.opp_sum_count > 0 {
                 let mut l = stream.launch_builder(&kernels.opponent_sum);
                 push(&mut l, &dp.opp_nodes);
-                l.arg(&lv.opp_start).arg(&lv.opp_count);
+                l.arg(&lv.opp_start).arg(&lv.opp_sum_count);
                 push(&mut l, &tree.actions);
                 push(&mut l, &tree.first_child);
                 push(&mut l, &dp.slots);
@@ -735,7 +741,7 @@ impl Pass<'_> {
                 push_mut(&mut l, self.values, &self.values_len);
                 l.arg(&hands);
                 // SAFETY: arguments match `opponent_sum`; indices are validated.
-                unsafe { l.launch(per_hand_grid(hands, lv.opp_count)) }?;
+                unsafe { l.launch(per_hand_grid(hands, lv.opp_sum_count)) }?;
             }
             if lv.chance_count > 0 {
                 let mut l = stream.launch_builder(&kernels.chance_sum);

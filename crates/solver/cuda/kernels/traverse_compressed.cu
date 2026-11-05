@@ -209,6 +209,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads)
                           u32 sums_len,
                           const float* strategy_scale_ptr,
                           u32 strategy_scale_len,
+                          const u32* fused_ptr,
+                          u32 fused_len,
                           const u32* rows_ptr,
                           u32 rows_len,
                           float* values_ptr,
@@ -235,6 +237,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads)
   const auto rows = view(rows_ptr, rows_len);
   const auto values = view(values_ptr, values_len);
   const auto mode = static_cast<Mode>(mode_raw);
+  const ChildValues child_value{actions, first_child, view(fused_ptr, fused_len), rows, values, hands};
 
   for (u32 k = blockIdx.x; k < level_count; k += gridDim.x) {
     const u32 node = level[k];
@@ -248,7 +251,7 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads)
     const u32 num_actions = actions[node];
     const u32 child0 = first_child[node];
     const u32 scale_slot = scale_slots[node];
-    const auto cfv = [&](u32 a, u32 h) -> float { return row(values, rows[child0 + a], hands)[h]; };
+    const auto cfv = [&](u32 a, u32 h) -> float { return child_value(child0 + a, h); };
 
     if (mode == Mode::BestResponse) {
       for (u32 h = threadIdx.x; h < hands; h += kThreads) {

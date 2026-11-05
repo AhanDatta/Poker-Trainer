@@ -180,4 +180,30 @@ static_assert(unpack_range(7u | (900u << 16)).lo == 7u);
 static_assert(unpack_range(7u | (900u << 16)).hi == 900u);
 static_assert(unpack_ranks(1u | (2u << 8) | (3u << 16) | (4u << 24)).second_hi == 4u);
 
+/// Children's values for the bottom-up update of the traverser's nodes: a
+/// child's value row, or, for an opponent node that is fused into its
+/// parent (its row is never written; `PlayerPlan::fused`), the sum of its
+/// children's rows in `opponent_sum`'s order, so the result is the same bit
+/// for bit. (A fused node's children are never fused: the plan checks it.)
+struct ChildValues {
+  cuda::std::span<const u32> actions;
+  cuda::std::span<const u32> first_child;
+  cuda::std::span<const u32> fused;
+  cuda::std::span<const u32> rows;
+  cuda::std::span<float> values;
+  u32 hands;
+
+  [[nodiscard]] __device__ auto operator()(u32 child, u32 h) const noexcept -> float {
+    if (fused[child] == 0u) {
+      return row(values, rows[child], hands)[h];
+    }
+    const u32 first = first_child[child];
+    float sum = 0.0f;
+    for (const u32 b : indices(actions[child])) {
+      sum = add_rn(sum, row(values, rows[first + b], hands)[h]);
+    }
+    return sum;
+  }
+};
+
 }  // namespace solver
