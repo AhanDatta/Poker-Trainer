@@ -529,6 +529,8 @@ pub struct SolveStatus {
     pub error: Option<String>,
     /// Exploitability (heads-up) or convergence (3-way), % of the pot.
     pub exploitability_pct: f64,
+    /// The solver that produced the result.
+    pub solver: crate::SolverTag,
     pub notes: Vec<String>,
 }
 
@@ -794,7 +796,7 @@ impl Study {
             .name("study-solve".into())
             .spawn(move || {
                 let job = &seg.job;
-                let run = || -> Result<(AnySolver, f64), String> {
+                let run = || -> Result<(AnySolver, crate::SolveSummary), String> {
                     let s = &settings.solver;
                     let menu = &settings.menu.postflop;
                     match seg.root {
@@ -843,7 +845,8 @@ impl Study {
                         *job.solver.write().unwrap_or_else(|e| e.into_inner()) = Some(solver);
                         job.with_status(|st| {
                             st.done = true;
-                            st.exploitability_pct = e;
+                            st.exploitability_pct = e.exploitability_pct;
+                            st.solver = e.solver;
                             st.stage = format!("{label}: solved");
                         });
                     }

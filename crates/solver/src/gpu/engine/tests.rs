@@ -689,6 +689,8 @@ fn gpu_backend_matches_explicit_use_gpu() {
         assert!(!backed.uses_gpu(), "the GPU is taken only while solving");
         let pb = backed.solve(&opts(6), |_| true);
         assert!(!backed.uses_gpu() && backed.gpu_error().is_none(), "{:?}", backed.gpu_error());
+        assert_eq!(backed.solved_on(), crate::SolvedOn::GpuFast, "the tag outlives the engine");
+        assert_eq!(explicit.solved_on(), crate::SolvedOn::GpuFast);
         assert_eq!(pe.exploitability.to_bits(), pb.exploitability.to_bits());
         assert!(storage_bits(&mut explicit) == storage_bits(&mut backed), "storage differs");
     }
@@ -739,6 +741,7 @@ fn exact_solves_match_cpu_bit_for_bit() {
         let pc = cpu.solve(&opts(5), |_| true);
         let pg = gpu.solve(&opts(5), |_| true);
         assert!(gpu.gpu_error().is_none(), "spot {k}: {:?}", gpu.gpu_error());
+        assert_eq!((cpu.solved_on(), gpu.solved_on()), (crate::SolvedOn::Cpu, crate::SolvedOn::GpuExact));
         let (bc, bg) = (storage_bits(&mut cpu), storage_bits(&mut gpu));
         let differing = bc.iter().zip(&bg).filter(|(a, b)| a != b).count();
         assert!(differing == 0, "spot {k}: {differing} of {} storage values differ", bc.len());

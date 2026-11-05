@@ -375,6 +375,7 @@ fn backend_defaults_to_the_cpu() {
     assert_eq!(cfg.backend, Backend::Cpu);
     let (s, _) = solve(cfg, 20, 0.0);
     assert!(!s.uses_gpu() && s.gpu_error().is_none());
+    assert_eq!(s.solved_on(), SolvedOn::Cpu);
 }
 
 /// `Auto` leaves river roots on the CPU: same bits, no GPU error.
@@ -386,6 +387,7 @@ fn auto_backend_keeps_river_roots_on_the_cpu() {
     let (auto, pa) = solve(cfg, 30, 0.0);
     assert_eq!(root_bits(&cpu, &pc), root_bits(&auto, &pa));
     assert!(!auto.uses_gpu() && auto.gpu_error().is_none());
+    assert_eq!(auto.solved_on(), SolvedOn::Cpu);
 }
 
 /// Without GPU support a GPU backend solves on the CPU (bit for bit) and
@@ -400,6 +402,7 @@ fn gpu_backend_without_gpu_support_solves_on_the_cpu() {
         let (s, p) = solve(cfg.clone(), 10, 0.0);
         assert_eq!(root_bits(&cpu, &pc), root_bits(&s, &p), "{backend:?}");
         assert!(!s.uses_gpu());
+        assert_eq!(s.solved_on(), SolvedOn::Cpu);
         assert!(s.gpu_error().is_some_and(|e| e.contains("gpu")), "{backend:?}: {:?}", s.gpu_error());
     }
 }

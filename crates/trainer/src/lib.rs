@@ -24,6 +24,7 @@ pub mod review;
 pub mod save;
 pub mod scoring;
 pub mod session;
+pub mod solver_tag;
 pub mod strength;
 pub mod study;
 
@@ -33,5 +34,6 @@ pub use config::{
 pub use hand::{LiveHand, LogEntry, StepResult};
 pub use profiles::Profile;
 pub use review::{DecisionReview, Review, ReviewStatus, SpotInfo, Variant, Verdict};
+pub use solver_tag::{SolveSummary, SolvedBy, SolverTag};
 pub use scoring::{FrequencyReport, ScoreOptions, ScoredDecision};
 pub use session::{Session, Stats};

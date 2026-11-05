@@ -557,6 +557,7 @@ mod tests {
         app.on_key(key('r'));
         let s = render(&app);
         assert!(s.contains("the solver's mix plays"), "{s}");
+        assert!(s.contains("Solved on CPU · exploitability"), "the review names its solver: {s}");
         // Score screen.
         app.on_key(key('g'));
         let s = render(&app);
@@ -695,6 +696,7 @@ mod tests {
                     history_index: 0,
                     categories: vec!["Check".into(), "33%".into()],
                 },
+                solver: trainer::SolverTag { by: trainer::SolvedBy::GpuFast, gpu_fallback: None },
             };
             sh.review = Some(SavedReview {
                 stage: "done".into(),

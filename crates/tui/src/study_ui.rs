@@ -626,7 +626,12 @@ fn draw_postflop(f: &mut Frame, app: &App, st: &StudyState, grid_area: Rect, pan
     if status.done && status.error.is_none() {
         let what = if view.is_some_and(|v| v.multiway) { "convergence" } else { "exploitability" };
         lines.push(Line::from(Span::styled(
-            format!("{} solve {what}: {:.2}% of the pot", status.label, status.exploitability_pct),
+            format!(
+                "{} solved on {} · {what} {:.2}% of the pot",
+                status.label,
+                status.solver.describe(),
+                status.exploitability_pct
+            ),
             Style::default().fg(Color::DarkGray),
         )));
     }

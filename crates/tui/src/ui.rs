@@ -979,7 +979,7 @@ fn draw_decision(f: &mut Frame, area: Rect, d: &DecisionReview, hand_notes: &[St
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        format!("Solve accuracy: exploitability {:.2}% of pot", d.exploitability_pct),
+        format!("Solved on {} · exploitability {:.2}% of pot", d.solver.describe(), d.exploitability_pct),
         Style::default().fg(Color::DarkGray),
     )));
     for n in d.notes.iter().chain(hand_notes) {

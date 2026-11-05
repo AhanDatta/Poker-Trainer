@@ -280,6 +280,15 @@ pub(crate) struct Engine {
 }
 
 impl Engine {
+    /// How terminal sums are accumulated.
+    pub(crate) fn precision(&self) -> GpuPrecision {
+        if self.exact != 0 {
+            GpuPrecision::Exact
+        } else {
+            GpuPrecision::Fast
+        }
+    }
+
     /// Device bytes a plan and its scratch buffers may take next to `host`'s
     /// storage: the free memory minus the storage and a margin for the
     /// display and the CUDA runtime (`Scratch::Budget` for `Plan::build_with`).

@@ -13,6 +13,7 @@
 
 use crate::ai::profile_policy;
 use crate::config::{FlopMode, SolverBackend, SolverSettings, VillainRange};
+use crate::solver_tag::{SolveSummary, SolverTag};
 use crate::fmt::{action_label, ActionContext, BB};
 use crate::preflop::{chart_policy, describe, line_range, ChartSet, PreDecision};
 use crate::profiles::Profile;
@@ -214,6 +215,9 @@ pub struct DecisionReview {
     /// Where the decision was made (for the session's frequency score).
     #[serde(default)]
     pub spot: SpotInfo,
+    /// The solver that produced this review.
+    #[serde(default)]
+    pub solver: SolverTag,
 }
 
 /// The kind of spot a decision was made in, and the frequency category of
@@ -611,7 +615,7 @@ impl<'a> Worker<'a> {
         let stacks = [by_seat[seats[0]], by_seat[seats[1]]];
         let root = BettingState::street_start(street, pot, stacks, BB);
 
-        let mut solved: Vec<Option<(Solver, f64)>> = Vec::new();
+        let mut solved: Vec<Option<(Solver, SolveSummary)>> = Vec::new();
         for (vi, &v) in variants.iter().enumerate() {
             let label = format!("{street} ({})", v.label());
             let pair = [ranges[vi][&seats[0]].clone(), ranges[vi][&seats[1]].clone()];
@@ -645,7 +649,7 @@ impl<'a> Worker<'a> {
 
         for (vi, &v) in variants.iter().enumerate() {
             let Some((base, base_expl)) = &solved[vi] else { continue };
-            let mut owned: Option<(Solver, f64)> = None;
+            let mut owned: Option<(Solver, SolveSummary)> = None;
             let mut offset = 0;
             for k in 0..actions.len() {
                 let (seat, a) = actions[k];
@@ -653,8 +657,8 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let (cur, cur_expl) = match &owned {
-                    Some((s, e)) => (s, *e),
-                    None => (base, *base_expl),
+                    Some((s, e)) => (s, e.clone()),
+                    None => (base, base_expl.clone()),
                 };
                 let path: Vec<Step> = actions[offset..k].iter().map(|&(_, a)| Step::Action(a)).collect();
                 let mut info = cur.query(&path).map_err(|e| e.to_string())?;
@@ -679,7 +683,7 @@ impl<'a> Worker<'a> {
                     let cfg = self.make_config(&board, &r, states[k], hero_combo, hero_p);
                     match self.solve(cfg, &label) {
                         Ok((s, e)) => {
-                            owned = Some((s, e));
+                            owned = Some((s, e.clone()));
                             offset = k;
                             info = owned.as_ref().unwrap().0.query(&[]).map_err(|e| e.to_string())?;
                             expl = e;
@@ -726,9 +730,9 @@ impl<'a> Worker<'a> {
             }
 
             if street != Street::River && state.board.len() > need {
-                let (cur, _) = match &owned {
-                    Some((s, e)) => (s, *e),
-                    None => (base, *base_expl),
+                let cur = match &owned {
+                    Some((s, _)) => s,
+                    None => base,
                 };
                 let path: Vec<Step> = actions[offset..].iter().map(|&(_, a)| Step::Action(a)).collect();
                 if let Ok(mut next) = cur.ranges_after(&path) {
@@ -770,7 +774,7 @@ impl<'a> Worker<'a> {
         let (pot, by_seat) = street_start(&snap.state, street);
         let root = MultiState::street_start(street, pot, seats.map(|x| by_seat[x]), [false; 3], BB);
 
-        let mut solved: Vec<Option<(MultiSolver, f64)>> = Vec::new();
+        let mut solved: Vec<Option<(MultiSolver, SolveSummary)>> = Vec::new();
         for (vi, &v) in variants.iter().enumerate() {
             let label = format!("{street} 3-way ({})", v.label());
             let mut rs: [Vec<f32>; 3] = seats.map(|x| ranges[vi][&x].clone());
@@ -862,7 +866,7 @@ impl<'a> Worker<'a> {
                     street,
                     &board,
                     history,
-                    *conv,
+                    conv.clone(),
                     notes,
                     spot,
                 )?;
@@ -914,14 +918,14 @@ impl<'a> Worker<'a> {
         cfg
     }
 
-    fn solve(&self, cfg: SolveConfig, label: &str) -> Result<(Solver, f64), String> {
+    fn solve(&self, cfg: SolveConfig, label: &str) -> Result<(Solver, SolveSummary), String> {
         if let Some(dir) = std::env::var_os("POKER_TRAINER_DUMP") {
             dump_config(std::path::Path::new(&dir), self.setup.hand_id, label, &cfg);
         }
         run_hu(cfg, &self.setup.settings, self.setup.hand_id, self.pool.as_ref(), label, self.shared)
     }
 
-    fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, f64), String> {
+    fn solve_multi(&self, cfg: MultiConfig, label: &str) -> Result<(MultiSolver, SolveSummary), String> {
         run_multi(cfg, &self.setup.settings, self.setup.hand_id, self.pool.as_ref(), label, self.shared)
     }
 }
@@ -1035,7 +1039,7 @@ pub(crate) fn run_hu(
     pool: Option<&rayon::ThreadPool>,
     label: &str,
     sink: &(dyn SolveSink + Sync),
-) -> Result<(Solver, f64), String> {
+) -> Result<(Solver, SolveSummary), String> {
     let cancel = sink.cancel_flag();
     sink.stage(format!("{label}: waiting for the solver"));
     let Some(_turn) = wait_solve_turn(priority, cancel, |ahead| {
@@ -1085,7 +1089,15 @@ pub(crate) fn run_hu(
     if let (SolverBackend::Gpu, Some(e)) = (s.backend, solver.gpu_error()) {
         sink.note(format!("{label}: solved on the CPU (GPU not used: {e})."));
     }
-    Ok((solver, progress.exploitability_pct))
+    let gpu_fallback = match s.backend {
+        SolverBackend::Cpu => None,
+        SolverBackend::Auto | SolverBackend::Gpu => solver.gpu_error().map(str::to_string),
+    };
+    let summary = SolveSummary {
+        exploitability_pct: progress.exploitability_pct,
+        solver: SolverTag { by: solver.solved_on().into(), gpu_fallback },
+    };
+    Ok((solver, summary))
 }
 
 /// Like [`run_hu`] for a three-player spot (approximate).
@@ -1096,7 +1108,7 @@ pub(crate) fn run_multi(
     pool: Option<&rayon::ThreadPool>,
     label: &str,
     sink: &(dyn SolveSink + Sync),
-) -> Result<(MultiSolver, f64), String> {
+) -> Result<(MultiSolver, SolveSummary), String> {
     let cancel = sink.cancel_flag();
     sink.stage(format!("{label}: waiting for the solver"));
     let Some(_turn) = wait_solve_turn(priority, cancel, |ahead| {
@@ -1128,7 +1140,8 @@ pub(crate) fn run_multi(
     if cancel.load(Ordering::Relaxed) {
         return Err(CANCELLED.into());
     }
-    Ok((solver, progress.exploitability_pct))
+    // 3-way solves run on the CPU.
+    Ok((solver, SolveSummary { exploitability_pct: progress.exploitability_pct, solver: SolverTag::default() }))
 }
 
 /// Seats still in the hand at the start of `street`.
@@ -1278,7 +1291,7 @@ fn grade(
     street: Street,
     board: &[Card],
     history: String,
-    exploitability_pct: f64,
+    solve: SolveSummary,
     notes: Vec<String>,
     spot: SpotInfo,
 ) -> Result<DecisionReview, String> {
@@ -1321,8 +1334,9 @@ fn grade(
         verdict: Verdict::from_loss_pct(loss_pct),
         range_strategy: info.range_strategy(),
         grid,
-        exploitability_pct,
+        exploitability_pct: solve.exploitability_pct,
         notes,
         spot,
+        solver: solve.solver,
     })
 }

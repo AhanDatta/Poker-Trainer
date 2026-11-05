@@ -54,6 +54,20 @@ use tree::{Builder, Kind, Tree, TreeParams};
 /// Whether this build can solve on the GPU (the `gpu` feature).
 pub const GPU_SUPPORT: bool = cfg!(feature = "gpu");
 
+/// Where a solve ran.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SolvedOn {
+    /// The CPU (also after a GPU that couldn't be used or failed mid-solve;
+    /// [`Solver::gpu_error`] says why).
+    #[default]
+    Cpu,
+    /// The GPU with double-single terminal sums (`GpuPrecision::Fast`).
+    GpuFast,
+    /// The GPU with f64 terminal sums, bit-identical to the CPU
+    /// (`GpuPrecision::Exact`).
+    GpuExact,
+}
+
 /// Where solves run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Backend {
@@ -301,6 +315,8 @@ pub struct Solver {
     gpu: Option<Box<gpu::Engine>>,
     /// Why the last solve didn't use the GPU, or abandoned it.
     gpu_error: Option<String>,
+    /// Where the last solve ran.
+    solved_on: SolvedOn,
 }
 
 impl Solver {
@@ -392,6 +408,7 @@ impl Solver {
             #[cfg(feature = "gpu")]
             gpu: None,
             gpu_error: None,
+            solved_on: SolvedOn::Cpu,
         })
     }
 
@@ -557,10 +574,19 @@ impl Solver {
                 )
                 .and_then(|p| self.download_from_gpu().map(|()| p));
             match result {
-                Ok(p) => return p,
+                Ok(p) => {
+                    if let Some(engine) = &self.gpu {
+                        self.solved_on = match engine.precision() {
+                            gpu::GpuPrecision::Fast => SolvedOn::GpuFast,
+                            gpu::GpuPrecision::Exact => SolvedOn::GpuExact,
+                        };
+                    }
+                    return p;
+                }
                 Err(e) => self.fall_back_to_cpu(e),
             }
         }
+        self.solved_on = SolvedOn::Cpu;
         match self.run_solve(
             opts,
             cancel,
@@ -685,6 +711,11 @@ impl Solver {
         {
             false
         }
+    }
+
+    /// Where the last solve ran (the CPU before any solve).
+    pub fn solved_on(&self) -> SolvedOn {
+        self.solved_on
     }
 
     /// Why the GPU wasn't used (`config.backend`) or was abandoned during a

@@ -65,6 +65,7 @@ fn decision(rng: &mut StdRng, street: Street, idx: usize) -> DecisionReview {
             history_index: idx,
             categories: cats.iter().map(|c| c.to_string()).collect(),
         },
+        solver: Default::default(),
     }
 }
 
