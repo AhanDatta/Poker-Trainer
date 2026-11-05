@@ -50,7 +50,7 @@ showdowns; 1 rejected (pass 2 already hits L2), 4 deferred. Whole solves
 5% faster on exact flops, 7% on the turn. Details and numbers in
 `crates/solver/cuda/README.md` ("Exact flops").
 
-## 2. Three-way solves on the GPU `[ ]`
+## 2. Three-way solves on the GPU `[~]`
 
 Port `solver::multi` (three players, sampled runouts, exact or independent
 card removal between the two opponents) with the heads-up port's workflow:
@@ -87,17 +87,24 @@ GPU shape:
 - Memory: 16-bit storage and tree splitting carry over.
 - Backend: 3-way solves follow `backend` like heads-up ones.
 
-Open questions (to settle before writing kernels):
-1. Exactness target. The CPU's exact-removal sums are f64 products of sums
-   grouped by lane batches and hash maps; matching them bit for bit may not
-   be practical. Proposal: bit-identical for independent removal and the
-   traversal kernels; exact removal checked against the CPU within f32
-   rounding (plus a brute-force reference over hand triples).
-2. Order. Proposal: independent removal first (simpler terminals, proves
-   the 3-player traversal), then exact removal.
-3. Runout sampling. 3-way flops are sampled (8 × 4 by default) for CPU
-   time; a faster GPU could afford more samples. Changing defaults is a
-   separate decision once there are numbers.
+Decided (2026-11-05):
+1. **Exactness:** bit-identical to the CPU for the traversal kernels and
+   independent-removal terminals; exact-removal terminals within f32
+   rounding of the CPU, plus a brute-force reference over hand triples.
+2. **Order:** independent removal first (proves the 3-player traversal),
+   then exact removal.
+3. Runout sampling defaults stay as they are until there are GPU numbers.
+
+Steps:
+1. 3-way plan (host): flattened multi tree, per-traverser schedule with two
+   reach slots per node, strategy-updater marks, folded cut-offs, terminal
+   lists; validation and mutation tests. `[ ]`
+2. Traversal kernels (opponent split for either opponent, two-slot chance
+   split, own update, sums) with independent-removal terminals; bit for bit
+   against the CPU with `exact_removal` off. `[ ]`
+3. Exact-removal terminals; against the CPU and a brute force. `[ ]`
+4. River batching parity, 16-bit storage, splitting, backend wiring,
+   benchmarks. `[ ]`
 
 Target: the chart-range 3-way flop (J♠9♠4♦, 8 × 4 sampled, exact removal)
 from 47 s on the CPU to well under 10 s.
