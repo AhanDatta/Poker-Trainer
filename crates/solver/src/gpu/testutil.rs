@@ -166,7 +166,7 @@ pub(crate) fn facing_bet(pot: Chips, stack: Chips, bet: Chips) -> BettingState {
 
 /// Random weights: each combo is in the range with probability `density`,
 /// with a weight in [0.05, 1].
-fn random_range(seed: u64, density: f64) -> Vec<f32> {
+pub(crate) fn random_range(seed: u64, density: f64) -> Vec<f32> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..1326)
         .map(|_| if rng.random::<f64>() < density { rng.random_range(0.05f32..=1.0) } else { 0.0 })

@@ -17,7 +17,7 @@ use crate::scratch::Buf;
 use crate::storage::Storage;
 use rayon::prelude::*;
 
-pub(super) struct Ctx<'a> {
+pub(crate) struct Ctx<'a> {
     pub tree: &'a Tree,
     pub store: &'a Storage,
     pub hands: &'a Hands,
@@ -34,7 +34,7 @@ pub(super) struct Ctx<'a> {
 
 /// `(win, lose)` payoffs of `p` at a node, already normalized; with `unit`,
 /// every outcome is worth 1 (the probability mass reaching the node).
-pub(super) fn payoffs(ctx: &Ctx, node: &Node, p: usize, unit: bool) -> (f64, f64) {
+pub(crate) fn payoffs(ctx: &Ctx, node: &Node, p: usize, unit: bool) -> (f64, f64) {
     let norm = ctx.norm[p];
     if unit {
         return (norm, norm);
@@ -46,7 +46,7 @@ pub(super) fn payoffs(ctx: &Ctx, node: &Node, p: usize, unit: bool) -> (f64, f64
 }
 
 /// `out[h] = pay * (reach of opponent hand pairs compatible with h)`.
-pub(super) fn pay_all(ctx: &Ctx, p: usize, rq: &[f32], rr: &[f32], pay: f64, out: &mut [f32]) {
+pub(crate) fn pay_all(ctx: &Ctx, p: usize, rq: &[f32], rr: &[f32], pay: f64, out: &mut [f32]) {
     if ctx.exact {
         exact::fold_values(ctx.hands, p, rq, rr, pay, out);
     } else {
@@ -79,7 +79,7 @@ fn terminal(ctx: &Ctx, node: &Node, p: usize, rq: &[f32], rr: &[f32], unit: bool
 /// Showdown with the opponents' hands treated as independent:
 /// `P(win) = P(beat q) * P(beat r)`, ties against an opponent counting half.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn independent_showdown(
+pub(crate) fn independent_showdown(
     hands: &Hands,
     table: &Table,
     folded: [bool; N],
@@ -175,7 +175,7 @@ pub(super) fn own_node_combine(ctx: &Ctx, node: &Node, n: usize, cfv: &[f32], mo
 /// player after `x` who hasn't folded there. Traversals skip what follows
 /// their player's fold, but never the nodes of a player still in the hand.
 #[inline]
-pub(super) fn strategy_updater(node: &Node, x: usize) -> usize {
+pub(crate) fn strategy_updater(node: &Node, x: usize) -> usize {
     let a = (x + 1) % N;
     if node.folded[a] {
         (x + 2) % N

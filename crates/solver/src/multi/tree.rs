@@ -14,7 +14,7 @@ use rand::SeedableRng;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     Player(u8),
     Chance,
     /// Everyone else folded: this player takes the pot.
@@ -24,14 +24,14 @@ pub(super) enum Kind {
 
 /// How a node was reached from its parent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Edge {
+pub(crate) enum Edge {
     Root,
     Action(Action),
     Card(Card),
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Node {
+pub(crate) struct Node {
     pub kind: Kind,
     pub street: Street,
     pub folded: [bool; N],
@@ -85,7 +85,7 @@ impl Node {
     }
 }
 
-pub(super) struct Tree {
+pub(crate) struct Tree {
     pub nodes: Vec<Node>,
     /// Full board of every showdown strength table.
     pub boards: Vec<Vec<Card>>,

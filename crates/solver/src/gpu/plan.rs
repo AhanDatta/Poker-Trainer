@@ -14,7 +14,7 @@ use crate::tree::{Edge, Kind};
 use std::ops::Range;
 
 mod schedule;
-pub(crate) use schedule::{scratch_bytes, Scratch, Segment};
+pub(crate) use schedule::{scratch_bytes, Scratch, Segment, Span};
 
 /// "No index" marker, shared with the kernels (`solver::kNone`).
 pub(crate) const NONE: u32 = u32::MAX;
@@ -224,11 +224,11 @@ struct NodeFields {
     actor: u32,
 }
 
-fn to_u32(x: usize, what: &str) -> Result<u32, GpuError> {
+pub(super) fn to_u32(x: usize, what: &str) -> Result<u32, GpuError> {
     u32::try_from(x).map_err(|_| invalid(format!("{what} ({x}) exceeds the kernels' u32 indexing")))
 }
 
-fn ensure(cond: bool, msg: impl FnOnce() -> String) -> Result<(), GpuError> {
+pub(super) fn ensure(cond: bool, msg: impl FnOnce() -> String) -> Result<(), GpuError> {
     if cond {
         Ok(())
     } else {
@@ -237,7 +237,7 @@ fn ensure(cond: bool, msg: impl FnOnce() -> String) -> Result<(), GpuError> {
 }
 
 /// `v[i]`, or an error naming `what`.
-fn at<T: Copy>(v: &[T], i: usize, what: &str) -> Result<T, GpuError> {
+pub(super) fn at<T: Copy>(v: &[T], i: usize, what: &str) -> Result<T, GpuError> {
     v.get(i).copied().ok_or_else(|| invalid(format!("{what}[{i}] out of range")))
 }
 
@@ -251,13 +251,13 @@ pub(crate) fn pack_cards(c1: u8, c2: u8) -> u32 {
     u32::from(c1) | u32::from(c2) << 8
 }
 
-fn unpack_cards(packed: u32) -> (usize, usize) {
+pub(super) fn unpack_cards(packed: u32) -> (usize, usize) {
     ((packed & 0xFF) as usize, (packed >> 8 & 0xFF) as usize)
 }
 
 /// `off` is a 53-entry offset array starting at 0, non-decreasing and
 /// ending at `total`.
-fn check_offsets(off: &[u32], total: usize, what: &str) -> Result<(), GpuError> {
+pub(super) fn check_offsets(off: &[u32], total: usize, what: &str) -> Result<(), GpuError> {
     ensure(off.len() == CARDS + 1, || format!("{what}: {} offsets", off.len()))?;
     ensure(off.first() == Some(&0) && off.windows(2).all(|w| w.first() <= w.get(1)), || {
         format!("{what}: offsets out of order")
@@ -647,13 +647,17 @@ impl Plan {
         check_offsets(&pp.opp_card_off, pp.opp_card_hands.len(), "opponent card lists")?;
         ensure(pp.opp_card_hands.iter().all(|&j| j < nq), || "opponent card list entry out of range".into())?;
 
-        self.validate_tables(pp)
+        pp.tables.validate(self.num_tables, &pp.my_cards, pp.opp_hands)
     }
+}
 
-    fn validate_tables(&self, pp: &PlayerPlan) -> Result<(), GpuError> {
-        let t = &pp.tables;
-        let nt = self.num_tables as usize;
-        let n = pp.hands as usize;
+impl Tables {
+    /// Checks the tables of `num_tables` boards for a traverser with hands
+    /// `my_cards` (packed) against an opponent with `opp_hands` hands.
+    pub(super) fn validate(&self, num_tables: u32, my_cards: &[u32], opp_hands: u32) -> Result<(), GpuError> {
+        let t = self;
+        let nt = num_tables as usize;
+        let n = my_cards.len();
         ensure(t.opp_off.len() == nt && t.opp_len.len() == nt && t.card_base.len() == nt, || {
             "table arrays".into()
         })?;
@@ -671,7 +675,7 @@ impl Plan {
                 .opp_order
                 .get(off..off + len)
                 .ok_or_else(|| invalid(format!("table {k}: opponent list out of range")))?;
-            ensure(order.iter().all(|&j| j < pp.opp_hands), || {
+            ensure(order.iter().all(|&j| j < opp_hands), || {
                 format!("table {k}: opponent hand out of range")
             })?;
             let card_off = t
@@ -709,7 +713,7 @@ impl Plan {
                     format!("table {k}, hand {h}: strength range out of order")
                 })?;
                 let r = at(&t.ranks, k * n + h, "ranks")?;
-                let (c1, c2) = unpack_cards(at(&pp.my_cards, h, "my_cards")?);
+                let (c1, c2) = unpack_cards(at(my_cards, h, "my_cards")?);
                 let (len1, len2) = (segment(c1)?.len() as u32, segment(c2)?.len() as u32);
                 let (r1l, r1h, r2l, r2h) = (r & 0xFF, r >> 8 & 0xFF, r >> 16 & 0xFF, r >> 24);
                 ensure(r1l <= r1h && r1h <= len1 && r2l <= r2h && r2h <= len2, || {
@@ -762,60 +766,86 @@ impl PlayerPlan {
     }
 }
 
+/// One hand of a strength-sorted list (weakest first).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Ranked {
+    pub strength: u32,
+    /// Index in its player's hand list.
+    pub idx: u32,
+    pub c1: u8,
+    pub c2: u8,
+}
+
 impl Tables {
     pub(crate) fn build(tables: &[StrengthTable], hs: &HandSet, p: usize) -> Result<Tables, GpuError> {
         let o = p ^ 1;
-        let n = hs.len(p);
+        let my_cards = side(&hs.cards, p)?;
+        let ranked =
+            |e: &crate::eval::Entry| Ranked { strength: e.strength, idx: u32::from(e.idx), c1: e.c1, c2: e.c2 };
         let mut t = Tables::default();
         for table in tables {
-            let (mine, theirs) = (side(&table.lists, p)?, side(&table.lists, o)?);
-            let len = to_u32(theirs.len(), "table opponent list")?;
-            t.opp_off.push(to_u32(t.opp_order.len(), "table opponent lists")?);
-            t.opp_len.push(len);
-            t.max_opp = t.max_opp.max(len);
-            t.opp_order.extend(theirs.iter().map(|e| u32::from(e.idx)));
-
-            let mut per_card: Vec<Vec<u32>> = vec![Vec::new(); CARDS];
-            for (j, e) in theirs.iter().enumerate() {
-                let j = to_u32(j, "table position")?;
-                for c in [e.c1, e.c2] {
-                    per_card.get_mut(c as usize).ok_or_else(|| invalid("card out of range"))?.push(j);
-                }
-            }
-            t.card_base.push(to_u32(t.card_pos.len(), "table card positions")?);
-            let mut off = 0u32;
-            for list in &per_card {
-                t.card_off.push(off);
-                t.card_pos.extend_from_slice(list);
-                off += to_u32(list.len(), "card list")?;
-            }
-            t.card_off.push(off);
-
-            let base = t.ranges.len();
-            t.ranges.resize(base + n, NONE);
-            t.ranks.resize(base + n, 0);
-            let rank = |c: u8, k: usize| -> Result<u32, GpuError> {
-                let list = per_card.get(c as usize).ok_or_else(|| invalid("card out of range"))?;
-                to_u32(list.partition_point(|&j| (j as usize) < k), "card rank")
-            };
-            for e in mine {
-                let h = e.idx as usize;
-                let lo = theirs.partition_point(|x| x.strength < e.strength);
-                let hi = theirs.partition_point(|x| x.strength <= e.strength);
-                ensure(hi < 0xFFFF, || "opponent list too long".into())?;
-                let &(c1, c2) =
-                    side(&hs.cards, p)?.get(h).ok_or_else(|| invalid("table hand out of range"))?;
-                let ranks = [rank(c1, lo)?, rank(c1, hi)?, rank(c2, lo)?, rank(c2, hi)?];
-                ensure(ranks.iter().all(|&r| r <= 0xFF), || "card list longer than 255".into())?;
-                let (Some(range), Some(packed)) = (t.ranges.get_mut(base + h), t.ranks.get_mut(base + h))
-                else {
-                    return Err(invalid("table hand out of range"));
-                };
-                *range = lo as u32 | (hi as u32) << 16;
-                *packed = ranks[0] | ranks[1] << 8 | ranks[2] << 16 | ranks[3] << 24;
-            }
+            t.push(side(&table.lists, p)?, side(&table.lists, o)?, my_cards, ranked)?;
         }
         Ok(t)
+    }
+
+    /// Appends the table of one board: the traverser's hands `mine` and the
+    /// opponent's `theirs` (both sorted by strength, read through `ranked`),
+    /// for a traverser whose hands hold `my_cards`.
+    pub(super) fn push<E>(
+        &mut self,
+        mine: &[E],
+        theirs: &[E],
+        my_cards: &[(u8, u8)],
+        ranked: impl Fn(&E) -> Ranked,
+    ) -> Result<(), GpuError> {
+        let t = self;
+        let n = my_cards.len();
+        let len = to_u32(theirs.len(), "table opponent list")?;
+        t.opp_off.push(to_u32(t.opp_order.len(), "table opponent lists")?);
+        t.opp_len.push(len);
+        t.max_opp = t.max_opp.max(len);
+        t.opp_order.extend(theirs.iter().map(|e| ranked(e).idx));
+
+        let mut per_card: Vec<Vec<u32>> = vec![Vec::new(); CARDS];
+        for (j, e) in theirs.iter().enumerate() {
+            let j = to_u32(j, "table position")?;
+            let e = ranked(e);
+            for c in [e.c1, e.c2] {
+                per_card.get_mut(c as usize).ok_or_else(|| invalid("card out of range"))?.push(j);
+            }
+        }
+        t.card_base.push(to_u32(t.card_pos.len(), "table card positions")?);
+        let mut off = 0u32;
+        for list in &per_card {
+            t.card_off.push(off);
+            t.card_pos.extend_from_slice(list);
+            off += to_u32(list.len(), "card list")?;
+        }
+        t.card_off.push(off);
+
+        let base = t.ranges.len();
+        t.ranges.resize(base + n, NONE);
+        t.ranks.resize(base + n, 0);
+        let rank = |c: u8, k: usize| -> Result<u32, GpuError> {
+            let list = per_card.get(c as usize).ok_or_else(|| invalid("card out of range"))?;
+            to_u32(list.partition_point(|&j| (j as usize) < k), "card rank")
+        };
+        for e in mine.iter().map(&ranked) {
+            let h = e.idx as usize;
+            let lo = theirs.partition_point(|x| ranked(x).strength < e.strength);
+            let hi = theirs.partition_point(|x| ranked(x).strength <= e.strength);
+            ensure(hi < 0xFFFF, || "opponent list too long".into())?;
+            let &(c1, c2) = my_cards.get(h).ok_or_else(|| invalid("table hand out of range"))?;
+            let ranks = [rank(c1, lo)?, rank(c1, hi)?, rank(c2, lo)?, rank(c2, hi)?];
+            ensure(ranks.iter().all(|&r| r <= 0xFF), || "card list longer than 255".into())?;
+            let (Some(range), Some(packed)) = (t.ranges.get_mut(base + h), t.ranks.get_mut(base + h)) else {
+                return Err(invalid("table hand out of range"));
+            };
+            *range = lo as u32 | (hi as u32) << 16;
+            *packed = ranks[0] | ranks[1] << 8 | ranks[2] << 16 | ranks[3] << 24;
+        }
+        Ok(())
     }
 }
 

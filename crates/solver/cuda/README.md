@@ -43,7 +43,10 @@ per-board showdown lookups, `plan/schedule.rs` splits it into segments and
 lays out a level schedule per traverser, and both validate every index the
 kernels will use; `engine.rs` uploads the plan once and launches one kernel
 per tree level (and segment); `Solver::solve` drives the same loop (iterations,
-exploitability checks, cancellation) for both backends.
+exploitability checks, cancellation) for both backends. `multi_plan.rs` is the
+3-way (`solver::multi`) plan: one reach-slot space per opponent, subtrees cut
+off after the traverser's fold, strategy-updater marks, and its own
+validation; it has no kernels yet (see `docs/ROADMAP.md`, section 2).
 
 ## Ground rules
 

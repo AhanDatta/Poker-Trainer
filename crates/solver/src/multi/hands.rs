@@ -6,7 +6,7 @@ use holdem::eval::EvalMask;
 use holdem::{Card, CardSet};
 
 /// Hand lists of the three players.
-pub(super) struct Hands {
+pub(crate) struct Hands {
     pub combos: [Vec<u16>; N],
     pub cards: [Vec<(u8, u8)>; N],
     pub weights: [Vec<f32>; N],
@@ -86,7 +86,7 @@ impl Hands {
 }
 
 /// Hands of the three players sorted by strength on one final board.
-pub(super) struct Table {
+pub(crate) struct Table {
     pub lists: [Vec<(u32, u32, u8, u8)>; N],
 }
 

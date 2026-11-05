@@ -98,7 +98,16 @@ Decided (2026-11-05):
 Steps:
 1. 3-way plan (host): flattened multi tree, per-traverser schedule with two
    reach slots per node, strategy-updater marks, folded cut-offs, terminal
-   lists; validation and mutation tests. `[ ]`
+   lists; validation and mutation tests. `[x]`
+   Done (`src/gpu/multi_plan.rs`): one reach-slot space per opponent, an
+   opponent-node list per opponent seat, fixed-payoff leaves (wins and every
+   node after the traverser's fold) and showdowns per traverser, the CPU
+   evaluator's rounding per leaf, and per-opponent showdown lookup tables
+   (the heads-up layout) for independent removal. Checked against a walk of
+   the CPU traversal on the `multi` test spots and random 3-way spots; about
+   100 corruptions rejected; seeded builder bugs caught. Left for later
+   steps: exact-removal lookup data (3), and splitting, fused opponent
+   nodes and fixed leaves grouped by reach pair (4).
 2. Traversal kernels (opponent split for either opponent, two-slot chance
    split, own update, sums) with independent-removal terminals; bit for bit
    against the CPU with `exact_removal` off. `[ ]`

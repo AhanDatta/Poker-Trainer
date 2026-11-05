@@ -25,11 +25,11 @@
 //! current strategy (unweighted) at its own nodes, and a traversal skips the
 //! subtrees after the traverser folded: its payoff there is fixed.
 
-mod cfr;
+pub(crate) mod cfr;
 mod exact;
-mod hands;
+pub(crate) mod hands;
 mod river;
-mod tree;
+pub(crate) mod tree;
 
 use crate::cfr::{normalize_in_place, Discount, Mode};
 use crate::storage::{Storage, StorageMode};
@@ -205,7 +205,7 @@ pub fn multiway_dcfr() -> DcfrParams {
 }
 
 /// The two opponents of `p` (in seat order).
-pub(super) fn opponents(p: usize) -> (usize, usize) {
+pub(crate) fn opponents(p: usize) -> (usize, usize) {
     match p {
         0 => (1, 2),
         1 => (0, 2),
@@ -271,7 +271,7 @@ impl MultiSolver {
         })
     }
 
-    fn ctx(&self) -> Ctx<'_> {
+    pub(crate) fn ctx(&self) -> Ctx<'_> {
         Ctx {
             tree: &self.tree,
             store: &self.store,
@@ -581,18 +581,18 @@ fn too_large(config: &MultiConfig, needed: u64) -> SolverError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{BettingState, SolveConfig, Solver};
     use holdem::card::parse_cards;
     use holdem::{Range, StreetSizes};
 
-    fn menu() -> PostflopMenu {
+    pub(crate) fn menu() -> PostflopMenu {
         let s = StreetSizes::new(&["66%"], &["3x"]);
         PostflopMenu { flop: s.clone(), turn: s.clone(), river: s, max_raises: 2, ..PostflopMenu::default() }
     }
 
-    fn config(board: &str, ranges: [&str; N], folded: [bool; N]) -> MultiConfig {
+    pub(crate) fn config(board: &str, ranges: [&str; N], folded: [bool; N]) -> MultiConfig {
         let board = parse_cards(board).unwrap();
         let street = Street::from_board_len(board.len());
         MultiConfig {

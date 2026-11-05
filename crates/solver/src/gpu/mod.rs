@@ -29,6 +29,9 @@ use std::sync::Arc;
 mod tests;
 
 mod engine;
+// The 3-way plan has no engine yet (ROADMAP 2.2); only its tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod multi_plan;
 mod plan;
 #[cfg(test)]
 mod testutil;
