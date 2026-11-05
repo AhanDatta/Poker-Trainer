@@ -12,39 +12,69 @@
 
 use super::*;
 use crate::cfr::{self, Discount, Mode};
+use crate::gpu::HostStorage;
 use crate::gpu::testutil::{
-    allin_turn_config, arb_river_config, arb_turn_config, device, iso_turn_config, mid_street_config,
+    allin_turn_config, arb_river_config, arb_turn_config, compressed, device, iso_turn_config, mid_street_config,
     river_config, sampled_flop_config, turn_config,
 };
-use crate::gpu::GpuPrecision;
-use crate::{Action, DcfrParams, NodeInfo, SolveConfig, SolveOptions, Solver, Step, StorageMode};
+use crate::gpu::{GpuPrecision, Scratch};
+use crate::{Action, DcfrParams, NodeInfo, SolveConfig, SolveOptions, Solver, Step};
 use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 fn engine_for(s: &mut Solver, gpu: Gpu, precision: GpuPrecision) -> Engine {
     let plan = Plan::build(&s.ctx()).unwrap();
-    let (r, m) = s.store.f32_buffers_mut().unwrap();
-    Engine::new(gpu, plan, r, m, precision).unwrap()
+    Engine::new(gpu, plan, s.store.gpu_view(), precision).unwrap()
 }
 
 /// Random regrets (some exactly zero, many negative) and strategy sums
 /// (some all-zero), so every branch of regret matching and normalization
-/// is exercised.
+/// is exercised. 16-bit storage gets random raw values and scales (some
+/// scales zero).
 fn randomize_storage(s: &mut Solver, seed: u64) {
     let mut rng = StdRng::seed_from_u64(seed);
-    let (r, m) = s.store.f32_buffers_mut().unwrap();
-    for x in r.iter_mut() {
-        *x = if rng.random::<f64>() < 0.2 { 0.0 } else { rng.random_range(-50.0f32..50.0) };
-    }
-    for x in m.iter_mut() {
-        *x = if rng.random::<f64>() < 0.3 { 0.0 } else { rng.random_range(0.0f32..20.0) };
+    match s.store.gpu_view() {
+        HostStorage::F32 { regrets, sums } => {
+            for x in regrets.iter_mut() {
+                *x = if rng.random::<f64>() < 0.2 { 0.0 } else { rng.random_range(-50.0f32..50.0) };
+            }
+            for x in sums.iter_mut() {
+                *x = if rng.random::<f64>() < 0.3 { 0.0 } else { rng.random_range(0.0f32..20.0) };
+            }
+        }
+        HostStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => {
+            for x in regrets.iter_mut() {
+                *x = if rng.random::<f64>() < 0.2 { 0 } else { rng.random() };
+            }
+            for x in sums.iter_mut() {
+                *x = if rng.random::<f64>() < 0.3 { 0 } else { rng.random() };
+            }
+            for x in regret_scale.iter_mut() {
+                *x = if rng.random::<f64>() < 0.1 { 0.0 } else { rng.random_range(0.0f32..50.0) };
+            }
+            for x in strategy_scale.iter_mut() {
+                *x = if rng.random::<f64>() < 0.1 { 0.0 } else { rng.random_range(0.0f32..20.0) };
+            }
+        }
     }
 }
 
+/// Every decision node's regrets and strategy sums, decoded by the CPU's own
+/// storage code (so 16-bit storage compares the same way as f32).
 fn storage_copy(s: &mut Solver) -> (Vec<f32>, Vec<f32>) {
-    let (r, m) = s.store.f32_buffers_mut().unwrap();
-    (r.to_vec(), m.to_vec())
+    let len = s.tree.storage_len as usize;
+    let (mut regrets, mut sums) = (vec![0f32; len], vec![0f32; len]);
+    for node in &s.tree.nodes {
+        let crate::tree::Kind::Player(q) = node.kind else { continue };
+        let b = node.block(s.hands.len(q as usize));
+        // SAFETY: no traversal is running; blocks don't overlap.
+        unsafe {
+            s.store.load_regrets(b, &mut regrets[b.offset..b.offset + b.len]);
+            s.store.load_strat(b, &mut sums[b.offset..b.offset + b.len]);
+        }
+    }
+    (regrets, sums)
 }
 
 /// `max |a - b|` and `max |b|`.
@@ -118,19 +148,27 @@ fn compare_nodes(cpu: &Solver, gpu: &Solver, strat_tol: f32, ev_tol: f32, rivers
 }
 
 /// Spots with chance nodes, the river cards to compare after check-check.
+/// Includes 16-bit storage variants.
 fn chance_spots() -> Vec<(SolveConfig, &'static [&'static str])> {
     vec![
         (turn_config(), &["Ks", "2h"]),
         (iso_turn_config(), &["Kc", "Kh", "3s"]),
         (allin_turn_config(), &["Ah"]),
         (sampled_flop_config(), &[]),
+        (compressed(turn_config()), &["Ks", "2h"]),
+        (compressed(iso_turn_config()), &["Kc", "Kh", "3s"]),
+        (compressed(sampled_flop_config()), &[]),
     ]
+}
+
+/// River spots, including one with 16-bit storage.
+fn river_spots() -> [SolveConfig; 4] {
+    [river_config(), mid_street_config(false), mid_street_config(true), compressed(mid_street_config(true))]
 }
 
 #[test]
 fn traversal_values_match_cpu_from_random_storage() {
-    let river_spots = [river_config(), mid_street_config(false), mid_street_config(true)];
-    let spots = river_spots.into_iter().chain(chance_spots().into_iter().map(|(c, _)| c));
+    let spots = river_spots().into_iter().chain(chance_spots().into_iter().map(|(c, _)| c));
     for ((k, cfg), precision) in
         spots.enumerate().flat_map(|spot| [(spot.clone(), GpuPrecision::Exact), (spot, GpuPrecision::Fast)])
     {
@@ -171,6 +209,9 @@ fn one_cfr_iteration_matches_cpu_from_random_storage() {
             turn_config(),
             iso_turn_config(),
             sampled_flop_config(),
+            compressed(mid_street_config(true)),
+            compressed(turn_config()),
+            compressed(sampled_flop_config()),
         ];
         for (k, cfg) in spots.into_iter().enumerate() {
             let Some(gpu) = device() else { return };
@@ -189,8 +230,7 @@ fn one_cfr_iteration_matches_cpu_from_random_storage() {
                     cfr::traverse(&ctx, 0, p, &cpu.hands.weights[p ^ 1], Mode::Cfr(d), &mut out);
                 }
                 engine.cfr_iteration(d).unwrap();
-                let (r, m) = on_gpu.store.f32_buffers_mut().unwrap();
-                engine.download(r, m).unwrap();
+                engine.download(on_gpu.store.gpu_view()).unwrap();
                 let (cr, cm) = storage_copy(&mut cpu);
                 let (gr, gm) = storage_copy(&mut on_gpu);
                 let what = format!("t {t}, config {k}, weighted {weighted}");
@@ -203,7 +243,7 @@ fn one_cfr_iteration_matches_cpu_from_random_storage() {
 
 #[test]
 fn solves_match_cpu() {
-    for cfg in [river_config(), mid_street_config(false), mid_street_config(true)] {
+    for cfg in river_spots() {
         let Some((cpu, gpu)) = solve_both(cfg.clone(), 5, GpuPrecision::Exact) else { return };
         compare_nodes(&cpu, &gpu, 5e-5, 0.25, &[]);
     }
@@ -245,14 +285,14 @@ fn continues_a_cpu_solve() {
 }
 
 #[test]
-fn declines_compressed_storage_and_stays_on_cpu() {
-    let mut cfg = turn_config();
-    cfg.storage = StorageMode::Compressed;
-    let mut s = Solver::new(cfg).unwrap();
-    assert!(matches!(s.use_gpu(GpuPrecision::Exact), Err(GpuError::InvalidInput(_))));
-    assert!(!s.uses_gpu());
+fn accepts_compressed_storage() {
+    let Some(_) = device() else { return };
+    let mut s = Solver::new(compressed(turn_config())).unwrap();
+    assert!(s.is_compressed());
+    s.use_gpu(GpuPrecision::Exact).unwrap();
     let p = s.solve(&opts(2), |_| true);
     assert_eq!(p.iteration, 2);
+    assert!(s.uses_gpu() && s.gpu_error().is_none());
 }
 
 #[test]
@@ -336,7 +376,14 @@ proptest! {
 /// decision-node checks cover).
 #[test]
 fn every_node_matches_cpu_given_gpu_reach() {
-    for cfg in [turn_config(), iso_turn_config(), allin_turn_config(), sampled_flop_config()] {
+    for cfg in [
+        turn_config(),
+        iso_turn_config(),
+        allin_turn_config(),
+        sampled_flop_config(),
+        compressed(turn_config()),
+        compressed(sampled_flop_config()),
+    ] {
         let Some(gpu) = device() else { return };
         let mut s = Solver::new(cfg).unwrap();
         randomize_storage(&mut s, 101);
@@ -436,8 +483,7 @@ fn fast_terminals_match_exact_terminals() {
 /// differences: the CPU-vs-CPU standard of `batched_river_matches_recursion`.
 #[test]
 fn fast_short_solves_match_cpu() {
-    let river_spots = [river_config(), mid_street_config(false), mid_street_config(true)];
-    let spots = river_spots.into_iter().map(|c| (c, &[][..])).chain(chance_spots());
+    let spots = river_spots().into_iter().map(|c| (c, &[][..])).chain(chance_spots());
     for (cfg, rivers) in spots {
         let Some((cpu, gpu)) = solve_both(cfg, 5, GpuPrecision::Fast) else { return };
         compare_nodes(&cpu, &gpu, 5e-5, 0.25, rivers);
@@ -452,7 +498,7 @@ fn fast_short_solves_match_cpu() {
 /// strategy, by the standard of `compressed_storage_is_close`.
 #[test]
 fn fast_converged_solves_match_cpu() {
-    for cfg in [turn_config(), iso_turn_config(), sampled_flop_config()] {
+    for cfg in [turn_config(), iso_turn_config(), sampled_flop_config(), compressed(turn_config())] {
         let Some(_) = device() else { return };
         let opts = SolveOptions { max_iterations: 400, target_exploitability_pct: 0.3, check_every: 20 };
         let mut cpu = Solver::new(cfg.clone()).unwrap();
@@ -501,3 +547,208 @@ proptest! {
         compare_nodes(&cpu, &gpu, 5e-5, 0.25 * (1.0 + ev_scale / 2500.0), &[]);
     }
 }
+
+/// Every regret and strategy sum (and 16-bit scale), as raw bits.
+fn storage_bits(s: &mut Solver) -> Vec<u32> {
+    match s.store.gpu_view() {
+        HostStorage::F32 { regrets, sums } => regrets.iter().chain(sums.iter()).map(|x| x.to_bits()).collect(),
+        HostStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => regrets
+            .iter()
+            .map(|&x| u32::from(x as u16))
+            .chain(sums.iter().map(|&x| u32::from(x)))
+            .chain(regret_scale.iter().chain(strategy_scale.iter()).map(|x| x.to_bits()))
+            .collect(),
+    }
+}
+
+/// A solver of `cfg` on the GPU with its tree split as `scratch` says, from
+/// storage randomized with `seed` (zero storage without one).
+fn gpu_solver(cfg: SolveConfig, precision: GpuPrecision, scratch: Scratch, seed: Option<u64>) -> Solver {
+    let mut s = Solver::new(cfg).unwrap();
+    if let Some(seed) = seed {
+        randomize_storage(&mut s, seed);
+    }
+    s.use_gpu_with(device().unwrap(), precision, scratch).unwrap();
+    s
+}
+
+fn segments(s: &Solver) -> u32 {
+    s.gpu.as_ref().unwrap().plan.num_segments
+}
+
+/// Splitting must not change a single bit: every group runs the same
+/// kernels on the same inputs, only in other value rows and reach slots.
+fn assert_split_matches_whole(cfg: &SolveConfig, precision: GpuPrecision, scratch: Scratch, seed: Option<u64>, iterations: u32) {
+    let mut whole = gpu_solver(cfg.clone(), precision, Scratch::Unlimited, seed);
+    let mut split = gpu_solver(cfg.clone(), precision, scratch, seed);
+    assert_eq!(segments(&whole), 1);
+    assert!(segments(&split) > 1, "{scratch:?}: tree not split");
+    let pw = whole.solve(&opts(iterations), |_| true);
+    let ps = split.solve(&opts(iterations), |_| true);
+    assert!(whole.uses_gpu() && whole.gpu_error().is_none(), "{:?}", whole.gpu_error());
+    assert!(split.uses_gpu() && split.gpu_error().is_none(), "{:?}", split.gpu_error());
+    assert_eq!(pw.iteration, ps.iteration);
+    assert_eq!(
+        pw.exploitability.to_bits(),
+        ps.exploitability.to_bits(),
+        "{precision:?}, {scratch:?}: exploitability {} vs {}",
+        pw.exploitability,
+        ps.exploitability
+    );
+    let (bw, bs) = (storage_bits(&mut whole), storage_bits(&mut split));
+    let differing = bw.iter().zip(&bs).filter(|(a, b)| a != b).count();
+    assert!(bw.len() == bs.len() && differing == 0, "{precision:?}, {scratch:?}: {differing} storage values differ");
+}
+
+#[test]
+fn split_solves_match_whole_solves_bit_for_bit() {
+    let Some(_) = device() else { return };
+    for (cfg, _) in chance_spots() {
+        let nodes = Solver::new(cfg.clone()).unwrap().tree.nodes.len() as u32;
+        for precision in [GpuPrecision::Exact, GpuPrecision::Fast] {
+            for max_nodes in [1, nodes / 4] {
+                assert_split_matches_whole(&cfg, precision, Scratch::ForceGroups { max_nodes }, None, 6);
+            }
+        }
+    }
+}
+
+/// From random storage: dead subtrees, zero scales and all-zero sums inside
+/// the groups.
+#[test]
+fn split_solves_match_whole_solves_from_random_storage() {
+    let Some(_) = device() else { return };
+    for (k, (cfg, _)) in chance_spots().into_iter().enumerate() {
+        let precision = if k % 2 == 0 { GpuPrecision::Exact } else { GpuPrecision::Fast };
+        assert_split_matches_whole(&cfg, precision, Scratch::ForceGroups { max_nodes: 1 }, Some(k as u64), 2);
+    }
+}
+
+/// A memory budget below the whole tree's needs splits it, with the same
+/// results; one too small for any chunk leaves the solver on the CPU.
+#[test]
+fn budget_split_solves_match_whole_solves() {
+    let Some(_) = device() else { return };
+    for cfg in [turn_config(), compressed(sampled_flop_config())] {
+        let s = Solver::new(cfg.clone()).unwrap();
+        let whole = Plan::build(&s.ctx()).unwrap();
+        let [p0, p1] = &whole.players;
+        let scratch = scratch_bytes(
+            [u64::from(p0.num_slots), u64::from(p1.num_slots)],
+            u64::from(whole.num_rows),
+            [u64::from(p0.hands), u64::from(p1.hands)],
+        );
+        let budget = whole.device_bytes() + scratch - 1;
+        assert_split_matches_whole(&cfg, GpuPrecision::Fast, Scratch::Budget(budget), None, 4);
+
+        let mut tiny = Solver::new(cfg).unwrap();
+        let err = tiny.use_gpu_with(device().unwrap(), GpuPrecision::Fast, Scratch::Budget(whole.device_bytes()));
+        assert!(matches!(err, Err(GpuError::OutOfMemory { .. })), "{err:?}");
+        assert!(!tiny.uses_gpu());
+        assert_eq!(tiny.solve(&opts(2), |_| true).iteration, 2);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(12))]
+
+    #[test]
+    fn random_split_solves_match_whole_solves(
+        cfg in arb_turn_config(),
+        max_nodes in 1u32..3000,
+        seed in any::<u64>(),
+        exact in any::<bool>(),
+    ) {
+        let Some(_) = device() else { return Ok(()) };
+        let Ok(s) = Solver::new(cfg.clone()) else { return Ok(()) };
+        let scratch = Scratch::ForceGroups { max_nodes };
+        if Plan::build_with(&s.ctx(), scratch).unwrap().num_segments == 1 {
+            return Ok(());
+        }
+        let precision = if exact { GpuPrecision::Exact } else { GpuPrecision::Fast };
+        assert_split_matches_whole(&cfg, precision, scratch, Some(seed), 2);
+    }
+}
+
+fn with_backend(mut cfg: SolveConfig, backend: crate::Backend) -> SolveConfig {
+    cfg.backend = backend;
+    cfg
+}
+
+/// `Backend::Gpu` runs each solve on the GPU (bit for bit as an explicit
+/// `use_gpu` with the default precision) and frees it afterwards.
+#[test]
+fn gpu_backend_matches_explicit_use_gpu() {
+    let Some(_) = device() else { return };
+    for cfg in [turn_config(), compressed(sampled_flop_config())] {
+        let mut explicit = Solver::new(cfg.clone()).unwrap();
+        explicit.use_gpu(GpuPrecision::default()).unwrap();
+        let pe = explicit.solve(&opts(6), |_| true);
+        assert!(explicit.uses_gpu(), "explicit use_gpu stays on");
+        let mut backed = Solver::new(with_backend(cfg, crate::Backend::Gpu)).unwrap();
+        assert!(!backed.uses_gpu(), "the GPU is taken only while solving");
+        let pb = backed.solve(&opts(6), |_| true);
+        assert!(!backed.uses_gpu() && backed.gpu_error().is_none(), "{:?}", backed.gpu_error());
+        assert_eq!(pe.exploitability.to_bits(), pb.exploitability.to_bits());
+        assert!(storage_bits(&mut explicit) == storage_bits(&mut backed), "storage differs");
+    }
+}
+
+/// A GPU-backed solve continued by a second `solve` call (the GPU taken
+/// again, the storage uploaded again) ends where one call would.
+#[test]
+fn gpu_backend_continues_across_solve_calls() {
+    let Some(_) = device() else { return };
+    let cfg = with_backend(turn_config(), crate::Backend::Gpu);
+    let mut once = Solver::new(cfg.clone()).unwrap();
+    once.solve(&opts(6), |_| true);
+    let mut twice = Solver::new(cfg).unwrap();
+    twice.solve(&opts(3), |_| true);
+    twice.solve(&opts(6), |_| true);
+    assert_eq!(twice.iterations(), 6);
+    assert!(storage_bits(&mut once) == storage_bits(&mut twice), "storage differs");
+}
+
+/// `Backend::Auto` solves turn roots on the GPU (same bits as `Gpu`).
+#[test]
+fn auto_backend_uses_the_gpu_off_the_river() {
+    let Some(_) = device() else { return };
+    let mut gpu = Solver::new(with_backend(turn_config(), crate::Backend::Gpu)).unwrap();
+    let pg = gpu.solve(&opts(6), |_| true);
+    let mut auto = Solver::new(with_backend(turn_config(), crate::Backend::Auto)).unwrap();
+    let pa = auto.solve(&opts(6), |_| true);
+    assert!(auto.gpu_error().is_none());
+    assert_eq!(pg.exploitability.to_bits(), pa.exploitability.to_bits());
+    assert!(storage_bits(&mut gpu) == storage_bits(&mut auto), "storage differs");
+}
+
+/// The exact path is bit-identical to the CPU: every regret and strategy sum
+/// (raw bits, scales included) and the exploitability, after 5 iterations,
+/// on every test spot (f32 and 16-bit storage, batched and one-at-a-time
+/// terminals, isomorphic cards, all-in runouts, rake).
+#[test]
+fn exact_solves_match_cpu_bit_for_bit() {
+    let Some(_) = device() else { return };
+    let mut no_batching = Solver::new(turn_config()).unwrap();
+    no_batching.set_batch_river(false);
+    let spots = river_spots().into_iter().chain(chance_spots().into_iter().map(|(c, _)| c));
+    for (k, cfg) in spots.enumerate() {
+        let mut cpu = Solver::new(cfg.clone()).unwrap();
+        let mut gpu = Solver::new(cfg).unwrap();
+        gpu.use_gpu(GpuPrecision::Exact).unwrap();
+        let pc = cpu.solve(&opts(5), |_| true);
+        let pg = gpu.solve(&opts(5), |_| true);
+        assert!(gpu.gpu_error().is_none(), "spot {k}: {:?}", gpu.gpu_error());
+        let (bc, bg) = (storage_bits(&mut cpu), storage_bits(&mut gpu));
+        let differing = bc.iter().zip(&bg).filter(|(a, b)| a != b).count();
+        assert!(differing == 0, "spot {k}: {differing} of {} storage values differ", bc.len());
+        assert_eq!(pc.exploitability.to_bits(), pg.exploitability.to_bits(), "spot {k}: exploitability");
+    }
+    let mut cpu = Solver::new(turn_config()).unwrap();
+    cpu.set_batch_river(false);
+    no_batching.use_gpu(GpuPrecision::Exact).unwrap();
+    cpu.solve(&opts(5), |_| true);
+    no_batching.solve(&opts(5), |_| true);
+    assert!(storage_bits(&mut cpu) == storage_bits(&mut no_batching), "without river batching");
+}
+

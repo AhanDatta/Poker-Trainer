@@ -158,12 +158,19 @@ impl Storage {
         matches!(self, Storage::Compressed { .. })
     }
 
-    /// The `f32` regrets and strategy sums (`None` for compressed storage).
+    /// All buffers, as the GPU engine uploads and downloads them.
     #[cfg(feature = "gpu")]
-    pub(crate) fn f32_buffers_mut(&mut self) -> Option<(&mut [f32], &mut [f32])> {
+    pub(crate) fn gpu_view(&mut self) -> crate::gpu::HostStorage<'_> {
         match self {
-            Storage::F32 { regrets, strat } => Some((regrets.as_mut_slice(), strat.as_mut_slice())),
-            Storage::Compressed { .. } => None,
+            Storage::F32 { regrets, strat } => {
+                crate::gpu::HostStorage::F32 { regrets: regrets.as_mut_slice(), sums: strat.as_mut_slice() }
+            }
+            Storage::Compressed { regrets, strat, regret_scale, strat_scale } => crate::gpu::HostStorage::Compressed {
+                regrets: regrets.as_mut_slice(),
+                sums: strat.as_mut_slice(),
+                regret_scale: regret_scale.as_mut_slice(),
+                strategy_scale: strat_scale.as_mut_slice(),
+            },
         }
     }
 

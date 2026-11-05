@@ -400,3 +400,221 @@ fn validate_rejects_bad_pairings() {
     bad_payoff.players[0].showdown_fold_payoff[k] = f64::INFINITY;
     assert!(matches!(bad_payoff.validate(), Err(GpuError::InvalidInput(_))), "infinite payoff accepted");
 }
+
+/// Spots whose root street has chance nodes, so their trees can be split.
+fn splittable_spots() -> Vec<(&'static str, SolveConfig)> {
+    vec![
+        ("turn", turn_config()),
+        ("isomorphic turn", iso_turn_config()),
+        ("all-in turn", allin_turn_config()),
+        ("sampled flop", sampled_flop_config()),
+    ]
+}
+
+fn split_plan(cfg: SolveConfig, scratch: Scratch) -> (Solver, Plan) {
+    let s = Solver::new(cfg).unwrap();
+    let plan = Plan::build_with(&s.ctx(), scratch).unwrap();
+    (s, plan)
+}
+
+/// Bytes of the scratch buffers `Engine::new` allocates for `plan`.
+fn plan_scratch(plan: &Plan) -> u64 {
+    let [p0, p1] = &plan.players;
+    scratch_bytes(
+        [u64::from(p0.num_slots), u64::from(p1.num_slots)],
+        u64::from(plan.num_rows),
+        [u64::from(p0.hands), u64::from(p1.hands)],
+    )
+}
+
+/// Chunks of a tree: children of the root street's chance nodes.
+fn chunk_count(s: &Solver) -> usize {
+    let street = s.tree.nodes[0].street;
+    s.tree.nodes.iter().filter(|n| matches!(n.kind, Kind::Chance) && n.street == street).map(|n| n.num_children as usize).sum()
+}
+
+fn sorted(v: &[u32]) -> Vec<u32> {
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v
+}
+
+/// Forced splitting gives one group per chunk (or groups of several),
+/// reuses value rows and reach slots, and schedules exactly the nodes and
+/// terminals of the whole plan.
+#[test]
+fn forced_groups_split_trees_with_chunks() {
+    for (name, cfg) in splittable_spots() {
+        let (s, whole) = split_plan(cfg.clone(), Scratch::Unlimited);
+        assert_eq!((whole.num_segments, whole.num_rows), (1, whole.num_nodes), "{name}: whole plan");
+        let chunks = chunk_count(&s);
+        assert!(chunks > 1, "{name}: no chunks");
+        for max_nodes in [1, whole.num_nodes / 4] {
+            let (_, plan) = split_plan(cfg.clone(), Scratch::ForceGroups { max_nodes });
+            plan.validate().unwrap();
+            let groups = plan.num_segments as usize - 1;
+            if max_nodes == 1 {
+                assert_eq!(groups, chunks, "{name}: one group per chunk");
+            } else {
+                assert!(groups > 1 && groups < chunks, "{name}: {groups} groups of {chunks} chunks");
+            }
+            assert!(plan.num_rows < plan.num_nodes, "{name}: value rows aren't reused");
+            assert!(plan_scratch(&plan) < plan_scratch(&whole), "{name}: no scratch saved");
+            for (p, (pp, wp)) in plan.players.iter().zip(&whole.players).enumerate() {
+                assert!(pp.num_slots < wp.num_slots, "{name}, player {p}: reach slots aren't reused");
+                assert_eq!(pp.segments.len(), groups + 1);
+                for (a, b, what) in [
+                    (&pp.own_nodes, &wp.own_nodes, "own nodes"),
+                    (&pp.opp_nodes, &wp.opp_nodes, "opponent nodes"),
+                    (&pp.chance_nodes, &wp.chance_nodes, "chance nodes"),
+                    (&pp.folds, &wp.folds, "folds"),
+                    (&pp.showdowns, &wp.showdowns, "showdowns"),
+                    (&pp.showdown_fold, &wp.showdown_fold, "paired folds"),
+                ] {
+                    assert_eq!(sorted(a), sorted(b), "{name}, player {p}: {what}");
+                }
+            }
+        }
+    }
+}
+
+/// Without chance nodes on the root street there is nothing to split.
+#[test]
+fn trees_without_chunks_stay_whole() {
+    for cfg in [river_config(), mid_street_config(true)] {
+        let (s, plan) = split_plan(cfg, Scratch::ForceGroups { max_nodes: 1 });
+        assert_eq!(chunk_count(&s), 0);
+        assert_eq!((plan.num_segments, plan.num_rows), (1, plan.num_nodes));
+    }
+}
+
+/// A budget splits the tree only when the whole would not fit, into groups
+/// that do; a budget too small for one chunk is an out-of-memory error.
+/// (On these small trees the plan arrays and the top segment are much of the
+/// total, so only budgets a little below the whole tree's need can fit.)
+#[test]
+fn budget_splits_only_as_needed() {
+    for (name, cfg) in splittable_spots() {
+        let (s, whole) = split_plan(cfg.clone(), Scratch::Unlimited);
+        let need = whole.device_bytes() + plan_scratch(&whole);
+        let (_, roomy) = split_plan(cfg.clone(), Scratch::Budget(2 * need));
+        assert_eq!(roomy.num_segments, 1, "{name}: split with room to spare");
+        let mut fitted = 0;
+        for budget in [need - 1, need * 19 / 20, need * 9 / 10, need * 3 / 4, need / 2] {
+            match Plan::build_with(&s.ctx(), Scratch::Budget(budget)) {
+                Ok(plan) => {
+                    assert!(plan.num_segments > 1, "{name}: not split under {budget} of {need} bytes");
+                    let used = plan.device_bytes() + plan_scratch(&plan);
+                    assert!(used <= budget, "{name}: {used} bytes over the budget of {budget}");
+                    fitted += 1;
+                }
+                Err(GpuError::OutOfMemory { needed, available }) => {
+                    assert!(needed > budget && available == budget, "{name}: {needed} vs {available}");
+                }
+                Err(e) => panic!("{name}: {e}"),
+            }
+        }
+        assert!(fitted >= 2, "{name}: only {fitted} budgets fitted");
+        let tiny = Scratch::Budget(whole.device_bytes());
+        assert!(matches!(Plan::build_with(&s.ctx(), tiny), Err(GpuError::OutOfMemory { .. })), "{name}");
+    }
+}
+
+#[test]
+fn validate_rejects_corrupted_split_plans() {
+    let (_, plan) = split_plan(turn_config(), Scratch::ForceGroups { max_nodes: 1 });
+    plan.validate().unwrap();
+    assert!(plan.num_segments > 3);
+    let nn = plan.num_nodes as usize;
+    let parent = |c: usize| (0..nn).find(|&i| plan.children(i).unwrap().contains(&c)).unwrap();
+    let segment_of = &plan.segment_of;
+    let group = |g: u32| (0..nn).filter(move |&i| segment_of[i] == g);
+    let root1 = group(1).find(|&i| plan.segment_of[parent(i)] == 0).unwrap();
+    let mut inner = group(1).filter(|&i| i != root1);
+    let (inner1, inner1b) = (inner.next().unwrap(), inner.next().unwrap());
+    let opp = plan.players[0].opp_nodes.iter().map(|&i| i as usize).find(|&i| plan.segment_of[i] == 1).unwrap();
+    type Mutation = Box<dyn Fn(&mut Plan)>;
+    let mutations: Vec<(&str, Mutation)> = vec![
+        ("group row in the top region", Box::new(move |p| p.row[inner1] = p.top_rows - 1)),
+        ("group rows shared", Box::new(move |p| p.row[inner1b] = p.row[inner1])),
+        ("top rows shared", Box::new(move |p| p.row[root1] = p.row[0])),
+        ("row out of range", Box::new(move |p| p.row[inner1] = p.num_rows)),
+        ("node moved to another group", Box::new(move |p| p.segment_of[inner1] = 2)),
+        ("chunk root moved to the top", Box::new(move |p| p.segment_of[root1] = 0)),
+        ("segment out of range", Box::new(move |p| p.segment_of[inner1] = p.num_segments)),
+        ("root in a group", Box::new(|p| p.segment_of[0] = 1)),
+        (
+            "group child slots in the top region",
+            Box::new(move |p| {
+                let pp = &mut p.players[0];
+                let first = pp.top_slots - 1;
+                pp.child_slot[opp] = first;
+                let children = p.first_child[opp] as usize..(p.first_child[opp] + p.actions[opp]) as usize;
+                for (a, c) in children.enumerate() {
+                    pp.slot[c] = first + a as u32;
+                }
+            }),
+        ),
+        ("group slot region moved", Box::new(|p| p.players[1].segments[1].fresh_slots.start += 1)),
+        ("group slots past the end", Box::new(|p| p.players[1].segments[2].fresh_slots.count = p.players[1].num_slots)),
+        (
+            "top slot region cut short",
+            Box::new(|p| {
+                let pp = &mut p.players[0];
+                pp.top_slots -= 1;
+                pp.segments[0].fresh_slots.count -= 1;
+                for s in &mut pp.segments[1..] {
+                    s.fresh_slots.start -= 1;
+                }
+            }),
+        ),
+        (
+            "segment levels overlap",
+            Box::new(|p| {
+                let s = &mut p.players[0].segments[1].levels;
+                s.start -= 1;
+                s.count += 1;
+            }),
+        ),
+        (
+            "level in the wrong segment",
+            Box::new(|p| {
+                let s = &mut p.players[1].segments;
+                s[0].levels.count += 1;
+                s[1].levels.start += 1;
+                s[1].levels.count -= 1;
+            }),
+        ),
+        (
+            "showdown in the wrong segment",
+            Box::new(|p| {
+                let s = &mut p.players[0].segments;
+                s[1].showdowns.count += 1;
+                s[2].showdowns.start += 1;
+                s[2].showdowns.count -= 1;
+            }),
+        ),
+        ("schedule missing a segment", Box::new(|p| {
+            p.players[1].segments.pop();
+        })),
+        ("value buffer too small", Box::new(|p| p.num_rows = p.top_rows)),
+    ];
+    for (what, mutate) in mutations {
+        let mut bad = plan.clone();
+        mutate(&mut bad);
+        assert!(matches!(bad.validate(), Err(GpuError::InvalidInput(_))), "{what}: accepted");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(32))]
+
+    /// Any group size gives a valid plan, split exactly when there are chunks.
+    #[test]
+    fn random_split_plans_validate(cfg in arb_turn_config(), max_nodes in 1u32..3000) {
+        let Ok(s) = Solver::new(cfg) else { return Ok(()) };
+        let plan = Plan::build_with(&s.ctx(), Scratch::ForceGroups { max_nodes }).unwrap();
+        prop_assert!(plan.validate().is_ok());
+        prop_assert_eq!(plan.num_segments > 1, chunk_count(&s) > 0);
+    }
+}

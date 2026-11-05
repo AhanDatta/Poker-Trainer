@@ -357,3 +357,50 @@ fn check_schedule_aims_at_predicted_convergence() {
     // No progress: fall back to the max gap.
     assert_eq!(gap(Some((20, 1.0)), (40, 1.2), 0.5, 20), 20);
 }
+
+/// Root strategy, EVs and exploitability, for bit-for-bit comparisons.
+fn root_bits(s: &Solver, p: &Progress) -> (Vec<u32>, Vec<u32>, u64) {
+    let root = s.query(&[]).unwrap();
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    (bits(&root.strategy), bits(&root.ev), p.exploitability.to_bits())
+}
+
+fn river_spot() -> SolveConfig {
+    config("Qh9d4c2sKs", "AQ, KQ, QJs, JTs, 99, 44", "AA, KK, AQ, QT, 99, 98s", 600, 4000, PostflopMenu::default())
+}
+
+#[test]
+fn backend_defaults_to_the_cpu() {
+    let cfg = river_spot();
+    assert_eq!(cfg.backend, Backend::Cpu);
+    let (s, _) = solve(cfg, 20, 0.0);
+    assert!(!s.uses_gpu() && s.gpu_error().is_none());
+}
+
+/// `Auto` leaves river roots on the CPU: same bits, no GPU error.
+#[test]
+fn auto_backend_keeps_river_roots_on_the_cpu() {
+    let (cpu, pc) = solve(river_spot(), 30, 0.0);
+    let mut cfg = river_spot();
+    cfg.backend = Backend::Auto;
+    let (auto, pa) = solve(cfg, 30, 0.0);
+    assert_eq!(root_bits(&cpu, &pc), root_bits(&auto, &pa));
+    assert!(!auto.uses_gpu() && auto.gpu_error().is_none());
+}
+
+/// Without GPU support a GPU backend solves on the CPU (bit for bit) and
+/// says why.
+#[cfg(not(feature = "gpu"))]
+#[test]
+fn gpu_backend_without_gpu_support_solves_on_the_cpu() {
+    let mut cfg = config("Qh9d4c2s", "AQ, KQ, 99, 44", "AA, KK, AQ, 98s", 600, 4000, PostflopMenu::default());
+    let (cpu, pc) = solve(cfg.clone(), 10, 0.0);
+    for backend in [Backend::Gpu, Backend::Auto] {
+        cfg.backend = backend;
+        let (s, p) = solve(cfg.clone(), 10, 0.0);
+        assert_eq!(root_bits(&cpu, &pc), root_bits(&s, &p), "{backend:?}");
+        assert!(!s.uses_gpu());
+        assert!(s.gpu_error().is_some_and(|e| e.contains("gpu")), "{backend:?}: {:?}", s.gpu_error());
+    }
+}
+

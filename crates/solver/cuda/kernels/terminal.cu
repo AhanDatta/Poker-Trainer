@@ -19,8 +19,8 @@
 //   rate and the f64 pipe was the bottleneck of these kernels; results
 //   agree with the exact path except for rare one-rounding-step differences.
 // Either way, sums and prefix sums run sequentially per thread over
-// contiguous chunks (or one card's list), with only the chunk totals
-// combined by a block-wide scan or reduction.
+// contiguous chunks (or a quarter of one card's list), with only the chunk
+// totals combined by a block-wide scan or reduction (or warp shuffles).
 //
 // Showdowns replace the CPU's sequential strength sweep by prefix sums over
 // the board's strength-sorted opponent hands, plus one prefix sum per card
@@ -47,7 +47,9 @@ namespace {
 /// Threads per block (a compile-time constant: loops stride by it, which
 /// measured a few percent faster than striding by `blockDim.x`). 512-thread
 /// showdown blocks, to fill the warp slots that the shared-memory limit of 3
-/// blocks per SM leaves empty, measured 10% slower.
+/// blocks per SM leaves empty, measured 10% slower; reading the opponent
+/// weights from the (cached) reach row instead of shared memory, for 4
+/// blocks per SM, 3% slower.
 inline constexpr u32 kThreads = 256;
 
 template <class T>
@@ -75,6 +77,74 @@ template <Accumulator A>
   return {begin, cuda::std::min(begin + per, len)};
 }
 
+/// Threads sharing one card's list in `card_prefix_sums` (a group of
+/// consecutive lanes of one warp).
+inline constexpr u32 kThreadsPerCard = 4;
+static_assert(kCards * kThreadsPerCard <= kThreads, "every card needs its thread group");
+static_assert(32 % kThreadsPerCard == 0, "a card's thread group must not straddle warps");
+
+/// `v` of lane `src` of this thread's card group (every lane of the warp
+/// must call it).
+template <Accumulator A>
+[[nodiscard]] __device__ auto group_lane(A v, u32 src) noexcept -> A {
+  constexpr unsigned kAll = 0xFFFF'FFFFu;
+  if constexpr (cuda::std::same_as<A, double>) {
+    return __shfl_sync(kAll, v, static_cast<int>(src), kThreadsPerCard);
+  } else {
+    return A{__shfl_sync(kAll, v.hi, static_cast<int>(src), kThreadsPerCard),
+             __shfl_sync(kAll, v.lo, static_cast<int>(src), kThreadsPerCard)};
+  }
+}
+
+/// Prefix sums of the weights of each card's opponent hands: for card `c`,
+/// whose entries are `card_pos[card_off[c] .. card_off[c + 1]]` (positions
+/// into `weights`), `out[card_off[c] + c + e]` is the sum of its first `e`
+/// weights, `e = 0 ..= len`. Every thread of the block must call it.
+///
+/// `kThreadsPerCard` threads share a card: each sums its quarter of the list
+/// into local prefixes, the quarter totals are combined across the group in
+/// lane order, and each quarter's prefixes are then offset by the totals
+/// before it (independent adds). The dependent chain is about a quarter of
+/// one sequential sweep, which left most of the block waiting at the barrier.
+template <Accumulator A>
+__device__ void card_prefix_sums(Span<const u32> card_off,
+                                 Span<const u32> card_pos,
+                                 Span<const float> weights,
+                                 Span<A> out) noexcept {
+  const u32 c = threadIdx.x / kThreadsPerCard;
+  const u32 part = threadIdx.x % kThreadsPerCard;
+  const bool has_card = c < kCards;
+  const u32 first_entry = has_card ? card_off[c] : 0u;
+  const u32 len = has_card ? card_off[c + 1] - first_entry : 0u;
+  const u32 lo = len * part / kThreadsPerCard;
+  const u32 hi = len * (part + 1) / kThreadsPerCard;
+  const auto segment = has_card ? out.subspan(first_entry + c, len + 1) : out.first(0);
+
+  // Local prefixes of this quarter (offset below).
+  A local{};
+#pragma unroll 4
+  for (u32 e = lo; e < hi; ++e) {
+    segment[e] = local;
+    local = add(local, weights[card_pos[first_entry + e]]);
+  }
+  // The totals of the quarters before this one, summed in lane order.
+  A carry{};
+  for (u32 q = 0; q + 1 < kThreadsPerCard; ++q) {
+    const A total = group_lane(local, q);
+    if (q < part) {
+      carry = add(carry, total);
+    }
+  }
+  if (part > 0) {
+    for (u32 e = lo; e < hi; ++e) {
+      segment[e] = add(carry, segment[e]);
+    }
+  }
+  if (has_card && part + 1 == kThreadsPerCard) {
+    segment[len] = add(carry, local);
+  }
+}
+
 /// Compatible opponent reach of a hand for a fold: `eval_fold` computes
 /// `total - (m1 + m2) + same`, the batched evaluators `total - m1 - m2 + same`.
 template <Accumulator A>
@@ -92,6 +162,7 @@ struct FoldArgs {
   Span<const u32> alive;
   Span<const float> reach;
   Span<float> values;
+  Span<const u32> rows;
   Span<const u32> my_cards;
   Span<const u32> same;
   Span<const u32> card_off;
@@ -116,7 +187,7 @@ __device__ void fold_values_impl(const FoldArgs& args) {
   for (u32 k = blockIdx.x; k < args.list.size(); k += gridDim.x) {
     const u32 node = args.list[k];
     const u32 slot = args.slots[node];
-    const auto out = row(args.values, node, hands);
+    const auto out = row(args.values, args.rows[node], hands);
     if (args.alive[slot] == 0u) {
       zero_row(out);
       continue;  // uniform: every thread of the block skips together
@@ -175,6 +246,7 @@ struct ShowdownArgs {
   Span<const u32> alive;
   Span<const float> reach;
   Span<float> values;
+  Span<const u32> rows;
   Span<const u32> my_cards;
   Span<const u32> same;
   Span<const u32> opp_off;
@@ -209,11 +281,11 @@ __device__ void showdown_values_impl(const ShowdownArgs& args) {
     const u32 node = args.list[k];
     const u32 slot = args.slots[node];
     const u32 fold_node = args.paired_fold[k];
-    const auto out = row(args.values, node, hands);
+    const auto out = row(args.values, args.rows[node], hands);
     if (args.alive[slot] == 0u) {
       zero_row(out);
       if (fold_node != kNone) {
-        zero_row(row(args.values, fold_node, hands));
+        zero_row(row(args.values, args.rows[fold_node], hands));
       }
       continue;  // uniform: every thread of the block skips together
     }
@@ -253,19 +325,8 @@ __device__ void showdown_values_impl(const ShowdownArgs& args) {
 
     // Card c's opponent hands, in strength order, are card_pos[card_off[c]
     // .. card_off[c+1]]; their prefix sums go to card_prefix[card_off[c] + c
-    // ..= card_off[c+1] + c]. One thread per card, sequentially.
-    for (u32 c = threadIdx.x; c < kCards; c += kThreads) {
-      const u32 first_entry = card_off[c];
-      const u32 len = card_off[c + 1] - first_entry;
-      const auto segment = card_prefix_all.subspan(first_entry + c, len + 1);
-      A sum{};
-#pragma unroll 8
-      for (u32 e = 0; e < len; ++e) {
-        segment[e] = sum;
-        sum = add(sum, weights[card_pos[first_entry + e]]);
-      }
-      segment[len] = sum;
-    }
+    // ..= card_off[c+1] + c].
+    card_prefix_sums(card_off, card_pos, Span<const float>{weights}, card_prefix_all);
     __syncthreads();
 
     // The prefix sums of card `c`'s list.
@@ -331,7 +392,7 @@ __device__ void showdown_values_impl(const ShowdownArgs& args) {
     // (sum - minus[a] - minus[b] + same) over the same reach. A separate
     // pass: computing it inside the loop above measured 30% slower.
     if (fold_node != kNone) {
-      const auto fold_out = row(args.values, fold_node, hands);
+      const auto fold_out = row(args.values, args.rows[fold_node], hands);
       const A pay = narrow_from<A>(args.paired_payoff[k]);
       const bool fold_one_at_a_time = args.scalar[fold_node] != 0u;
       for (u32 h = threadIdx.x; h < hands; h += kThreads) {
@@ -352,7 +413,8 @@ __device__ void showdown_values_impl(const ShowdownArgs& args) {
 
 using solver::u32;
 
-/// Fold terminals: `value[h] = payoff * compatible_reach(h)`. `exact` picks
+/// Fold terminals `[segment_start, segment_start + segment_count)` of the
+/// list: `value[h] = payoff * compatible_reach(h)`. `exact` picks
 /// f64 (exact) or double-single (fast) accumulators. Dynamic shared memory:
 /// `opp_hands` floats.
 extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const u32* list_ptr,
@@ -367,6 +429,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
                                                                            u32 alive_len,
                                                                            const float* reach_ptr,
                                                                            u32 reach_len,
+                                                                           const u32* rows_ptr,
+                                                                           u32 rows_len,
                                                                            float* values_ptr,
                                                                            u32 values_len,
                                                                            const u32* my_cards_ptr,
@@ -377,18 +441,21 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
                                                                            u32 card_off_len,
                                                                            const u32* card_hands_ptr,
                                                                            u32 card_hands_len,
+                                                                           u32 segment_start,
+                                                                           u32 segment_count,
                                                                            u32 hands,
                                                                            u32 opp_hands,
                                                                            u32 exact) {
   using namespace solver;
   const FoldArgs args{
-      .list = view(list_ptr, list_len),
-      .payoff = view(payoff_ptr, payoff_len),
+      .list = view(list_ptr, list_len).subspan(segment_start, segment_count),
+      .payoff = view(payoff_ptr, payoff_len).subspan(segment_start, segment_count),
       .slots = view(slots_ptr, slots_len),
       .scalar = view(scalar_ptr, scalar_len),
       .alive = view(alive_ptr, alive_len),
       .reach = view(reach_ptr, reach_len),
       .values = view(values_ptr, values_len),
+      .rows = view(rows_ptr, rows_len),
       .my_cards = view(my_cards_ptr, my_cards_len),
       .same = view(same_ptr, same_len),
       .card_off = view(card_off_ptr, card_off_len),
@@ -403,7 +470,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) fold_values(const
   }
 }
 
-/// Showdown terminals: `value[h] = win * weaker(h) + lose * stronger(h)`,
+/// Showdown terminals `[segment_start, segment_start + segment_count)` of
+/// the list: `value[h] = win * weaker(h) + lose * stronger(h)`,
 /// plus `tie * tied(h)` when ties pay something (mid-street roots, rake).
 /// A paired fold (`paired_fold[k]`, payoff `paired_payoff[k]`) shares the
 /// showdown's opponent reach and is evaluated from the same sums. `exact`
@@ -430,6 +498,8 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
                                                                                u32 alive_len,
                                                                                const float* reach_ptr,
                                                                                u32 reach_len,
+                                                                               const u32* rows_ptr,
+                                                                               u32 rows_len,
                                                                                float* values_ptr,
                                                                                u32 values_len,
                                                                                const u32* my_cards_ptr,
@@ -452,24 +522,27 @@ extern "C" __global__ void __launch_bounds__(solver::kThreads) showdown_values(c
                                                                                u32 ranges_len,
                                                                                const u32* ranks_ptr,
                                                                                u32 ranks_len,
+                                                                               u32 segment_start,
+                                                                               u32 segment_count,
                                                                                u32 hands,
                                                                                u32 opp_hands,
                                                                                u32 max_opp,
                                                                                u32 exact) {
   using namespace solver;
   const ShowdownArgs args{
-      .list = view(list_ptr, list_len),
-      .table_of = view(table_of_ptr, table_of_len),
-      .win = view(win_ptr, win_len),
-      .lose = view(lose_ptr, lose_len),
-      .tie = view(tie_ptr, tie_len),
-      .paired_fold = view(paired_fold_ptr, paired_fold_len),
-      .paired_payoff = view(paired_payoff_ptr, paired_payoff_len),
+      .list = view(list_ptr, list_len).subspan(segment_start, segment_count),
+      .table_of = view(table_of_ptr, table_of_len).subspan(segment_start, segment_count),
+      .win = view(win_ptr, win_len).subspan(segment_start, segment_count),
+      .lose = view(lose_ptr, lose_len).subspan(segment_start, segment_count),
+      .tie = view(tie_ptr, tie_len).subspan(segment_start, segment_count),
+      .paired_fold = view(paired_fold_ptr, paired_fold_len).subspan(segment_start, segment_count),
+      .paired_payoff = view(paired_payoff_ptr, paired_payoff_len).subspan(segment_start, segment_count),
       .slots = view(slots_ptr, slots_len),
       .scalar = view(scalar_ptr, scalar_len),
       .alive = view(alive_ptr, alive_len),
       .reach = view(reach_ptr, reach_len),
       .values = view(values_ptr, values_len),
+      .rows = view(rows_ptr, rows_len),
       .my_cards = view(my_cards_ptr, my_cards_len),
       .same = view(same_ptr, same_len),
       .opp_off = view(opp_off_ptr, opp_off_len),

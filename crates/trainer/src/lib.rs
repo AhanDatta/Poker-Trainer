@@ -28,7 +28,7 @@ pub mod strength;
 pub mod study;
 
 pub use config::{
-    FlopMode, GameType, HeroPosition, ScoringSettings, SolverSettings, TrainerConfig, VillainRange,
+    FlopMode, GameType, HeroPosition, ScoringSettings, SolverBackend, SolverSettings, TrainerConfig, VillainRange,
 };
 pub use hand::{LiveHand, LogEntry, StepResult};
 pub use profiles::Profile;

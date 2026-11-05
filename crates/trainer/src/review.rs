@@ -12,7 +12,7 @@
 //!    meaningful.
 
 use crate::ai::profile_policy;
-use crate::config::{FlopMode, SolverSettings, VillainRange};
+use crate::config::{FlopMode, SolverBackend, SolverSettings, VillainRange};
 use crate::fmt::{action_label, ActionContext, BB};
 use crate::preflop::{chart_policy, describe, line_range, ChartSet, PreDecision};
 use crate::profiles::Profile;
@@ -983,6 +983,7 @@ pub(crate) fn hu_config(
     cfg.max_memory_bytes = (s.max_memory_gb * 1e9) as u64;
     cfg.rake_rate = rake_rate;
     cfg.rake_cap = rake_cap as f64;
+    cfg.backend = s.backend.into();
     cfg
 }
 
@@ -1080,6 +1081,9 @@ pub(crate) fn run_hu(
     };
     if cancel.load(Ordering::Relaxed) {
         return Err(CANCELLED.into());
+    }
+    if let (SolverBackend::Gpu, Some(e)) = (s.backend, solver.gpu_error()) {
+        sink.note(format!("{label}: solved on the CPU (GPU not used: {e})."));
     }
     Ok((solver, progress.exploitability_pct))
 }

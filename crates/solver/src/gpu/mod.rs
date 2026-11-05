@@ -33,7 +33,7 @@ mod plan;
 #[cfg(test)]
 mod testutil;
 
-pub(crate) use engine::Engine;
+pub(crate) use engine::{Engine, HostStorage};
 
 /// Operations of the double-single test kernel (`Op` in
 /// double_float_check.cu).
@@ -61,12 +61,13 @@ pub enum GpuPrecision {
     /// rate).
     Exact,
 }
-pub(crate) use plan::Plan;
+pub(crate) use plan::{Plan, Scratch};
 
 /// Kernel images built by `build.rs` from `cuda/kernels/*.cu`.
 static REGRET_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/regret.fatbin"));
 static SELFTEST_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/selftest.fatbin"));
 static TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse.fatbin"));
+static TRAVERSE_COMPRESSED_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse_compressed.fatbin"));
 static TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.fatbin"));
 static DOUBLE_FLOAT_CHECK_IMAGE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/double_float_check.fatbin"));
@@ -207,11 +208,14 @@ struct Kernels {
     regret_match_i16: CudaFunction,
     selftest_out_of_bounds: CudaFunction,
     begin_traversal: CudaFunction,
+    reset_alive: CudaFunction,
     opponent_split: CudaFunction,
     own_update: CudaFunction,
     opponent_sum: CudaFunction,
     chance_split: CudaFunction,
     chance_sum: CudaFunction,
+    opponent_split_compressed: CudaFunction,
+    own_update_compressed: CudaFunction,
     fold_values: CudaFunction,
     showdown_values: CudaFunction,
     double_float_check: CudaFunction,
@@ -253,6 +257,7 @@ impl Gpu {
         let regret = ctx.load_module(Ptx::from_binary(REGRET_IMAGE.to_vec()))?;
         let selftest = ctx.load_module(Ptx::from_binary(SELFTEST_IMAGE.to_vec()))?;
         let traverse = ctx.load_module(Ptx::from_binary(TRAVERSE_IMAGE.to_vec()))?;
+        let traverse_compressed = ctx.load_module(Ptx::from_binary(TRAVERSE_COMPRESSED_IMAGE.to_vec()))?;
         let terminal = ctx.load_module(Ptx::from_binary(TERMINAL_IMAGE.to_vec()))?;
         let double_float = ctx.load_module(Ptx::from_binary(DOUBLE_FLOAT_CHECK_IMAGE.to_vec()))?;
         let kernels = Kernels {
@@ -260,11 +265,14 @@ impl Gpu {
             regret_match_i16: regret.load_function("regret_match_i16")?,
             selftest_out_of_bounds: selftest.load_function("selftest_out_of_bounds")?,
             begin_traversal: traverse.load_function("begin_traversal")?,
+            reset_alive: traverse.load_function("reset_alive")?,
             opponent_split: traverse.load_function("opponent_split")?,
             own_update: traverse.load_function("own_update")?,
             opponent_sum: traverse.load_function("opponent_sum")?,
             chance_split: traverse.load_function("chance_split")?,
             chance_sum: traverse.load_function("chance_sum")?,
+            opponent_split_compressed: traverse_compressed.load_function("opponent_split_compressed")?,
+            own_update_compressed: traverse_compressed.load_function("own_update_compressed")?,
             fold_values: terminal.load_function("fold_values")?,
             showdown_values: terminal.load_function("showdown_values")?,
             double_float_check: double_float.load_function("double_float_check")?,

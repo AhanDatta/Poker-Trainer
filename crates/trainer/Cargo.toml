@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Heads-up solves on an NVIDIA GPU (needs the CUDA toolkit to build; see
+# crates/solver/cuda/README.md). Off by default.
+gpu = ["solver/gpu"]
+
 [dependencies]
 holdem.workspace = true
 solver.workspace = true

@@ -24,6 +24,31 @@ pub enum FlopMode {
     Exact,
 }
 
+/// Where heads-up solves run (three-way solves always use the CPU).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SolverBackend {
+    /// The CPU.
+    #[default]
+    Cpu,
+    /// The GPU, for turn and flop spots, when the build has GPU support and
+    /// an NVIDIA GPU is free; the CPU otherwise.
+    Auto,
+    /// The GPU for every heads-up solve; the CPU (with a note saying why)
+    /// when it can't be used.
+    Gpu,
+}
+
+impl From<SolverBackend> for solver::Backend {
+    fn from(b: SolverBackend) -> solver::Backend {
+        match b {
+            SolverBackend::Cpu => solver::Backend::Cpu,
+            SolverBackend::Auto => solver::Backend::Auto,
+            SolverBackend::Gpu => solver::Backend::Gpu,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VillainRange {
@@ -61,6 +86,8 @@ pub struct SolverSettings {
     pub flop_future_menu: PostflopMenu,
     /// Worker threads for the solver (0 = all cores).
     pub threads: usize,
+    /// Where heads-up solves run.
+    pub backend: SolverBackend,
     /// Three-way pots: sampled turn and river cards for flop solves.
     pub multiway_turn_samples: usize,
     pub multiway_river_samples: usize,
@@ -101,6 +128,7 @@ impl Default for SolverSettings {
             hero_hand_floor: 0.02,
             flop_future_menu: future,
             threads: 0,
+            backend: SolverBackend::Cpu,
             multiway_turn_samples: 8,
             multiway_river_samples: 4,
             multiway_target_pct: 1.5,
@@ -375,6 +403,24 @@ impl TrainerConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn solver_backend_parses_and_defaults_to_the_cpu() {
+        use super::{SolverBackend, TrainerConfig};
+        assert_eq!(TrainerConfig::default().solver.backend, SolverBackend::Cpu);
+        for (text, want) in [("cpu", SolverBackend::Cpu), ("auto", SolverBackend::Auto), ("gpu", SolverBackend::Gpu)] {
+            let cfg: TrainerConfig = toml::from_str(&format!("[solver]\nbackend = \"{text}\"\n")).unwrap();
+            assert_eq!(cfg.solver.backend, want);
+            let back = toml::to_string(&cfg).unwrap();
+            assert!(back.contains(&format!("backend = \"{text}\"")), "{back}");
+            assert_eq!(solver::Backend::from(want), match want {
+                SolverBackend::Cpu => solver::Backend::Cpu,
+                SolverBackend::Auto => solver::Backend::Auto,
+                SolverBackend::Gpu => solver::Backend::Gpu,
+            });
+        }
+        assert!(toml::from_str::<TrainerConfig>("[solver]\nbackend = \"tpu\"\n").is_err());
+    }
+
     use super::*;
 
     #[test]

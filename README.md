@@ -69,6 +69,17 @@ features, which is fine for a local build.
 RUSTFLAGS="-C target-cpu=native" cargo install --path crates/tui
 ```
 
+Optional, experimental: heads-up solves on an NVIDIA GPU. This needs the CUDA
+Toolkit 13.x to build (and on Windows, Visual Studio's C++ compiler); the
+built program needs only the NVIDIA driver. Then pick **Solve on: Auto** (or
+GPU) in the setup screen, or set `backend` in the config. Without a usable
+GPU, solves run on the CPU as usual. Details and numbers:
+[crates/solver/cuda/README.md](crates/solver/cuda/README.md).
+
+```bash
+cargo install --path crates/tui --features gpu
+```
+
 Use a terminal with Unicode and 256 colors (any modern one; on Windows,
 Windows Terminal).
 
@@ -453,6 +464,20 @@ scales almost linearly with cores (3.8× on 4 threads).
 | Heads-up **limped** pot, flop exact (~880 × 860 combos) | ~2.7 GB | ~11–12 min |
 | 6-max single-raised pot, flop exact (~290 × 220 combos) | <1 GB | a few minutes |
 
+**With an NVIDIA GPU** (experimental `gpu` build, `backend = "auto"`), on a
+laptop RTX 4060 against its i7-13700H (14 cores), solving to 0.3% of the pot:
+
+| Heads-up spot | CPU | GPU |
+|---|---|---|
+| Turn, full menu | 2.7 s | 0.87 s |
+| Flop **exact**, two-tone (the default exact tree) | 128 s | 32 s |
+| Flop exact, two-tone, 3x raises on turn and river | 147 s | 39 s |
+| Flop exact, rainbow, 3x raises on turn and river | 218 s | 60 s |
+
+The GPU's default precision is within a fraction of a percentage point of
+the CPU's strategies; an exact mode reproduces the CPU bit for bit at about
+2.6× the CPU's speed. Details: [crates/solver/cuda/README.md](crates/solver/cuda/README.md).
+
 Exact flop trees use one bet size on the turn and river, with all-in as the
 only raise there. The flop itself always uses the full menu. Before this
 round's optimizations, exact flop solves needed ~9 GB. Trees larger than
@@ -551,6 +576,7 @@ villain_range = "gto"        # gto | actual | both
 target_exploitability_pct = 0.5
 max_memory_gb = 5.0
 threads = 0                  # 0 = all cores
+backend = "cpu"              # cpu | auto | gpu: where heads-up solves run (GPU needs a `--features gpu` build)
 multiway_turn_samples = 8    # 3-way pots
 multiway_river_samples = 4
 
@@ -598,8 +624,9 @@ the presets in `crates/trainer/src/profiles.rs`.
 * **9-max charts** use fallback rules; no public solver set was found.
 * **Exact flop solves still take minutes** on a 4-core machine. Wider SIMD,
   single-pass sweeps and predictive CFR variants were tried and didn't help
-  (see the solver sections); the remaining lever is smaller trees (e.g. fewer
-  bet sizes).
+  (see the solver sections); the remaining levers are smaller trees (e.g.
+  fewer bet sizes) and the experimental GPU backend (about 30-60 s per exact
+  flop on a laptop RTX 4060; see Performance).
 * **Exploitative review:** node-lock the villain to its AI style's postflop
   tendencies to show the max-EV play against that specific opponent.
 * The preflop menu has one raise size per level, while imported charts may

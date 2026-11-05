@@ -7,6 +7,14 @@
 
 namespace solver {
 
+/// Read access to a node's `actions x hands` values: an f32 `Block`, or a
+/// decoded view of 16-bit storage (`Scaled` in compressed.cuh).
+template <class V>
+concept ValueBlock = requires(const V v, u32 a, u32 h) {
+  { v(a, h) } -> cuda::std::convertible_to<float>;
+  { v.extent(0) } -> cuda::std::convertible_to<u32>;
+};
+
 /// Sum over actions of `max(regret, 0)` for hand `h`, in action order
 /// (CPU: `cfr::positive_sums`).
 template <RegretValue R>
@@ -31,7 +39,8 @@ template <RegretValue R>
 
 /// Sum over actions of the strategy sums of hand `h`, starting from the
 /// first action's (CPU: `cfr::normalize_in_place`).
-[[nodiscard]] __device__ inline auto strategy_total(Block<const float> sums, u32 h) noexcept -> float {
+template <ValueBlock V>
+[[nodiscard]] __device__ auto strategy_total(const V& sums, u32 h) noexcept -> float {
   float total = sums(0, h);
   for (u32 a = 1; a < sums.extent(0); ++a) {
     total = add_rn(total, sums(a, h));
@@ -42,7 +51,8 @@ template <RegretValue R>
 /// Average-strategy probability of action `a` for hand `h`, given
 /// `inv = recip(strategy_total(sums, h))`; uniform when the sums are zero
 /// (CPU: `cfr::normalize_in_place`).
-[[nodiscard]] __device__ inline auto normalized(Block<const float> sums, u32 a, u32 h, float inv) noexcept -> float {
+template <ValueBlock V>
+[[nodiscard]] __device__ auto normalized(const V& sums, u32 a, u32 h, float inv) noexcept -> float {
   if (inv == 0.0f) {
     return 1.0f / static_cast<float>(sums.extent(0));
   }

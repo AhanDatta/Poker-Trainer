@@ -2,7 +2,7 @@
 //!
 //! Usage: cargo run --release -p solver --example bench -- [river|turn|flop-fast|flop-exact|flop-exact-lean] [board]
 //! Env: ITERS (max iterations), TARGET (% pot), NOISO=1, STORAGE=f32|compressed|auto, NOBATCH=1,
-//! GPU=1|fast|exact (with --features gpu; f32 storage only for now)
+//! GPU=1|fast|exact (with --features gpu)
 
 use holdem::card::parse_cards;
 use holdem::{PostflopMenu, Range, Street, StreetSizes};
@@ -166,7 +166,7 @@ fn run(name: &str, board: &str, chance: ChanceMode, future_menu: Option<Postflop
 
 /// `GPU=1` (or `GPU=fast`): solve on the GPU with double-single terminal
 /// sums; `GPU=exact`: with f64 sums, bit-identical to the CPU. Needs
-/// `--features gpu`; f32 storage only for now.
+/// `--features gpu`.
 #[cfg(feature = "gpu")]
 fn use_gpu(s: &mut Solver) {
     let precision = match std::env::var("GPU").as_deref() {

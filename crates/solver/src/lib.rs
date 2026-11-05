@@ -51,6 +51,25 @@ pub use storage::StorageMode;
 pub use tree::{BettingState, ChanceMode, Transition, TreeStats};
 use tree::{Builder, Kind, Tree, TreeParams};
 
+/// Whether this build can solve on the GPU (the `gpu` feature).
+pub const GPU_SUPPORT: bool = cfg!(feature = "gpu");
+
+/// Where solves run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    /// The CPU.
+    #[default]
+    Cpu,
+    /// The GPU, when the solver is built with the `gpu` feature and an NVIDIA
+    /// GPU with enough free memory is present. Otherwise, or if the GPU fails
+    /// during a solve, the solve runs on the CPU and [`Solver::gpu_error`]
+    /// says why. The GPU is held only while `solve` runs.
+    Gpu,
+    /// Like `Gpu` for turn and flop roots; river roots stay on the CPU (their
+    /// small trees solve about as fast there).
+    Auto,
+}
+
 /// Everything needed to build a solvable game.
 #[derive(Clone, Debug)]
 pub struct SolveConfig {
@@ -81,6 +100,8 @@ pub struct SolveConfig {
     /// Solve mirror-image (suit-isomorphic) runouts only once.
     pub isomorphism: bool,
     pub dcfr: DcfrParams,
+    /// Where solves run (the CPU by default).
+    pub backend: Backend,
 }
 
 impl SolveConfig {
@@ -108,6 +129,7 @@ impl SolveConfig {
             storage: StorageMode::Auto,
             isomorphism: true,
             dcfr: DcfrParams::default(),
+            backend: Backend::Cpu,
         }
     }
 }
@@ -277,8 +299,7 @@ pub struct Solver {
     /// The GPU engine after a successful `use_gpu`.
     #[cfg(feature = "gpu")]
     gpu: Option<Box<gpu::Engine>>,
-    /// Why the GPU was abandoned during a solve.
-    #[cfg(feature = "gpu")]
+    /// Why the last solve didn't use the GPU, or abandoned it.
     gpu_error: Option<String>,
 }
 
@@ -370,7 +391,6 @@ impl Solver {
             batch_river: true,
             #[cfg(feature = "gpu")]
             gpu: None,
-            #[cfg(feature = "gpu")]
             gpu_error: None,
         })
     }
@@ -460,6 +480,66 @@ impl Solver {
     /// set (`on_progress` only runs at exploitability checks, which can be
     /// many seconds apart on big trees).
     pub fn solve_cancellable(
+        &mut self,
+        opts: &SolveOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+        mut on_progress: impl FnMut(&Progress) -> bool,
+    ) -> Progress {
+        let borrowed = self.borrow_gpu();
+        let progress = self.solve_on_current_backend(opts, cancel, &mut on_progress);
+        if borrowed {
+            self.release_gpu();
+        }
+        progress
+    }
+
+    /// Whether `config.backend` asks for the GPU for this tree.
+    fn wants_gpu(&self) -> bool {
+        match self.config.backend {
+            Backend::Cpu => false,
+            Backend::Gpu => true,
+            Backend::Auto => self.config.root.street != Street::River,
+        }
+    }
+
+    /// Takes the GPU for one solve if `config.backend` asks for it and no
+    /// engine is in place yet; true if it did. A GPU that can't be used is
+    /// recorded in [`Self::gpu_error`] and the solve stays on the CPU.
+    fn borrow_gpu(&mut self) -> bool {
+        if !self.wants_gpu() {
+            return false;
+        }
+        #[cfg(feature = "gpu")]
+        {
+            if self.gpu.is_some() {
+                return false;
+            }
+            match self.use_gpu(gpu::GpuPrecision::default()) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.gpu_error = Some(e.to_string());
+                    false
+                }
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.gpu_error = Some("this build has no GPU support (the solver's `gpu` feature)".into());
+            false
+        }
+    }
+
+    /// Frees the GPU (its memory and context). Regrets and strategy sums
+    /// are on the host after every solve, so nothing is lost; a later
+    /// `use_gpu` or GPU-backed solve uploads them again.
+    pub fn release_gpu(&mut self) {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu = None;
+        }
+    }
+
+    fn solve_on_current_backend(
         &mut self,
         opts: &SolveOptions,
         cancel: &std::sync::atomic::AtomicBool,
@@ -561,36 +641,54 @@ impl Solver {
         Ok(progress)
     }
 
-    /// Moves the solve to the GPU (experimental: river, turn and flop roots
-    /// with `f32` storage; compressed storage, which large flop trees use,
-    /// is declined, as is a tree that doesn't fit in free GPU memory). The
-    /// current regrets and strategy sums are
-    /// uploaded, so a solve can continue on the GPU; results are copied back
-    /// when `solve` returns, after which `query` and the other read methods
-    /// work as usual. If the GPU fails during a solve, the solver discards
-    /// the GPU state, restarts the solve from scratch on the CPU, and
-    /// [`Self::gpu_error`] says what happened. `precision` picks how
-    /// terminal sums are accumulated ([`gpu::GpuPrecision`]).
+    /// Moves the solve to the GPU until [`Self::release_gpu`] (experimental;
+    /// `config.backend` does this for the duration of each solve instead).
+    /// Trees whose scratch buffers don't fit in free GPU memory run in groups
+    /// of subtrees; one that doesn't fit even so is declined. The current
+    /// regrets and strategy sums are uploaded, so a solve can continue on the
+    /// GPU; results are copied back when `solve` returns, after which `query`
+    /// and the other read methods work as usual. If the GPU fails during a
+    /// solve, the solver discards the GPU state, restarts the solve from
+    /// scratch on the CPU, and [`Self::gpu_error`] says what happened.
+    /// `precision` picks how terminal sums are accumulated
+    /// ([`gpu::GpuPrecision`]).
     #[cfg(feature = "gpu")]
     pub fn use_gpu(&mut self, precision: gpu::GpuPrecision) -> Result<(), gpu::GpuError> {
-        let plan = gpu::Plan::build(&self.ctx())?;
         let device = gpu::Gpu::new()?;
-        let (regrets, sums) = self.store.f32_buffers_mut().ok_or_else(|| {
-            gpu::GpuError::InvalidInput("compressed storage isn't supported on the GPU yet".into())
-        })?;
-        self.gpu = Some(Box::new(gpu::Engine::new(device, plan, regrets, sums, precision)?));
+        let budget = gpu::Engine::scratch_budget(&device, &self.store.gpu_view())?;
+        self.use_gpu_with(device, precision, gpu::Scratch::Budget(budget))
+    }
+
+    /// [`Solver::use_gpu`] with the tree split as `scratch` says (trees too
+    /// big for the device's memory run in groups of subtrees).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn use_gpu_with(
+        &mut self,
+        device: gpu::Gpu,
+        precision: gpu::GpuPrecision,
+        scratch: gpu::Scratch,
+    ) -> Result<(), gpu::GpuError> {
+        let plan = gpu::Plan::build_with(&self.ctx(), scratch)?;
+        self.gpu = Some(Box::new(gpu::Engine::new(device, plan, self.store.gpu_view(), precision)?));
         self.gpu_error = None;
         Ok(())
     }
 
-    /// Whether solves currently run on the GPU.
-    #[cfg(feature = "gpu")]
+    /// Whether solves currently run on the GPU (after [`Self::use_gpu`];
+    /// GPU-backed solves hold it only while they run).
     pub fn uses_gpu(&self) -> bool {
-        self.gpu.is_some()
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
     }
 
-    /// Why the GPU was abandoned during a solve, if it was.
-    #[cfg(feature = "gpu")]
+    /// Why the GPU wasn't used (`config.backend`) or was abandoned during a
+    /// solve, if so.
     pub fn gpu_error(&self) -> Option<&str> {
         self.gpu_error.as_deref()
     }
@@ -616,10 +714,7 @@ impl Solver {
     #[cfg(feature = "gpu")]
     fn download_from_gpu(&mut self) -> Result<(), gpu::GpuError> {
         let Some(engine) = &self.gpu else { return Ok(()) };
-        let (regrets, sums) = self.store.f32_buffers_mut().ok_or_else(|| {
-            gpu::GpuError::InvalidInput("compressed storage isn't supported on the GPU yet".into())
-        })?;
-        engine.download(regrets, sums)
+        engine.download(self.store.gpu_view())
     }
 
     /// After a GPU failure: drops the GPU state and resets the solve, so it

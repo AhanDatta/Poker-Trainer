@@ -69,6 +69,12 @@ pub(crate) fn river_config() -> SolveConfig {
     )
 }
 
+/// `c` with 16-bit ("compressed") storage.
+pub(crate) fn compressed(mut c: SolveConfig) -> SolveConfig {
+    c.storage = StorageMode::Compressed;
+    c
+}
+
 /// The turn spot of `batched_river_matches_recursion`: 48 river cards, no
 /// suit isomorphism (the board has all four suits).
 pub(crate) fn turn_config() -> SolveConfig {

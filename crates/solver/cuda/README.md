@@ -12,26 +12,37 @@ MSVC as the host compiler. A built binary needs only the NVIDIA driver.
 ## Status
 
 Experimental. `Solver::use_gpu(precision)` (with `--features gpu`) moves a
-solve to the GPU: river and turn roots, and flop roots small enough for `f32` storage
-(sampled runouts). **Compressed storage** (16-bit, which exact flop trees use)
-is not supported yet, and a tree that doesn't fit in free GPU memory (keeping a
-0.5 GB margin) is declined; both stay on the CPU.
+solve to the GPU: river, turn and flop roots, with `f32` or 16-bit
+(compressed) storage, bit-identical to the CPU with `GpuPrecision::Exact`.
+
+GPU memory holds the regret/strategy storage, the plan, and scratch buffers:
+opponent reach per "slot" and one row of values per node. When the whole
+tree's scratch doesn't fit in free memory (keeping a 0.5 GB margin), the tree
+is **split**: the subtrees under the root street's chance nodes (turn
+subtrees on a flop, river subtrees on a turn) become *chunks*, and groups of
+chunks run one after another in one shared scratch region (see
+`src/gpu/plan/schedule.rs`). Splitting changes no result bit; it only costs
+more, smaller launches. A tree whose storage plus a single chunk doesn't fit
+is declined (`GpuError::OutOfMemory`) and stays on the CPU.
 
 | File | Contents | CPU twin |
 |---|---|---|
 | `include/solver/core.cuh` | views, exact arithmetic, encodings shared with `src/gpu/plan.rs` | |
 | `include/solver/strategy.cuh` | per-hand regret matching and normalization | `cfr::regret_match_into`, `cfr::normalize_in_place` |
 | `include/solver/double_float.cuh` | double-single arithmetic and the `Accumulator` vocabulary (f64 or double-single) of the terminal kernels | |
+| `include/solver/compressed.cuh` | 16-bit storage: decoding views, encoding with the CPU's rounding and saturation | `storage::Storage::Compressed` |
 | `kernels/traverse.cu` | level-by-level traversal: opponent and chance splits (top-down), own-node regret update, opponent and chance sums (bottom-up) | `river::run`, `cfr::chance`, `cfr::own_node_update` |
+| `kernels/traverse_compressed.cu` | the two storage-touching traversal steps for 16-bit storage, one block per node (a block-wide max sets each node's new scale) | `Storage::update_regrets`, `Storage::update_strat` |
 | `kernels/terminal.cu` | fold and showdown values (card removal by inclusion–exclusion, prefix sums), with the rounding of the CPU evaluator that handles each terminal | `eval::fold_batch` / `eval_fold`, `eval::showdown_batch` / `eval_showdown` |
 | `kernels/regret.cu` | standalone regret matching | `cfr::regret_match_into` |
 | `kernels/selftest.cu` | deliberate out-of-bounds read for `tests/gpu_fault.rs` | |
 | `kernels/double_float_check.cu` | double-single operations for the tests against host f64 | |
 
-The host side (`src/gpu/`): `plan.rs` flattens the tree into arrays, a level
-schedule per traverser and per-board showdown lookups, and validates every
-index the kernels will use; `engine.rs` uploads it once and launches one
-kernel per tree level; `Solver::solve` drives the same loop (iterations,
+The host side (`src/gpu/`): `plan.rs` flattens the tree into arrays and
+per-board showdown lookups, `plan/schedule.rs` splits it into segments and
+lays out a level schedule per traverser, and both validate every index the
+kernels will use; `engine.rs` uploads the plan once and launches one kernel
+per tree level (and segment); `Solver::solve` drives the same loop (iterations,
 exploitability checks, cancellation) for both backends.
 
 ## Ground rules
@@ -110,7 +121,10 @@ Measured on the exact path: GPU and CPU solves agree **bit for bit** (every
 strategy, EV and regret identical after 5 iterations) on the river, turn,
 suit-isomorphic turn, all-in turn and sampled flop spots, on 24 random river
 and 10 random turn spots, and with river batching off: over 46,000
-comparisons, none different.
+comparisons, none different. `exact_solves_match_cpu_bit_for_bit` keeps
+this checked on every test spot, with `f32` and 16-bit storage (raw bits,
+scales included), and splitting a tree into groups changes no bit either
+(`split_solves_match_whole_solves_*`).
 
 How the fast path is checked, in layers (a bug has to get past each):
 
@@ -154,30 +168,46 @@ error in negation.
 ## Performance
 
 RTX 4060 Laptop GPU (8 GB) and i7-13700H (6P + 8E cores), plugged in,
-2026-11-04. `examples/bench` in release mode with its default spots, stopping at
-0.3% of the pot. CPU and GPU runs interleaved; ranges over 2-3 runs (5 on the
-river).
+2026-11-04. `examples/bench` in release mode, stopping at 0.3% of the pot.
 
-| Solve | Iterations | CPU | GPU, `Exact` | GPU, `Fast` |
+Exact flops (16-bit storage; the GPU splits these trees into groups of turn
+subtrees to fit its 8 GB), one run each, interleaved:
+
+| Exact flop solve | Iterations | CPU | GPU, `Exact` | GPU, `Fast` |
 |---|---|---|---|---|
-| river `Ks7d2c9h4s` | 80 | 9.9–10.3 ms | 11.9 ms | 11.7–12.3 ms |
-| turn `Ks7d2c9h` | 168 (fast: 169) | 3.03–3.31 s, 18–20 ms/iter | 1.20–1.22 s, 7.2 ms/iter | **0.87–0.89 s**, 5.2 ms/iter |
-| flop-fast `Ks7d2c`, 8 × 6 sampled | 116 | 4.60–5.28 s, 40–46 ms/iter | 1.57–1.59 s, 13.6 ms/iter | **1.15–1.16 s**, 10.0 ms/iter |
-| flop-exact `Ks7s2d` | 184 | 151–156 s, 820–850 ms/iter | not yet (16-bit storage) | not yet |
+| `flop-exact-lean Ks7s2d` (the trainer's default tree: all-in raises on turn and river) | 217 (fast: 218) | 127.8 s, 589 ms/iter | 48.6 s, 224 ms/iter | **32.2 s**, 148 ms/iter |
+| `flop-exact Ks7s2d` (two-tone, 3x raises) | 184 (fast: 187) | 146.8 s, 798 ms/iter | 56.2 s, 306 ms/iter | **39.0–39.1 s**, 209 ms/iter |
+| `flop-exact Ks7d2c` (rainbow, 3x raises) | 174 (fast: 172) | 218.3 s, 1255 ms/iter | 87.4 s, 502 ms/iter | **60.4 s**, 351 ms/iter |
 
-Plus a one-time setup per solve (CUDA context, plan, upload): 0.12 s on the
-river, 0.35-0.4 s on the turn, 0.55 s on the sampled flop. **The fast GPU path
-is 3.4-3.8× faster than the CPU on the turn and 4.0-4.6× on the sampled
-flop**; the exact path 2.5-2.7× and 2.9-3.3×. Every run reached the target
-with the same root strategy as the CPU to within 0.1 percentage point (the
-exact path: identical). The river stays slightly slower than the CPU: its
-14-node tree can't fill the GPU and launch latency sets the time.
+**The fast GPU path solves exact flops 3.6-4.0× faster than the CPU**, the
+exact path 2.5-2.6×. Setup per solve (CUDA context, plan, upload) adds 1.2-2.4
+s. The exact path took the same iterations to the same root strategy as the
+CPU (it is bit-identical); the fast path's root strategy was within 0.2
+percentage points.
+
+Smaller trees (f32 storage, whole trees), ranges over 2 runs in the same
+session:
+
+| Solve | Iterations | CPU | GPU, `Fast` |
+|---|---|---|---|
+| turn `Ks7d2c9h` | 168 (fast: 169) | 2.70–2.74 s, 16 ms/iter | **0.865–0.867 s**, 5.1 ms/iter |
+| flop-fast `Ks7d2c`, 8 × 6 sampled | 116 | 4.39–4.42 s, 38 ms/iter | **1.15–1.17 s**, 10.0 ms/iter |
+
+That is 3.1× on the turn and 3.8× on the sampled flop (setup: 0.3-0.4 s).
+Earlier in the day, before 16-bit storage and splitting existed, the same
+GPU runs took 0.87–0.89 s and 1.15–1.16 s, so neither added cost to trees
+that don't need it. The CPU measured faster in this session than in that
+earlier one (turn 3.03–3.31 s, flop-fast 4.60–5.28 s then); each table
+compares runs from one session. Earlier measurements also had the exact path
+1.4× slower than fast on these trees, and the river (a 14-node tree that
+can't fill the GPU) at 11.7-12.3 ms on the GPU against 9.9-10.3 ms on the
+CPU, which is why `Backend::Auto` keeps river roots on the CPU.
 
 The CPU on this branch measured the same as on `main` (interleaved, same
 iterations and results: turn 3.08 vs 3.09 s, flop-fast 4.60 vs 4.67 s, river
 3000 iterations 0.135 vs 0.132 ms/iter, all within run-to-run noise). Peak
-memory: river 0.01 GB, turn 0.15 GB, flop-fast 0.26 GB, flop-exact 2.98 GB;
-a GPU process adds about 0.15 GB of CUDA runtime.
+host memory: turn 0.15 GB, flop-fast 0.26 GB, exact flops 2.1-4.8 GB; a GPU
+process adds 0.13-0.23 GB (CUDA runtime).
 
 ### Where the GPU time goes
 
@@ -219,16 +249,43 @@ Tried and rejected (measured slower or no better): 512-thread showdown blocks
 loop strides from `blockDim.x` instead of a compile-time constant (a few
 percent slower).
 
+### Exact flops
+
+Nsight Systems, exact flop `Ks7s2d` (3x raises), 30 iterations: the tree
+(1.0 million nodes, 16-bit storage) ran as its top plus 2 groups of turn
+subtrees. Kernel time per traversal, fast path:
+
+| Kernel | Time | Bound by |
+|---|---|---|
+| `showdown_values` | 38.4 ms | latency: 50% occupancy (shared memory, 3 blocks per SM), barrier waits |
+| `opponent_split_compressed` | 18.5 ms | DRAM, 74% of peak |
+| `own_update_compressed` | 14.6 ms | DRAM, 77% of peak |
+| `opponent_sum` | 11.6 ms | DRAM, 50-60% of peak (child value rows) |
+| `fold_values` | 5.1 ms | |
+| `chance_split` + `chance_sum` | 2.9 ms | |
+| total | 91 ms | |
+
+The showdown kernel's per-card prefix sums used to be one sequential sweep
+per card: 52 threads working while the rest of the block waited. Four
+threads per card (quarter sums, combined with warp shuffles) made showdowns
+5% faster and kept the exact path bit-identical. Tried and rejected: reading
+the opponent weights from the reach row instead of shared memory, which
+fits 4 blocks per SM instead of 3 but measured 3% slower.
+
 What remains:
 
-- The traversal kernels (`opponent_split`, `own_update`, `opponent_sum`, 1.2
-  ms per traversal) are now the larger share. They move an estimated 70% of
-  the GPU's 256 GB/s: the turn tree's 16 million regret/strategy cells are
-  read and written every traversal. 16-bit storage (phase 3) would halve that
-  traffic.
+- The two 16-bit storage kernels encode in two passes (find the node's new
+  largest value, then encode against it), so they read their regrets, sums
+  and child values twice. Keeping pass 1's results in shared memory for
+  nodes that fit would cut their traffic by about 40%: roughly 10% of an
+  exact flop solve.
+- `opponent_sum` writes a value row per opponent node only for its parent
+  to read it back; fusing it into the parent's update would save that
+  round trip.
 - Both precisions share one kernel, so registers are allocated for the
-  hungrier one: fast showdowns run at 65% occupancy against 82% for exact.
-  Separate entry points per precision may recover some of that.
+  hungrier one: fast showdowns run at 65% occupancy against 82% for exact
+  (on the turn). Separate entry points per precision may recover some of
+  that.
 
 ## Running the GPU checks
 

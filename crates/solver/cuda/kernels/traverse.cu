@@ -18,8 +18,10 @@
 //
 // Reach lives in "slots" of `opp_hands` floats; the traverser's own nodes
 // pass their slot to their children unchanged, so only opponent and chance
-// nodes write reach. Values live in one row of `hands` floats per tree
-// node, and every node's row is written exactly once per traversal.
+// nodes write reach. Values live in rows of `hands` floats, node `i` in
+// row `rows[i]`, and every node's row is written exactly once per pass over
+// its segment (a tree too big for memory runs in segments that reuse rows
+// and reach slots; see src/gpu/plan/schedule.rs).
 //
 // Threads: x covers hands, y walks the level's nodes (grid-stride), so a
 // block always works on a single node and branches on node state are
@@ -30,11 +32,6 @@
 
 namespace solver {
 namespace {
-
-/// Marks a reach slot alive. Several blocks may mark the same slot.
-__device__ void mark_alive(u32& flag) noexcept {
-  cuda::atomic_ref<u32, cuda::thread_scope_device>{flag}.store(1u, cuda::std::memory_order_relaxed);
-}
 
 [[nodiscard]] __device__ auto hand_index() noexcept -> u32 {
   return blockIdx.x * blockDim.x + threadIdx.x;
@@ -61,6 +58,15 @@ extern "C" __global__ void begin_traversal(u32* alive_ptr,
   }
   if (i < weights_len) {
     reach[i] = weights[i];
+  }
+}
+
+/// Clears the alive flags of slots `[start, start + count)` (a group's
+/// reach slots, before the group runs).
+extern "C" __global__ void reset_alive(u32* alive_ptr, u32 alive_len, u32 start, u32 count) {
+  const auto alive = solver::view(alive_ptr, alive_len).subspan(start, count);
+  for (u32 i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
+    alive[i] = 0u;
   }
 }
 
@@ -164,6 +170,8 @@ extern "C" __global__ void own_update(const u32* level_ptr,
                                       u32 regrets_len,
                                       const float* sums_ptr,
                                       u32 sums_len,
+                                      const u32* rows_ptr,
+                                      u32 rows_len,
                                       float* values_ptr,
                                       u32 values_len,
                                       u32 hands,
@@ -179,6 +187,7 @@ extern "C" __global__ void own_update(const u32* level_ptr,
   const auto alive = view(alive_ptr, alive_len);
   const auto regrets_all = view(regrets_ptr, regrets_len);
   const auto sums_all = view(sums_ptr, sums_len);
+  const auto rows = view(rows_ptr, rows_len);
   const auto values = view(values_ptr, values_len);
   const auto mode = static_cast<Mode>(mode_raw);
 
@@ -188,14 +197,14 @@ extern "C" __global__ void own_update(const u32* level_ptr,
   }
   for (u32 k = blockIdx.y; k < level_count; k += gridDim.y) {
     const u32 node = level[k];
-    float& out = row(values, node, hands)[h];
+    float& out = row(values, rows[node], hands)[h];
     if (alive[slots[node]] == 0u) {
       out = 0.0f;
       continue;
     }
     const u32 num_actions = actions[node];
     const u32 child0 = first_child[node];
-    const auto cfv = [&](u32 a) -> float { return row(values, child0 + a, hands)[h]; };
+    const auto cfv = [&](u32 a) -> float { return row(values, rows[child0 + a], hands)[h]; };
     switch (mode) {
       case Mode::BestResponse: {
         float best = cfv(0);
@@ -263,6 +272,8 @@ extern "C" __global__ void opponent_sum(const u32* level_ptr,
                                         u32 slots_len,
                                         const u32* alive_ptr,
                                         u32 alive_len,
+                                        const u32* rows_ptr,
+                                        u32 rows_len,
                                         float* values_ptr,
                                         u32 values_len,
                                         u32 hands) {
@@ -272,6 +283,7 @@ extern "C" __global__ void opponent_sum(const u32* level_ptr,
   const auto first_child = view(first_child_ptr, first_child_len);
   const auto slots = view(slots_ptr, slots_len);
   const auto alive = view(alive_ptr, alive_len);
+  const auto rows = view(rows_ptr, rows_len);
   const auto values = view(values_ptr, values_len);
 
   const u32 h = hand_index();
@@ -280,7 +292,7 @@ extern "C" __global__ void opponent_sum(const u32* level_ptr,
   }
   for (u32 k = blockIdx.y; k < level_count; k += gridDim.y) {
     const u32 node = level[k];
-    float& out = row(values, node, hands)[h];
+    float& out = row(values, rows[node], hands)[h];
     if (alive[slots[node]] == 0u) {
       out = 0.0f;
       continue;
@@ -288,7 +300,7 @@ extern "C" __global__ void opponent_sum(const u32* level_ptr,
     const u32 child0 = first_child[node];
     float sum = 0.0f;
     for (const u32 a : indices(actions[node])) {
-      sum = add_rn(sum, row(values, child0 + a, hands)[h]);
+      sum = add_rn(sum, row(values, rows[child0 + a], hands)[h]);
     }
     out = sum;
   }
@@ -390,6 +402,8 @@ extern "C" __global__ void chance_sum(const u32* level_ptr,
                                       u32 slots_len,
                                       const u32* alive_ptr,
                                       u32 alive_len,
+                                      const u32* rows_ptr,
+                                      u32 rows_len,
                                       float* values_ptr,
                                       u32 values_len,
                                       u32 hands) {
@@ -406,6 +420,7 @@ extern "C" __global__ void chance_sum(const u32* level_ptr,
   const auto my_cards = view(my_cards_ptr, my_cards_len);
   const auto slots = view(slots_ptr, slots_len);
   const auto alive = view(alive_ptr, alive_len);
+  const auto rows = view(rows_ptr, rows_len);
   const auto values = view(values_ptr, values_len);
 
   const u32 h = hand_index();
@@ -417,11 +432,11 @@ extern "C" __global__ void chance_sum(const u32* level_ptr,
     if (holds(unpack_cards(my_cards[j]), cards[child])) {
       return 0.0;
     }
-    return static_cast<double>(row(values, child, hands)[j]);
+    return static_cast<double>(row(values, rows[child], hands)[j]);
   };
   for (u32 k = blockIdx.y; k < level_count; k += gridDim.y) {
     const u32 node = level[k];
-    float& out = row(values, node, hands)[h];
+    float& out = row(values, rows[node], hands)[h];
     if (alive[slots[node]] == 0u) {
       out = 0.0f;
       continue;

@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use trainer::config::{FlopMode, HeroPosition, VillainRange};
+use trainer::config::{FlopMode, HeroPosition, SolverBackend, VillainRange};
 use trainer::fmt::bb;
 use trainer::{DecisionReview, LiveHand, Variant, Verdict};
 
@@ -233,6 +233,26 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
                 format!("Every runout: up to {} GB of RAM and minutes per flop.", cfg.solver.max_memory_gb),
             ),
         },
+        SetupItem::SolveOn => match cfg.solver.backend {
+            SolverBackend::Cpu => s("CPU", "Solves run on the processor."),
+            SolverBackend::Auto => s(
+                "Auto",
+                if solver::GPU_SUPPORT {
+                    "Heads-up turn and flop solves run on the NVIDIA GPU when one is free (several times \
+                     faster), otherwise on the CPU."
+                } else {
+                    "This build has no GPU support (build with --features gpu), so solves run on the CPU."
+                },
+            ),
+            SolverBackend::Gpu => s(
+                "GPU",
+                if solver::GPU_SUPPORT {
+                    "Heads-up solves run on the NVIDIA GPU; if it can't be used, on the CPU (with a note)."
+                } else {
+                    "This build has no GPU support (build with --features gpu), so solves run on the CPU."
+                },
+            ),
+        },
         SetupItem::ThreeWay => {
             if cfg.solver.multiway_exact_removal {
                 s(
@@ -310,6 +330,7 @@ fn draw_setup(f: &mut Frame, app: &App) {
             SetupItem::Stack => "Stacks",
             SetupItem::Rake => "Rake",
             SetupItem::FlopSolve => "Flop solving",
+            SetupItem::SolveOn => "Solve on",
             SetupItem::ThreeWay => "3-way pots",
             SetupItem::BetSizes => "Bet sizes",
             SetupItem::VillainRange => "Villain range in review",

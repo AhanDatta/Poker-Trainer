@@ -7,7 +7,7 @@ use holdem::Action;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use trainer::config::{FlopMode, GameType, HeroPosition, VillainRange};
+use trainer::config::{FlopMode, GameType, HeroPosition, SolverBackend, VillainRange};
 use trainer::save::{self, SessionMeta, SessionStore};
 use trainer::study::StudySettings;
 use trainer::{LiveHand, Session, Variant};
@@ -53,6 +53,8 @@ pub enum SetupItem {
     Stack,
     Rake,
     FlopSolve,
+    /// Where heads-up solves run (CPU, GPU or automatic).
+    SolveOn,
     /// Exact card removal between opponents in 3-way solves.
     ThreeWay,
     /// Opens the bet-size editor.
@@ -353,6 +355,7 @@ impl App {
                 SetupItem::Stack,
                 SetupItem::Rake,
                 SetupItem::FlopSolve,
+                SetupItem::SolveOn,
                 SetupItem::ThreeWay,
                 SetupItem::BetSizes,
             ];
@@ -367,6 +370,7 @@ impl App {
             SetupItem::Stack,
             SetupItem::Rake,
             SetupItem::FlopSolve,
+            SetupItem::SolveOn,
             SetupItem::ThreeWay,
             SetupItem::BetSizes,
             SetupItem::VillainRange,
@@ -611,6 +615,14 @@ impl App {
                 };
                 if cfg.solver.flop_mode == FlopMode::Exact {
                     self.flash("Exact flop solves need several GB of RAM and minutes per hand.");
+                }
+            }
+            SetupItem::SolveOn => {
+                let all = [SolverBackend::Cpu, SolverBackend::Auto, SolverBackend::Gpu];
+                let cur = all.iter().position(|&b| b == cfg.solver.backend).unwrap_or(0);
+                cfg.solver.backend = all[cycle(cur, all.len())];
+                if cfg.solver.backend != SolverBackend::Cpu && !solver::GPU_SUPPORT {
+                    self.flash("This build has no GPU support (build with --features gpu); solves stay on the CPU.");
                 }
             }
             SetupItem::ThreeWay => {

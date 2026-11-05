@@ -74,6 +74,11 @@ template <class T>
   return cuda::std::views::iota(u32{0}, n);
 }
 
+/// Marks a reach slot alive. Several blocks may mark the same slot.
+__device__ inline void mark_alive(u32& flag) noexcept {
+  cuda::atomic_ref<u32, cuda::thread_scope_device>{flag}.store(1u, cuda::std::memory_order_relaxed);
+}
+
 // ---- Exact arithmetic --------------------------------------------------------
 //
 // The CPU twin rounds every multiply and add separately. nvcc would fuse

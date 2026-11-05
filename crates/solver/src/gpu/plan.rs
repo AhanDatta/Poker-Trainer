@@ -8,10 +8,13 @@
 //! rather than an out-of-bounds access on the device.
 
 use super::{invalid, GpuError};
-use crate::cfr::{fold_payoff, showdown_payoffs, Ctx};
+use crate::cfr::Ctx;
 use crate::hands::{HandSet, StrengthTable};
 use crate::tree::{Edge, Kind};
 use std::ops::Range;
+
+mod schedule;
+pub(crate) use schedule::{scratch_bytes, Scratch, Segment};
 
 /// "No index" marker, shared with the kernels (`solver::kNone`).
 pub(crate) const NONE: u32 = u32::MAX;
@@ -30,6 +33,10 @@ pub(crate) const MAX_WEIGHT: f32 = 1e6;
 
 /// Suit pairs (`iso::PAIRS`), the rows of a permutation table.
 pub(crate) const SUIT_PAIRS: usize = 6;
+
+/// Most actions per decision node (the 16-bit kernels track alive children
+/// in a 32-bit mask; `kMaxActions` in traverse_compressed.cu).
+pub(crate) const MAX_ACTIONS: u32 = 32;
 
 /// Discriminants of the kernels' `enum class Mode`.
 pub(crate) const MODE_CFR: u32 = 0;
@@ -98,7 +105,12 @@ pub(crate) struct PlayerPlan {
     /// (children's slots are consecutive), `NONE` elsewhere.
     pub child_slot: Vec<u32>,
     pub num_slots: u32,
-    /// Top-down order; bottom-up walks it backwards.
+    /// Slots `[0, top_slots)` belong to the top segment; groups reuse the
+    /// rest (see `schedule`).
+    pub top_slots: u32,
+    /// Per segment: its ranges of `levels`, the terminal lists and the slots.
+    pub segments: Vec<Segment>,
+    /// Top-down order within each segment; bottom-up walks it backwards.
     pub levels: Vec<LevelRange>,
     pub opp_nodes: Vec<u32>,
     pub own_nodes: Vec<u32>,
@@ -147,6 +159,11 @@ pub(crate) struct Plan {
     pub first_child: Vec<u32>,
     /// Per node: storage offset of a decision node, 0 for terminals.
     pub offset: Vec<u32>,
+    /// Per node: the index of a decision node's scale in 16-bit storage
+    /// (`Node::slot`), `NONE` elsewhere. Unique per decision node.
+    pub scale_slot: Vec<u32>,
+    /// Number of scales in 16-bit storage (one per decision node).
+    pub num_scale_slots: u32,
     /// Per node: the acting player of a decision node, [`CHANCE`] for a
     /// chance node, `NONE` for terminals.
     pub actor: Vec<u32>,
@@ -171,6 +188,14 @@ pub(crate) struct Plan {
     /// evaluated one at a time.
     pub scalar: Vec<u32>,
     pub num_tables: u32,
+    /// Per node: its segment (0 = the top of the tree, k = group k).
+    pub segment_of: Vec<u32>,
+    pub num_segments: u32,
+    /// Per node: its row in the value buffer; rows `[0, top_rows)` belong
+    /// to the top segment and the chunk roots, groups reuse the rest.
+    pub row: Vec<u32>,
+    pub top_rows: u32,
+    pub num_rows: u32,
     pub players: [PlayerPlan; 2],
 }
 
@@ -235,8 +260,14 @@ fn check_offsets(off: &[u32], total: usize, what: &str) -> Result<(), GpuError> 
 }
 
 impl Plan {
-    /// Flattens the tree behind `ctx`.
+    /// Flattens the tree behind `ctx` as one segment.
+    #[cfg(test)]
     pub(crate) fn build(ctx: &Ctx) -> Result<Plan, GpuError> {
+        Self::build_with(ctx, Scratch::Unlimited)
+    }
+
+    /// Flattens the tree behind `ctx`, split into segments under `scratch`.
+    pub(crate) fn build_with(ctx: &Ctx, scratch: Scratch) -> Result<Plan, GpuError> {
         let tree = ctx.tree;
         let num_nodes = to_u32(tree.nodes.len(), "tree nodes")?;
         let storage_len = u32::try_from(tree.storage_len)
@@ -245,6 +276,7 @@ impl Plan {
             num_nodes,
             storage_len,
             num_tables: to_u32(ctx.tables.len(), "strength tables")?,
+            num_scale_slots: tree.num_player_nodes,
             ..Plan::default()
         };
         for node in &tree.nodes {
@@ -262,6 +294,7 @@ impl Plan {
             plan.actions.push(if terminal { 0 } else { u32::from(node.num_children) });
             plan.first_child.push(if terminal { 0 } else { node.first_child });
             plan.offset.push(offset);
+            plan.scale_slot.push(if matches!(node.kind, Kind::Player(_)) { node.slot } else { NONE });
             plan.chance_factor.push(factor);
             plan.card.push(match node.edge {
                 Edge::Card(c) => to_u32(c.index(), "card")?,
@@ -284,8 +317,27 @@ impl Plan {
         }
         let levels = plan.bfs_levels()?;
         plan.scalar = Self::scalar_terminals(ctx, &levels)?;
-        plan.players =
-            [PlayerPlan::build(ctx, &plan, &levels, 0)?, PlayerPlan::build(ctx, &plan, &levels, 1)?];
+        plan.players = [PlayerPlan::build(ctx, &plan, 0)?, PlayerPlan::build(ctx, &plan, 1)?];
+        // The schedule's device arrays have the same total length however
+        // the tree is split: per player a slot, a child slot and a list entry
+        // per node, 12 bytes per fold and 44 per showdown (an upper bound:
+        // paired folds move into the showdown arrays); plus a row per node.
+        let nodes = &ctx.tree.nodes;
+        let folds = nodes.iter().filter(|n| matches!(n.kind, Kind::Fold(_))).count() as u64;
+        let showdowns = nodes.iter().filter(|n| matches!(n.kind, Kind::Showdown)).count() as u64;
+        let nn = u64::from(num_nodes);
+        let schedule_bytes = 2 * (12 * nn + 12 * folds + 44 * showdowns + 64) + 4 * nn;
+        let seg = plan.segment(ctx, scratch, plan.device_bytes() + schedule_bytes)?;
+        plan.segment_of = seg.segment_of;
+        plan.num_segments = seg.num_segments;
+        plan.row = seg.row;
+        plan.top_rows = seg.top_rows;
+        plan.num_rows = seg.num_rows;
+        for p in 0..2 {
+            let mut pp = std::mem::take(plan.players.get_mut(p).ok_or_else(|| invalid("player out of range"))?);
+            pp.build_schedule(ctx, &plan, p)?;
+            *plan.players.get_mut(p).ok_or_else(|| invalid("player out of range"))? = pp;
+        }
         plan.validate()?;
         Ok(plan)
     }
@@ -332,13 +384,15 @@ impl Plan {
         let tree = b(&self.actions)
             + b(&self.first_child)
             + b(&self.offset)
+            + b(&self.scale_slot)
             + b(&self.card)
             + b(&self.chance_factor)
             + b(&self.iso_start)
             + b(&self.iso_count)
             + b(&self.iso_child)
             + b(&self.iso_pair)
-            + b(&self.scalar);
+            + b(&self.scalar)
+            + b(&self.row);
         let player = |pp: &PlayerPlan| {
             let t = &pp.tables;
             b(&pp.slot)
@@ -416,6 +470,7 @@ impl Plan {
             ("actions", self.actions.len()),
             ("first_child", self.first_child.len()),
             ("offset", self.offset.len()),
+            ("scale_slot", self.scale_slot.len()),
             ("actor", self.actor.len()),
             ("card", self.card.len()),
             ("chance_factor", self.chance_factor.len()),
@@ -430,8 +485,20 @@ impl Plan {
             "root must be a decision node".into()
         })?;
         let hands = [self.players[0].hands, self.players[1].hands];
+        let mut scale_used = vec![false; self.num_scale_slots as usize];
         for i in 0..nn {
             let node = self.node(i)?;
+            let scale_slot = at(&self.scale_slot, i, "scale_slot")?;
+            if node.actor < 2 {
+                let used = scale_used
+                    .get_mut(scale_slot as usize)
+                    .ok_or_else(|| invalid(format!("node {i}: scale slot {scale_slot} out of range")))?;
+                ensure(!*used, || format!("node {i}: scale slot {scale_slot} shared"))?;
+                *used = true;
+                ensure(node.actions <= MAX_ACTIONS, || format!("node {i}: {} actions", node.actions))?;
+            } else {
+                ensure(scale_slot == NONE, || format!("node {i}: scale slot on a non-decision node"))?;
+            }
             let card = at(&self.card, i, "card")?;
             ensure(card == NONE || (card as usize) < CARDS, || format!("node {i}: card {card}"))?;
             let (iso_start, iso_count) =
@@ -481,6 +548,7 @@ impl Plan {
                 format!("node {i}: storage block out of range")
             })?;
         }
+        schedule::validate_segments(self)?;
         for (p, pp) in self.players.iter().enumerate() {
             self.validate_player(p, pp).map_err(|e| match e {
                 GpuError::InvalidInput(s) => GpuError::InvalidInput(format!("player {p}: {s}")),
@@ -491,97 +559,14 @@ impl Plan {
     }
 
     fn validate_player(&self, p: usize, pp: &PlayerPlan) -> Result<(), GpuError> {
-        let nn = self.num_nodes as usize;
         let other = self.players.get(p ^ 1).ok_or_else(|| invalid("player out of range"))?;
         let (n, nq) = (pp.hands, pp.opp_hands);
         ensure(n == other.opp_hands && nq == other.hands, || "hand counts disagree".into())?;
         ensure(n >= 1 && nq >= 1, || "empty range".into())?;
         ensure(n <= NONE / 2 && nq <= NONE / 2, || "too many hands".into())?;
-        // Buffers the kernels index with u32.
-        to_u32(pp.num_slots as usize * nq as usize, "reach buffer")?;
-        to_u32(nn * n as usize, "value buffer")?;
-        ensure(pp.slot.len() == nn && pp.child_slot.len() == nn, || {
-            "slot arrays have the wrong length".into()
-        })?;
-        ensure(pp.slot.first() == Some(&0), || "root must use slot 0".into())?;
-
-        // Slots: in range, and children consistent with their parent's role.
-        for i in 0..nn {
-            let slot = at(&pp.slot, i, "slot")?;
-            ensure(slot < pp.num_slots, || format!("node {i}: slot out of range"))?;
-            let node = self.node(i)?;
-            if node.actor == NONE {
-                continue;
-            }
-            let child_slot = at(&pp.child_slot, i, "child_slot")?;
-            if node.actor < 2 && node.actor as usize == p {
-                ensure(child_slot == NONE, || format!("own node {i} has child slots"))?;
-                for c in self.children(i)? {
-                    ensure(at(&pp.slot, c, "slot")? == slot, || {
-                        format!("own node {i}: child {c} doesn't share its slot")
-                    })?;
-                }
-            } else {
-                let end = u64::from(child_slot) + u64::from(node.actions);
-                ensure(child_slot != NONE && end <= u64::from(pp.num_slots), || {
-                    format!("opponent or chance node {i}: child slots out of range")
-                })?;
-                for (a, c) in self.children(i)?.enumerate() {
-                    ensure(u64::from(at(&pp.slot, c, "slot")?) == u64::from(child_slot) + a as u64, || {
-                        format!("opponent or chance node {i}: child {c} has the wrong slot")
-                    })?;
-                }
-            }
-        }
-
-        // Levels: every non-terminal node exactly once, in the list of its
-        // role, and non-terminal children exactly one level deeper.
-        let role = |actor: u32| -> Role {
-            match actor {
-                CHANCE => Role::Chance,
-                a if a as usize == p => Role::Own,
-                _ => Role::Opponent,
-            }
-        };
-        let mut level_of = vec![NONE; nn];
-        let (mut expect_opp, mut expect_own, mut expect_chance) = (0u32, 0u32, 0u32);
-        for (d, lv) in pp.levels.iter().enumerate() {
-            ensure(
-                lv.opp_start == expect_opp && lv.own_start == expect_own && lv.chance_start == expect_chance,
-                || format!("level {d} isn't contiguous"),
-            )?;
-            expect_opp = lv.opp_start.checked_add(lv.opp_count).ok_or_else(|| invalid("level overflow"))?;
-            expect_own = lv.own_start.checked_add(lv.own_count).ok_or_else(|| invalid("level overflow"))?;
-            expect_chance =
-                lv.chance_start.checked_add(lv.chance_count).ok_or_else(|| invalid("level overflow"))?;
-            let opp = pp.opp_nodes.get(lv.opp_start as usize..expect_opp as usize);
-            let own = pp.own_nodes.get(lv.own_start as usize..expect_own as usize);
-            let chance = pp.chance_nodes.get(lv.chance_start as usize..expect_chance as usize);
-            let (Some(opp), Some(own), Some(chance)) = (opp, own, chance) else {
-                return Err(invalid(format!("level {d} out of range")));
-            };
-            let listed = opp
-                .iter()
-                .map(|x| (x, Role::Opponent))
-                .chain(own.iter().map(|x| (x, Role::Own)))
-                .chain(chance.iter().map(|x| (x, Role::Chance)));
-            for (&id, list_role) in listed {
-                let i = id as usize;
-                let actor = self.node(i)?.actor;
-                ensure(actor != NONE && role(actor) == list_role, || format!("node {id} in the wrong list"))?;
-                let entry = level_of.get_mut(i).ok_or_else(|| invalid(format!("node {id} out of range")))?;
-                ensure(*entry == NONE, || format!("node {id} scheduled twice"))?;
-                *entry = d as u32;
-            }
-        }
-        ensure(
-            expect_opp as usize == pp.opp_nodes.len()
-                && expect_own as usize == pp.own_nodes.len()
-                && expect_chance as usize == pp.chance_nodes.len(),
-            || "node lists have unscheduled entries".into(),
-        )?;
-
-        // Terminals: each exactly once, with its payoffs.
+        schedule::validate_player_schedule(self, p, pp)?;
+        // Terminal arrays line up, and a paired fold shares its showdown's
+        // opponent reach.
         ensure(pp.fold_payoff.len() == pp.folds.len(), || "fold payoffs".into())?;
         let ns = pp.showdowns.len();
         ensure(
@@ -593,38 +578,12 @@ impl Plan {
                 && pp.showdown_fold_payoff.len() == ns,
             || "showdown arrays".into(),
         )?;
-        // A paired fold shares its showdown's opponent reach.
         for (&showdown, &fold) in pp.showdowns.iter().zip(&pp.showdown_fold) {
             if fold != NONE {
                 ensure(
                     at(&pp.slot, fold as usize, "slot")? == at(&pp.slot, showdown as usize, "slot")?,
                     || format!("fold {fold} paired with showdown {showdown} has another reach"),
                 )?;
-            }
-        }
-        let paired = pp.showdown_fold.iter().filter(|&&f| f != NONE);
-        let mut terminal_seen = vec![false; nn];
-        for &id in pp.folds.iter().chain(&pp.showdowns).chain(paired) {
-            let i = id as usize;
-            ensure(self.node(i)?.actor == NONE, || format!("terminal list entry {id} isn't a terminal"))?;
-            let seen =
-                terminal_seen.get_mut(i).ok_or_else(|| invalid(format!("terminal {id} out of range")))?;
-            ensure(!*seen, || format!("terminal {id} listed twice"))?;
-            *seen = true;
-        }
-        for i in 0..nn {
-            let level = at(&level_of, i, "level")?;
-            if self.node(i)?.actor == NONE {
-                ensure(at(&terminal_seen, i, "terminal")?, || format!("terminal {i} not listed"))?;
-                continue;
-            }
-            ensure(level != NONE, || format!("decision node {i} not scheduled"))?;
-            for c in self.children(i)? {
-                if self.node(c)?.actor != NONE {
-                    ensure(at(&level_of, c, "level")? == level + 1, || {
-                        format!("node {c} isn't one level below its parent {i}")
-                    })?;
-                }
             }
         }
         ensure(pp.showdown_table.iter().all(|&t| t < self.num_tables), || {
@@ -741,80 +700,17 @@ impl Plan {
 }
 
 impl PlayerPlan {
-    fn build(ctx: &Ctx, plan: &Plan, levels: &[Vec<u32>], p: usize) -> Result<PlayerPlan, GpuError> {
+    /// Player `p`'s hand data and showdown tables; the schedule comes
+    /// later ([`PlayerPlan::build_schedule`]), once the tree is segmented.
+    fn build(ctx: &Ctx, plan: &Plan, p: usize) -> Result<PlayerPlan, GpuError> {
         let hs = ctx.hands;
         let o = p ^ 1;
-        let nn = plan.num_nodes as usize;
+        let _ = plan;
         let mut pp = PlayerPlan {
             hands: to_u32(hs.len(p), "hands")?,
             opp_hands: to_u32(hs.len(o), "hands")?,
-            slot: vec![NONE; nn],
-            child_slot: vec![NONE; nn],
             ..PlayerPlan::default()
         };
-        // Slots, top-down. A level only holds children of the previous one,
-        // so a node's slot is known before its children are assigned.
-        let mut next_slot = 1u64;
-        if let Some(root) = pp.slot.first_mut() {
-            *root = 0;
-        }
-        for level in levels {
-            let mut range = LevelRange {
-                opp_start: to_u32(pp.opp_nodes.len(), "opponent nodes")?,
-                own_start: to_u32(pp.own_nodes.len(), "own nodes")?,
-                chance_start: to_u32(pp.chance_nodes.len(), "chance nodes")?,
-                ..LevelRange::default()
-            };
-            for &id in level {
-                let i = id as usize;
-                let node = ctx.tree.nodes.get(i).ok_or_else(|| invalid(format!("node {id} out of range")))?;
-                let parent_slot = at(&pp.slot, i, "slot")?;
-                match node.kind {
-                    Kind::Player(q) if q as usize == p => {
-                        pp.own_nodes.push(id);
-                        for c in node.children() {
-                            *pp.slot.get_mut(c).ok_or_else(|| invalid("child out of range"))? = parent_slot;
-                        }
-                    }
-                    // Opponent and chance nodes give every child a reach of
-                    // its own.
-                    Kind::Player(_) | Kind::Chance => {
-                        if matches!(node.kind, Kind::Chance) {
-                            pp.chance_nodes.push(id);
-                        } else {
-                            pp.opp_nodes.push(id);
-                        }
-                        let first = u32::try_from(next_slot).map_err(|_| invalid("too many reach slots"))?;
-                        *pp.child_slot.get_mut(i).ok_or_else(|| invalid("node out of range"))? = first;
-                        for (a, c) in node.children().enumerate() {
-                            *pp.slot.get_mut(c).ok_or_else(|| invalid("child out of range"))? =
-                                first.saturating_add(a as u32);
-                        }
-                        next_slot += u64::from(node.num_children);
-                    }
-                    Kind::Fold(_) => {
-                        pp.folds.push(id);
-                        pp.fold_payoff.push(fold_payoff(ctx, node, p));
-                    }
-                    Kind::Showdown => {
-                        let (w, l, t) = showdown_payoffs(ctx, node, p);
-                        pp.showdowns.push(id);
-                        pp.showdown_table
-                            .push(u32::try_from(node.offset).map_err(|_| invalid("strength table index"))?);
-                        pp.win.push(w);
-                        pp.lose.push(l);
-                        pp.tie.push(t);
-                    }
-                }
-            }
-            range.opp_count = to_u32(pp.opp_nodes.len(), "opponent nodes")? - range.opp_start;
-            range.own_count = to_u32(pp.own_nodes.len(), "own nodes")? - range.own_start;
-            range.chance_count = to_u32(pp.chance_nodes.len(), "chance nodes")? - range.chance_start;
-            pp.levels.push(range);
-        }
-        pp.num_slots = u32::try_from(next_slot).map_err(|_| invalid("too many reach slots"))?;
-        pp.pair_folds_with_showdowns(ctx, plan, p)?;
-
         pp.my_cards = side(&hs.cards, p)?.iter().map(|&(a, b)| pack_cards(a, b)).collect();
         pp.opp_cards = side(&hs.cards, o)?.iter().map(|&(a, b)| pack_cards(a, b)).collect();
         pp.same = side(&hs.same, p)?.clone();
@@ -841,55 +737,6 @@ impl PlayerPlan {
         pp.opp_card_hands = list;
         pp.tables = Tables::build(ctx.tables, hs, p)?;
         Ok(pp)
-    }
-}
-
-impl PlayerPlan {
-    /// Moves each fold that shares its opponent reach with a showdown (the
-    /// fold and the call, both children of one of the traverser's nodes)
-    /// into that showdown's `showdown_fold`, like the CPU's `showdown_batch`
-    /// grouping. Only batched terminals are paired: the CPU evaluates the
-    /// others one at a time.
-    fn pair_folds_with_showdowns(&mut self, ctx: &Ctx, plan: &Plan, p: usize) -> Result<(), GpuError> {
-        let nodes = &ctx.tree.nodes;
-        self.showdown_fold = vec![NONE; self.showdowns.len()];
-        self.showdown_fold_payoff = vec![0.0; self.showdowns.len()];
-        let mut showdown_index = vec![NONE; nodes.len()];
-        for (k, &id) in self.showdowns.iter().enumerate() {
-            *showdown_index.get_mut(id as usize).ok_or_else(|| invalid("showdown out of range"))? =
-                to_u32(k, "showdowns")?;
-        }
-        let mut paired = vec![false; nodes.len()];
-        for node in nodes.iter().filter(|n| matches!(n.kind, Kind::Player(q) if q as usize == p)) {
-            let batched = |c: usize| at(&plan.scalar, c, "scalar").is_ok_and(|s| s == 0);
-            let fold =
-                node.children().find(|&c| matches!(nodes.get(c), Some(n) if matches!(n.kind, Kind::Fold(_))));
-            let showdown = node
-                .children()
-                .find(|&c| matches!(nodes.get(c), Some(n) if matches!(n.kind, Kind::Showdown)));
-            let (Some(fold), Some(showdown)) = (fold, showdown) else { continue };
-            if !batched(fold) || !batched(showdown) {
-                continue;
-            }
-            let k = at(&showdown_index, showdown, "showdown index")? as usize;
-            let fold_node = nodes.get(fold).ok_or_else(|| invalid("fold out of range"))?;
-            *self.showdown_fold.get_mut(k).ok_or_else(|| invalid("showdown out of range"))? =
-                to_u32(fold, "fold")?;
-            *self.showdown_fold_payoff.get_mut(k).ok_or_else(|| invalid("showdown out of range"))? =
-                fold_payoff(ctx, fold_node, p);
-            *paired.get_mut(fold).ok_or_else(|| invalid("fold out of range"))? = true;
-        }
-        let mut folds = Vec::with_capacity(self.folds.len());
-        let mut payoffs = Vec::with_capacity(self.folds.len());
-        for (&id, &pay) in self.folds.iter().zip(&self.fold_payoff) {
-            if !at(&paired, id as usize, "paired")? {
-                folds.push(id);
-                payoffs.push(pay);
-            }
-        }
-        self.folds = folds;
-        self.fold_payoff = payoffs;
-        Ok(())
     }
 }
 

@@ -734,6 +734,24 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// The "Solve on" row cycles CPU, Auto, GPU and shows the choice.
+    #[test]
+    fn solve_on_row_cycles_backends() {
+        use trainer::SolverBackend;
+        let mut app = App::new(Session::new(TrainerConfig::default()).unwrap(), "/nonexistent/x.toml".into());
+        while app.setup_items()[app.setup_cursor] != app::SetupItem::SolveOn {
+            press(&mut app, KeyCode::Down);
+        }
+        assert!(render(&app).contains("Solve on"));
+        for want in [SolverBackend::Auto, SolverBackend::Gpu, SolverBackend::Cpu] {
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.session.config.solver.backend, want);
+        }
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.session.config.solver.backend, SolverBackend::Gpu);
+        assert!(render(&app).contains("GPU"));
+    }
+
     /// Prints the bet-size editor (run with --ignored --nocapture).
     #[test]
     #[ignore]

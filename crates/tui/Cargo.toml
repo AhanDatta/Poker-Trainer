@@ -10,6 +10,10 @@ publish.workspace = true
 name = "poker-trainer"
 path = "src/main.rs"
 
+[features]
+# Heads-up solves on an NVIDIA GPU (see crates/solver/cuda/README.md).
+gpu = ["trainer/gpu"]
+
 [dependencies]
 holdem.workspace = true
 solver.workspace = true
