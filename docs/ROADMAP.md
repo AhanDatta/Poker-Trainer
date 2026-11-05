@@ -15,7 +15,7 @@ Status: `[ ]` to do, `[~]` in progress, `[x]` done.
   the reason.
 - Show it on the review screen.
 
-## 1. Optimize the heads-up GPU solver `[ ]`
+## 1. Optimize the heads-up GPU solver `[x]`
 
 Single-solve speed (reviews). No changes made only for NN training data yet
 (batched many-spot solving waits until the NN design is known).
@@ -36,28 +36,68 @@ occupancy), 16-bit storage kernels 33 ms (DRAM-bound, 74-77%), opponent sums
    row is written only for its parent to read it back). Expected 5-10%.
    Changes the traversal structure: needs its own validation and tests.
 4. **Launch overhead** (CUDA graphs or fewer, merged launches) for turn and
-   river trees, which are launch-bound.
+   river trees. Measured: gaps between kernels are ~6% of a turn
+   iteration and under 1% of an exact flop's. CUDA graphs would need the
+   per-iteration discounts moved into device memory; deferred as low value.
 5. Re-profile after each step; record kept and rejected ideas with numbers
    in `crates/solver/cuda/README.md`.
 
 Done when the ideas above are measured and kept or rejected, and the exact
 path is still bit-identical to the CPU.
 
+Outcome (2026-11-05): 2 and 3 kept, plus 4-thread per-card prefix sums in
+showdowns; 1 rejected (pass 2 already hits L2), 4 deferred. Whole solves
+5% faster on exact flops, 7% on the turn. Details and numbers in
+`crates/solver/cuda/README.md` ("Exact flops").
+
 ## 2. Three-way solves on the GPU `[ ]`
 
 Port `solver::multi` (three players, sampled runouts, exact or independent
 card removal between the two opponents) with the heads-up port's workflow:
 plan and validation first, then kernels level by level, then terminals,
-each checked bit for bit against the CPU solver (exact path) before any fast
-path. 4+-way pots stay out of scope (rare, approximate, hard to validate).
+each checked against the CPU solver before any fast path. 4+-way pots stay
+out of scope (rare, approximate, hard to validate).
 
-Expected shape (to confirm against the code when starting):
-- Plan: three traversers; reach for the two non-traversing players per slot.
-- Terminals: showdowns and folds summed over pairs of opponent hands with
-  inclusion-exclusion over shared cards (exact removal), or factored
-  per-opponent sweeps (independent). Compute-heavy, which suits the GPU.
-- Memory: reuse 16-bit storage and tree splitting.
-- Backend setting: 3-way solves follow `backend` like heads-up ones.
+What the CPU solver does that the port must mirror (`src/multi/`):
+- A traversal for player `p` carries **two** opponent reach vectors. At an
+  opponent's node only that opponent's reach splits (the other passes
+  through); at a chance node both are copied with blocked hands zeroed (the
+  chance factor applied to one of them only, since values are bilinear).
+- A player's average strategy is accumulated in the traversal of the **next
+  player still in the hand** (`strategy_updater`), not in "the opponent's"
+  traversal.
+- Once `p` has folded, its subtree is a fixed payoff times the opponent pair
+  mass (no traversal below); a node either opponent can't reach is dead.
+- Terminals: `pay_all` (fixed payoff × mass of compatible opponent pairs),
+  showdowns with **exact removal** (inclusion-exclusion over shared cards,
+  `exact.rs`: per-card sums plus per-card hand lists, terminals on one board
+  batched 4 lanes at a time) or **independent** opponents
+  (`P(win) = P(beat q) · P(beat r)` from per-opponent compat/beat sums).
+- River subtrees evaluated breadth-first with batched terminals
+  (`river.rs`), as heads-up; fixed-payoff leaves grouped by reach pair.
+
+GPU shape:
+- Plan: per traverser, two reach slots per node (one per opponent: only the
+  acting opponent's or a chance node's children get fresh slots), the
+  strategy-updater mark per opponent node, folded-subtree cut-offs.
+- Kernels: opponent split/sum and own update generalize directly; chance
+  split writes two slots; terminals are the new work, with exact removal
+  the hard part (pair sums per hand: per-card statistics, then a gather per
+  hand, as in the heads-up showdown tables).
+- Memory: 16-bit storage and tree splitting carry over.
+- Backend: 3-way solves follow `backend` like heads-up ones.
+
+Open questions (to settle before writing kernels):
+1. Exactness target. The CPU's exact-removal sums are f64 products of sums
+   grouped by lane batches and hash maps; matching them bit for bit may not
+   be practical. Proposal: bit-identical for independent removal and the
+   traversal kernels; exact removal checked against the CPU within f32
+   rounding (plus a brute-force reference over hand triples).
+2. Order. Proposal: independent removal first (simpler terminals, proves
+   the 3-player traversal), then exact removal.
+3. Runout sampling. 3-way flops are sampled (8 × 4 by default) for CPU
+   time; a faster GPU could afford more samples. Changing defaults is a
+   separate decision once there are numbers.
 
 Target: the chart-range 3-way flop (J♠9♠4♦, 8 × 4 sampled, exact removal)
 from 47 s on the CPU to well under 10 s.

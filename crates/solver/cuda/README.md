@@ -253,39 +253,60 @@ percent slower).
 
 Nsight Systems, exact flop `Ks7s2d` (3x raises), 30 iterations: the tree
 (1.0 million nodes, 16-bit storage) ran as its top plus 2 groups of turn
-subtrees. Kernel time per traversal, fast path:
+subtrees. Kernel time per traversal, fast path, before and after the
+optimization round of 2026-11-05:
 
-| Kernel | Time | Bound by |
-|---|---|---|
-| `showdown_values` | 38.4 ms | latency: 50% occupancy (shared memory, 3 blocks per SM), barrier waits |
-| `opponent_split_compressed` | 18.5 ms | DRAM, 74% of peak |
-| `own_update_compressed` | 14.6 ms | DRAM, 77% of peak |
-| `opponent_sum` | 11.6 ms | DRAM, 50-60% of peak (child value rows) |
-| `fold_values` | 5.1 ms | |
-| `chance_split` + `chance_sum` | 2.9 ms | |
-| total | 91 ms | |
+| Kernel | Before | After | Bound by |
+|---|---|---|---|
+| `showdown_values` | 38.4 ms | 34.8 ms | latency: 50% occupancy (shared memory, 3 blocks per SM), barrier waits |
+| `opponent_split_compressed` | 18.5 ms | 18.6 ms | DRAM, 74% of peak |
+| `own_update_compressed` | 14.6 ms | 20.3 ms | DRAM, 77% of peak; now also sums fused children |
+| `opponent_sum` | 11.6 ms | 2.6 ms | DRAM (child value rows) |
+| `fold_values` | 5.1 ms | 5.1 ms | |
+| `chance_split` + `chance_sum` | 2.9 ms | 2.9 ms | |
+| total | 91 ms | 84 ms | |
 
-The showdown kernel's per-card prefix sums used to be one sequential sweep
-per card: 52 threads working while the rest of the block waited. Four
-threads per card (quarter sums, combined with warp shuffles) made showdowns
-5% faster and kept the exact path bit-identical. Tried and rejected: reading
-the opponent weights from the reach row instead of shared memory, which
-fits 4 blocks per SM instead of 3 but measured 3% slower.
+Kept:
+
+- **Per-card prefix sums with 4 threads per card** (quarter sums combined
+  with warp shuffles) instead of one sequential sweep per card, which left
+  most of the block waiting at the barrier: showdowns 5% faster.
+- **One entry point per precision** (`*_exact`, `*_fast`): one kernel for
+  both held the fast path to the exact path's registers. Fast showdowns
+  8-10% faster, 4% less kernel time on the turn and the exact flop.
+- **Opponent nodes fused into their parent's update**: an opponent node
+  right below one of the traverser's nodes no longer writes a value row only
+  for the parent to read it back; the parent sums the node's children
+  itself, in `opponent_sum`'s order (bit-identical). 4% less kernel time on
+  the exact flop, 2% on the turn. (The parent re-sums a fused child each
+  time it reads it, which is why `own_update_compressed` grew.)
+
+Effect on whole solves, measured by alternating the old and new builds on
+the same spot (a laptop GPU's clocks drop as it heats, so back-to-back runs
+of one build vary by up to 10%): exact flop `Ks7s2d` 224-225 -> 212-213
+ms per iteration (-5%), turn 0.95-0.96 -> 0.88-0.90 s (-7%). Root
+strategies and iteration counts unchanged; the exact path still matches
+the CPU bit for bit.
+
+Tried and rejected, with measurements:
+
+- Opponent weights read from the (cached) reach row instead of shared
+  memory, for 4 showdown blocks per SM instead of 3: 3% slower.
+- Staging the 16-bit storage kernels' new values in shared memory instead
+  of recomputing them in the encoding pass: no faster for opponent splits
+  and 6% slower own updates. Counters show why: pass 2's re-reads already
+  hit the L2 cache, so DRAM traffic was close to the minimum.
+- Caching each hand's first 8 child values (to read fused children once):
+  the indexed array lands in local memory; own updates 40% slower.
+- CUDA graphs against launch overhead: measured gaps between kernels are
+  ~6% of a turn iteration and under 1% of an exact flop's; deferred.
 
 What remains:
 
-- The two 16-bit storage kernels encode in two passes (find the node's new
-  largest value, then encode against it), so they read their regrets, sums
-  and child values twice. Keeping pass 1's results in shared memory for
-  nodes that fit would cut their traffic by about 40%: roughly 10% of an
-  exact flop solve.
-- `opponent_sum` writes a value row per opponent node only for its parent
-  to read it back; fusing it into the parent's update would save that
-  round trip.
-- Both precisions share one kernel, so registers are allocated for the
-  hungrier one: fast showdowns run at 65% occupancy against 82% for exact
-  (on the turn). Separate entry points per precision may recover some of
-  that.
+- Showdowns are 40% of exact-flop time and latency-bound at 50% occupancy;
+  the two cheap fixes tried didn't help, so a gain needs a different scheme
+  (e.g. several showdowns per block sharing their board's tables).
+- The 16-bit storage kernels are close to the DRAM minimum for their data.
 
 ## Running the GPU checks
 
