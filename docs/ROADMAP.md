@@ -110,7 +110,16 @@ Steps:
    nodes and fixed leaves grouped by reach pair (4).
 2. Traversal kernels (opponent split for either opponent, two-slot chance
    split, own update, sums) with independent-removal terminals; bit for bit
-   against the CPU with `exact_removal` off. `[ ]`
+   against the CPU with `exact_removal` off. `[x]`
+   Done (`src/gpu/multi/engine.rs`, `kernels/multi_*.cu`):
+   `MultiSolver::use_gpu(GpuPrecision::Exact)` (f32 storage, whole trees,
+   f64 terminal sums), bit-identical to the CPU in every test; 18 planted
+   bugs caught; sanitizer clean. The per-node steps and the showdown prefix
+   sums are now shared with the heads-up kernels (`traversal.cuh`,
+   `terminal.cuh`), and the host code is split into shared modules
+   (`device.rs`, `shared.rs`, `tables.rs`). Benchmarks in
+   `crates/solver/cuda/README.md` ("Three-player solves"). Left for later:
+   a double-single fast path, `backend` wiring.
 3. Exact-removal terminals; against the CPU and a brute force. `[ ]`
 4. River batching parity, 16-bit storage, splitting, backend wiring,
    benchmarks. `[ ]`

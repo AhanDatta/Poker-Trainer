@@ -4,7 +4,10 @@
 //! Usage: cargo run --release -p trainer --example multibench -- [board] [iterations]
 //! Env: TURNS / RIVERS (sampled cards, default 8 / 4), EXACT=1 (every card),
 //! EXACT_REMOVAL=1 (card removal between opponents), COMPARE=1 (both, judged
-//! in the exact game), RANGES="r0|r1|r2" (instead of the chart ranges).
+//! in the exact game), RANGES="r0|r1|r2" (instead of the chart ranges),
+//! GPU=1 (solve on the GPU; needs `--features gpu`, independent opponents and
+//! f32 storage, which it implies), F32=1 (f32 storage on the CPU too, to
+//! compare like with like).
 
 use holdem::card::parse_cards;
 use solver::multi::{MultiConfig, MultiSolver, MultiState};
@@ -92,7 +95,11 @@ fn main() {
         rake_rate: 0.0,
         rake_cap: 0.0,
         exact_removal: std::env::var("EXACT_REMOVAL").is_ok(),
-        storage: solver::StorageMode::Auto,
+        storage: if std::env::var("GPU").is_ok() || std::env::var("F32").is_ok() {
+            solver::StorageMode::F32
+        } else {
+            solver::StorageMode::Auto
+        },
         dcfr: dcfr_from_env(),
     };
     if std::env::var("COMPARE").is_ok() {
@@ -118,6 +125,9 @@ fn main() {
     }
     let (by_bet, runout) = solver.showdown_counts();
     println!("showdowns: {by_bet} after betting, {runout} in all-in runouts");
+    if std::env::var("GPU").is_ok() {
+        use_gpu(&mut solver);
+    }
     if iters == 0 {
         return;
     }
@@ -144,6 +154,28 @@ fn main() {
         el.as_secs_f64() * 1e3 / p.iteration as f64,
         p.exploitability_pct
     );
+    if let Some(e) = solver.gpu_error() {
+        println!("GPU failed, solve restarted on the CPU: {e}");
+    }
+}
+
+/// `GPU=1`: solve on the GPU (f64 terminal sums, bit-identical to the CPU).
+#[cfg(feature = "gpu")]
+fn use_gpu(solver: &mut MultiSolver) {
+    let t = Instant::now();
+    match solver.use_gpu(solver::gpu::GpuPrecision::Exact) {
+        Ok(()) => println!("on the GPU (setup {:.2?})", t.elapsed()),
+        Err(e) => {
+            eprintln!("GPU unavailable: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn use_gpu(_: &mut MultiSolver) {
+    eprintln!("GPU=1 needs a build with --features gpu");
+    std::process::exit(1);
 }
 
 /// Solves with independent opponents and with exact card removal, then

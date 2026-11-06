@@ -226,6 +226,11 @@ pub struct MultiSolver {
     iterations: u32,
     convergence: f64,
     batch_river: bool,
+    /// The GPU engine after a successful `use_gpu`.
+    #[cfg(feature = "gpu")]
+    gpu: Option<Box<crate::gpu::MultiEngine>>,
+    /// Why the last solve abandoned the GPU, if it did.
+    gpu_error: Option<String>,
 }
 
 impl MultiSolver {
@@ -268,6 +273,9 @@ impl MultiSolver {
             iterations: 0,
             convergence: f64::INFINITY,
             batch_river: true,
+            #[cfg(feature = "gpu")]
+            gpu: None,
+            gpu_error: None,
         })
     }
 
@@ -292,6 +300,8 @@ impl MultiSolver {
     #[doc(hidden)]
     pub fn set_batch_river(&mut self, on: bool) {
         self.batch_river = on;
+        // A GPU plan built for the other evaluator would be stale.
+        self.release_gpu();
     }
 
     fn root_values(&self, mode: Mode) -> [f64; N] {
@@ -337,13 +347,40 @@ impl MultiSolver {
 
     /// Like [`Self::solve`], but stops within one iteration once `cancel` is
     /// set (`on_progress` only runs at exploitability checks, which can be
-    /// many seconds apart on big trees).
+    /// many seconds apart on big trees). Runs on the GPU after a successful
+    /// [`Self::use_gpu`].
     pub fn solve_cancellable(
         &mut self,
         opts: &SolveOptions,
         cancel: &std::sync::atomic::AtomicBool,
         mut on_progress: impl FnMut(&Progress) -> bool,
     ) -> Progress {
+        #[cfg(feature = "gpu")]
+        if self.gpu.is_some() {
+            let result = self
+                .run_solve(opts, cancel, &mut on_progress, Self::gpu_iteration, Self::gpu_convergence)
+                .and_then(|p| self.download_from_gpu().map(|()| p));
+            match result {
+                Ok(p) => return p,
+                Err(e) => self.fall_back_to_cpu(e),
+            }
+        }
+        match self.run_solve(opts, cancel, &mut on_progress, Self::cpu_iteration, Self::cpu_convergence) {
+            Ok(p) => p,
+            Err(never) => match never {},
+        }
+    }
+
+    /// The solve loop for either backend: `iterate` runs one DCFR
+    /// iteration, `converge` measures the convergence at the checks.
+    fn run_solve<E>(
+        &mut self,
+        opts: &SolveOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: &mut impl FnMut(&Progress) -> bool,
+        mut iterate: impl FnMut(&mut Self, Discount) -> Result<(), E>,
+        mut converge: impl FnMut(&mut Self) -> Result<f64, E>,
+    ) -> Result<Progress, E> {
         let pot = self.config.root.pot as f64;
         let check = opts.check_every.max(1);
         let target = opts.target_exploitability_pct * pot / 100.0;
@@ -359,7 +396,7 @@ impl MultiSolver {
         while self.iterations < opts.max_iterations {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 progress.finished = true;
-                return progress;
+                return Ok(progress);
             }
             self.iterations += 1;
             let mut d = Discount::new(self.iterations, &self.config.dcfr);
@@ -367,16 +404,10 @@ impl MultiSolver {
             // below half a quantization step round away): add unweighted
             // strategies there, as the heads-up solver does.
             d.reach_weighted &= !self.store.is_compressed();
-            let ctx = self.ctx();
-            for p in 0..N {
-                let (q, r) = opponents(p);
-                let mut out = vec![0f32; self.hands.len(p)];
-                let w = &self.hands.weights;
-                traverse(&ctx, 0, p, &w[q], &w[r], Mode::Cfr(d), false, &mut out);
-            }
+            iterate(self, d)?;
             let last = self.iterations >= opts.max_iterations;
             if self.iterations >= next_check || last {
-                self.convergence = self.convergence();
+                self.convergence = converge(self)?;
                 progress.iteration = self.iterations;
                 progress.exploitability = self.convergence;
                 progress.exploitability_pct = 100.0 * self.convergence / pot;
@@ -384,7 +415,7 @@ impl MultiSolver {
                 progress.finished = done;
                 if !on_progress(&progress) || done {
                     progress.finished = true;
-                    return progress;
+                    return Ok(progress);
                 }
                 let (t, e) = (self.iterations, self.convergence);
                 next_check = t + crate::next_check_gap(last_check, (t, e), target, check);
@@ -392,7 +423,111 @@ impl MultiSolver {
             }
         }
         progress.finished = true;
-        progress
+        Ok(progress)
+    }
+
+    /// One DCFR iteration on the CPU: players 0, 1 and 2 in turn.
+    fn cpu_iteration(&mut self, d: Discount) -> Result<(), std::convert::Infallible> {
+        let ctx = self.ctx();
+        for p in 0..N {
+            let (q, r) = opponents(p);
+            let mut out = vec![0f32; self.hands.len(p)];
+            let w = &self.hands.weights;
+            traverse(&ctx, 0, p, &w[q], &w[r], Mode::Cfr(d), false, &mut out);
+        }
+        Ok(())
+    }
+
+    fn cpu_convergence(&mut self) -> Result<f64, std::convert::Infallible> {
+        Ok(self.convergence())
+    }
+
+    /// Moves solves to the GPU until [`Self::release_gpu`] (experimental;
+    /// so far only with independent opponents, `exact_removal` off, f32
+    /// storage and `GpuPrecision::Exact`: anything else is an error and
+    /// solves stay on the CPU). Bit-identical to the CPU. Results are copied
+    /// back when `solve` returns, after which `query` and the other read
+    /// methods work as usual. If the GPU fails during a solve, the solver
+    /// discards the GPU state, restarts the solve from scratch on the CPU,
+    /// and [`Self::gpu_error`] says what happened.
+    #[cfg(feature = "gpu")]
+    pub fn use_gpu(&mut self, precision: crate::gpu::GpuPrecision) -> Result<(), crate::gpu::GpuError> {
+        if precision != crate::gpu::GpuPrecision::Exact {
+            return Err(crate::gpu::GpuError::InvalidInput(
+                "3-way GPU solves only have the exact precision so far".into(),
+            ));
+        }
+        let device = crate::gpu::Gpu::new()?;
+        let plan = crate::gpu::MultiPlan::build(&self.ctx())?;
+        self.gpu = Some(Box::new(crate::gpu::MultiEngine::new(device, plan, self.store.gpu_view())?));
+        self.gpu_error = None;
+        Ok(())
+    }
+
+    /// Whether solves currently run on the GPU (after [`Self::use_gpu`]).
+    pub fn uses_gpu(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu.is_some()
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
+    }
+
+    /// Why the last solve abandoned the GPU, if it did.
+    pub fn gpu_error(&self) -> Option<&str> {
+        self.gpu_error.as_deref()
+    }
+
+    /// Frees the GPU (its memory and context). Regrets and strategy sums are
+    /// on the host after every solve, so nothing is lost.
+    pub fn release_gpu(&mut self) {
+        #[cfg(feature = "gpu")]
+        {
+            self.gpu = None;
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_engine(&mut self) -> Result<&mut crate::gpu::MultiEngine, crate::gpu::GpuError> {
+        self.gpu.as_deref_mut().ok_or_else(|| crate::gpu::GpuError::InvalidInput("no GPU engine".into()))
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_iteration(&mut self, d: Discount) -> Result<(), crate::gpu::GpuError> {
+        self.gpu_engine()?.cfr_iteration(d)
+    }
+
+    #[cfg(feature = "gpu")]
+    fn gpu_convergence(&mut self) -> Result<f64, crate::gpu::GpuError> {
+        self.gpu_engine()?.convergence()
+    }
+
+    /// Copies the GPU's regrets and strategy sums into host storage.
+    #[cfg(feature = "gpu")]
+    fn download_from_gpu(&mut self) -> Result<(), crate::gpu::GpuError> {
+        let Some(engine) = &self.gpu else { return Ok(()) };
+        engine.download(self.store.gpu_view())
+    }
+
+    /// After a GPU failure: drops the GPU state and resets the solve, so it
+    /// restarts on the CPU from a clean slate.
+    #[cfg(feature = "gpu")]
+    fn fall_back_to_cpu(&mut self, e: crate::gpu::GpuError) {
+        self.gpu = None;
+        self.gpu_error = Some(e.to_string());
+        self.store =
+            Storage::new(self.tree.storage_len as usize, self.tree.num_player_nodes as usize, self.store.is_compressed());
+        self.iterations = 0;
+        self.convergence = f64::INFINITY;
+    }
+
+    /// The regret/strategy storage (tests compare it with the GPU's).
+    #[cfg(all(test, feature = "gpu"))]
+    pub(crate) fn store_mut(&mut self) -> &mut Storage {
+        &mut self.store
     }
 
     /// Average strategy of a player node (action-major).
@@ -535,6 +670,8 @@ impl MultiSolver {
     /// independent opponents) for later solving and evaluation; used to
     /// measure how a strategy found with one model fares under the other.
     pub fn set_exact_removal(&mut self, on: bool) {
+        // A GPU plan holds the other model's payoffs.
+        self.release_gpu();
         self.config.exact_removal = on;
         self.norm = norms(&self.hands, on);
     }

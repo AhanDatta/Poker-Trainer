@@ -104,7 +104,7 @@ pub(crate) fn independent_showdown(
 
 /// Values of player `p` at node `id`; `unit` gives probability masses.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn traverse(
+pub(crate) fn traverse(
     ctx: &Ctx,
     id: usize,
     p: usize,

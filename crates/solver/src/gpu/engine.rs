@@ -5,95 +5,15 @@
 #[cfg(test)]
 mod tests;
 
-use super::plan::{
-    scratch_bytes, showdown_shared_bytes, LevelRange, Plan, PlayerPlan, Segment, MODE_AVERAGE,
-    MODE_BEST_RESPONSE, MODE_CFR, SHOWDOWN_SHARED_LIMIT,
+pub(crate) use super::device::HostStorage;
+use super::device::{
+    begin_traversal, check_memory, per_hand_grid, per_node_grid, per_terminal_grid, push, push_mut, Buffer, DeviceStorage, DeviceTables, ModeArgs,
+    MAX_TERMINAL_BLOCKS, MEMORY_MARGIN, THREADS,
 };
+use super::plan::{scratch_bytes, showdown_shared_bytes, LevelRange, Plan, PlayerPlan, Segment, SHOWDOWN_SHARED_LIMIT};
 use super::{invalid, Gpu, GpuError, GpuPrecision};
 use crate::cfr::{Discount, Mode};
-use cudarc::driver::{CudaSlice, DeviceRepr, LaunchArgs, LaunchConfig, PushKernelArg, ValidAsZeroBits};
-
-/// The solver's storage as the engine uploads and downloads it.
-pub(crate) enum HostStorage<'a> {
-    F32 { regrets: &'a mut [f32], sums: &'a mut [f32] },
-    /// 16-bit values with one f32 scale per decision node.
-    Compressed { regrets: &'a mut [i16], sums: &'a mut [u16], regret_scale: &'a mut [f32], strategy_scale: &'a mut [f32] },
-}
-
-/// The storage on the device.
-enum DeviceStorage {
-    F32 { regrets: CudaSlice<f32>, sums: CudaSlice<f32> },
-    Compressed { regrets: CudaSlice<i16>, sums: CudaSlice<u16>, regret_scale: CudaSlice<f32>, strategy_scale: CudaSlice<f32> },
-}
-
-impl HostStorage<'_> {
-    /// Device bytes of this storage.
-    fn bytes(&self) -> u64 {
-        match self {
-            HostStorage::F32 { regrets, sums } => 4 * (regrets.len() + sums.len()) as u64,
-            HostStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => {
-                2 * (regrets.len() + sums.len()) as u64 + 4 * (regret_scale.len() + strategy_scale.len()) as u64
-            }
-        }
-    }
-
-    /// Checks the lengths against the plan; returns the device bytes needed.
-    fn check(&self, plan: &Plan) -> Result<u64, GpuError> {
-        let len = plan.storage_len as usize;
-        let scales = plan.num_scale_slots as usize;
-        let ok = match self {
-            HostStorage::F32 { regrets, sums } => regrets.len() == len && sums.len() == len,
-            HostStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => {
-                regrets.len() == len && sums.len() == len && regret_scale.len() == scales && strategy_scale.len() == scales
-            }
-        };
-        if !ok {
-            return Err(invalid("storage doesn't match the tree"));
-        }
-        Ok(self.bytes())
-    }
-}
-
-/// Threads per block, as the kernels assume (`kThreads` in terminal.cu;
-/// the traversal kernels take any size).
-const THREADS: u32 = 256;
-/// Most blocks along grid y (hardware limit 65535); kernels stride beyond.
-const MAX_GRID_Y: u32 = 65_535;
-/// Most blocks for the one-block-per-terminal kernels; they stride beyond.
-const MAX_TERMINAL_BLOCKS: u32 = 4096;
-
-/// A device buffer and the logical length the kernels see. Allocations are
-/// never empty (an empty list gets one unused element).
-struct Buffer<T> {
-    data: CudaSlice<T>,
-    len: u32,
-}
-
-/// Pushes a read-only buffer as the kernel's `(pointer, length)` pair.
-fn push<'a, T>(l: &mut LaunchArgs<'a>, b: &'a Buffer<T>) {
-    l.arg(&b.data).arg(&b.len);
-}
-
-/// Pushes a buffer the kernel writes, with the logical length `len`.
-fn push_mut<'a, T>(l: &mut LaunchArgs<'a>, data: &'a mut CudaSlice<T>, len: &'a u32) {
-    l.arg(data).arg(len);
-}
-
-impl Gpu {
-    fn upload<T: DeviceRepr + Default>(&self, v: &[T]) -> Result<Buffer<T>, GpuError> {
-        let len = u32::try_from(v.len()).map_err(|_| invalid("buffer exceeds u32 indexing"))?;
-        let data = if v.is_empty() {
-            self.stream.clone_htod(&[T::default()])?
-        } else {
-            self.stream.clone_htod(v)?
-        };
-        Ok(Buffer { data, len })
-    }
-
-    fn zeros<T: DeviceRepr + ValidAsZeroBits>(&self, len: usize) -> Result<CudaSlice<T>, GpuError> {
-        Ok(self.stream.alloc_zeros::<T>(len.max(1))?)
-    }
-}
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 /// One traverser's plan on the device.
 struct DevicePlayer {
@@ -119,19 +39,11 @@ struct DevicePlayer {
     opp_cards: Buffer<u32>,
     perm: Buffer<u32>,
     opp_weights: Buffer<f32>,
-    opp_off: Buffer<u32>,
-    opp_len: Buffer<u32>,
-    opp_order: Buffer<u32>,
-    card_base: Buffer<u32>,
-    card_off: Buffer<u32>,
-    card_pos: Buffer<u32>,
-    ranges: Buffer<u32>,
-    ranks: Buffer<u32>,
+    tables: DeviceTables,
 }
 
 impl DevicePlayer {
     fn upload(gpu: &Gpu, pp: &PlayerPlan) -> Result<DevicePlayer, GpuError> {
-        let t = &pp.tables;
         Ok(DevicePlayer {
             slots: gpu.upload(&pp.slot)?,
             child_slots: gpu.upload(&pp.child_slot)?,
@@ -155,74 +67,8 @@ impl DevicePlayer {
             opp_cards: gpu.upload(&pp.opp_cards)?,
             perm: gpu.upload(&pp.perm)?,
             opp_weights: gpu.upload(&pp.opp_weights)?,
-            opp_off: gpu.upload(&t.opp_off)?,
-            opp_len: gpu.upload(&t.opp_len)?,
-            opp_order: gpu.upload(&t.opp_order)?,
-            card_base: gpu.upload(&t.card_base)?,
-            card_off: gpu.upload(&t.card_off)?,
-            card_pos: gpu.upload(&t.card_pos)?,
-            ranges: gpu.upload(&t.ranges)?,
-            ranks: gpu.upload(&t.ranks)?,
+            tables: DeviceTables::upload(gpu, &pp.tables)?,
         })
-    }
-}
-
-/// The kernels' view of a traversal mode.
-#[derive(Clone, Copy)]
-struct ModeArgs {
-    mode: u32,
-    positive_discount: f32,
-    negative_discount: f32,
-    strategy_discount: f32,
-    reach_weighted: u32,
-}
-
-impl ModeArgs {
-    fn new(mode: Mode) -> ModeArgs {
-        match mode {
-            Mode::Cfr(d) => ModeArgs {
-                mode: MODE_CFR,
-                positive_discount: d.pos,
-                negative_discount: d.neg,
-                strategy_discount: d.strat,
-                reach_weighted: u32::from(d.reach_weighted),
-            },
-            Mode::BestResponse => ModeArgs::plain(MODE_BEST_RESPONSE),
-            Mode::Average => ModeArgs::plain(MODE_AVERAGE),
-        }
-    }
-
-    fn plain(mode: u32) -> ModeArgs {
-        ModeArgs {
-            mode,
-            positive_discount: 0.0,
-            negative_discount: 0.0,
-            strategy_discount: 0.0,
-            reach_weighted: 0,
-        }
-    }
-}
-
-/// Grid for kernels with hands along x and a level's nodes along y.
-fn per_hand_grid(hands: u32, nodes: u32) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (hands.div_ceil(THREADS).max(1), nodes.clamp(1, MAX_GRID_Y), 1),
-        block_dim: (THREADS, 1, 1),
-        shared_mem_bytes: 0,
-    }
-}
-
-/// Grid for one-block-per-node kernels (16-bit storage updates).
-fn per_node_grid(nodes: u32) -> LaunchConfig {
-    LaunchConfig { grid_dim: (nodes.clamp(1, 1 << 20), 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: 0 }
-}
-
-/// Grid for one-block-per-terminal kernels.
-fn per_terminal_grid(terminals: u32, threads: u32, shared_mem_bytes: u32) -> LaunchConfig {
-    LaunchConfig {
-        grid_dim: (terminals.clamp(1, MAX_TERMINAL_BLOCKS), 1, 1),
-        block_dim: (threads, 1, 1),
-        shared_mem_bytes,
     }
 }
 
@@ -259,9 +105,6 @@ impl DeviceTree {
         })
     }
 }
-
-/// Device memory left free for the display and the CUDA runtime.
-const MEMORY_MARGIN: u64 = 512 << 20;
 
 /// A game tree with its regrets and strategy sums on the GPU.
 pub(crate) struct Engine {
@@ -307,7 +150,7 @@ impl Engine {
         precision: GpuPrecision,
     ) -> Result<Engine, GpuError> {
         plan.validate()?;
-        let storage_bytes = host.check(&plan)?;
+        let storage_bytes = host.check(plan.storage_len, plan.num_scale_slots)?;
         let [p0, p1] = &plan.players;
         let reach_len =
             (p0.num_slots as usize * p0.opp_hands as usize).max(p1.num_slots as usize * p1.opp_hands as usize);
@@ -318,29 +161,14 @@ impl Engine {
             u64::from(plan.num_rows),
             [u64::from(p0.hands), u64::from(p1.hands)],
         );
-        let needed = plan.device_bytes() + storage_bytes + scratch;
-        let (free, _total) = gpu.stream.context().mem_get_info()?;
-        let available = (free as u64).saturating_sub(MEMORY_MARGIN);
-        if needed > available {
-            return Err(GpuError::OutOfMemory { needed, available });
-        }
+        check_memory(&gpu, plan.device_bytes() + storage_bytes + scratch)?;
         let engine = Engine {
             tree: DeviceTree::upload(&gpu, &plan)?,
             players: [
                 DevicePlayer::upload(&gpu, &plan.players[0])?,
                 DevicePlayer::upload(&gpu, &plan.players[1])?,
             ],
-            storage: match host {
-                HostStorage::F32 { regrets, sums } => {
-                    DeviceStorage::F32 { regrets: gpu.upload(regrets)?.data, sums: gpu.upload(sums)?.data }
-                }
-                HostStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => DeviceStorage::Compressed {
-                    regrets: gpu.upload(regrets)?.data,
-                    sums: gpu.upload(sums)?.data,
-                    regret_scale: gpu.upload(regret_scale)?.data,
-                    strategy_scale: gpu.upload(strategy_scale)?.data,
-                },
-            },
+            storage: DeviceStorage::upload(&gpu, host)?,
             scale_slots: gpu.upload(&plan.scale_slot)?,
             reach: gpu.zeros(reach_len)?,
             values: gpu.zeros(values_len)?,
@@ -356,40 +184,8 @@ impl Engine {
     /// Copies the regrets and strategy sums (and scales) back into host
     /// storage of the same kind.
     pub(crate) fn download(&self, host: HostStorage<'_>) -> Result<(), GpuError> {
-        host.check(&self.plan)?;
-        let stream = &self.gpu.stream;
-        /// `dst.len()` elements of `src` into `dst` (lengths checked above;
-        /// slicing to exactly `dst.len()` keeps cudarc's length assertion
-        /// from ever firing).
-        fn copy<T: DeviceRepr>(
-            stream: &std::sync::Arc<cudarc::driver::CudaStream>,
-            src: &CudaSlice<T>,
-            dst: &mut [T],
-        ) -> Result<(), GpuError> {
-            if dst.is_empty() {
-                return Ok(());
-            }
-            let view = src.try_slice(..dst.len()).ok_or_else(|| invalid("device storage too short"))?;
-            Ok(stream.memcpy_dtoh(&view, dst)?)
-        }
-        match (&self.storage, host) {
-            (DeviceStorage::F32 { regrets, sums }, HostStorage::F32 { regrets: r, sums: s }) => {
-                copy(stream, regrets, r)?;
-                copy(stream, sums, s)?;
-            }
-            (
-                DeviceStorage::Compressed { regrets, sums, regret_scale, strategy_scale },
-                HostStorage::Compressed { regrets: r, sums: s, regret_scale: rs, strategy_scale: ss },
-            ) => {
-                copy(stream, regrets, r)?;
-                copy(stream, sums, s)?;
-                copy(stream, regret_scale, rs)?;
-                copy(stream, strategy_scale, ss)?;
-            }
-            _ => return Err(invalid("host and device storage kinds differ")),
-        }
-        stream.synchronize()?;
-        Ok(())
+        host.check(self.plan.storage_len, self.plan.num_scale_slots)?;
+        self.storage.download(&self.gpu, host)
     }
 
     /// One DCFR iteration: player 0's update, then player 1's (which sees
@@ -507,20 +303,8 @@ impl Pass<'_> {
 
     /// Root reach and alive flags (slot 0 alive, every other slot dead).
     fn begin(&mut self) -> Result<(), GpuError> {
-        let opp_hands = self.pp.opp_hands;
-        let mut l = self.gpu.stream.launch_builder(&self.gpu.kernels.begin_traversal);
-        push_mut(&mut l, self.alive, &self.alive_len);
-        push_mut(&mut l, self.reach, &self.reach_len);
-        push(&mut l, &self.dp.opp_weights);
-        let cfg = LaunchConfig {
-            grid_dim: (self.alive_len.max(opp_hands).div_ceil(THREADS).max(1), 1, 1),
-            block_dim: (THREADS, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        // SAFETY: arguments match `begin_traversal`; every buffer holds at
-        // least its logical length (allocated for the larger traversal).
-        unsafe { l.launch(cfg) }?;
-        Ok(())
+        let (reach_len, alive_len) = (self.reach_len, self.alive_len);
+        begin_traversal(self.gpu, self.alive, alive_len, self.reach, reach_len, &self.dp.opp_weights)
     }
 
     /// Clears the alive flags of a group's reach slots: the previous group
@@ -660,14 +444,7 @@ impl Pass<'_> {
             push_mut(&mut l, self.values, &self.values_len);
             push(&mut l, &dp.my_cards);
             push(&mut l, &dp.same);
-            push(&mut l, &dp.opp_off);
-            push(&mut l, &dp.opp_len);
-            push(&mut l, &dp.opp_order);
-            push(&mut l, &dp.card_base);
-            push(&mut l, &dp.card_off);
-            push(&mut l, &dp.card_pos);
-            push(&mut l, &dp.ranges);
-            push(&mut l, &dp.ranks);
+            dp.tables.push(&mut l);
             l.arg(&seg.showdowns.start).arg(&seg.showdowns.count);
             l.arg(&hands).arg(&opp_hands).arg(&pp.tables.max_opp);
             // SAFETY: arguments match `showdown_values_{exact,fast}`; indices (the

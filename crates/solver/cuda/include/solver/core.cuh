@@ -14,6 +14,10 @@
 namespace solver {
 
 using u32 = cuda::std::uint32_t;
+
+/// A non-owning view (`view` below builds one from a kernel argument pair).
+template <class T>
+using Span = cuda::std::span<T>;
 using i16 = cuda::std::int16_t;
 
 /// "No index" marker in index arrays (the host's `plan::NONE`).

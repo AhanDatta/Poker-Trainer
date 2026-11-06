@@ -20,31 +20,10 @@
 //! num_slots)` to the group running. Everything here is checked by
 //! [`validate_segments`] and [`validate_player_schedule`].
 
-use super::{at, ensure, invalid, to_u32, Kind, LevelRange, Plan, PlayerPlan, Role, CHANCE, NONE};
+use super::{at, ensure, invalid, to_u32, Kind, LevelRange, Plan, PlayerPlan, Role, Span, CHANCE, NONE};
 use crate::cfr::{fold_payoff, showdown_payoffs, Ctx};
 use crate::gpu::GpuError;
 use std::ops::Range;
-
-/// `[start, start + count)` of some list.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Span {
-    pub start: u32,
-    pub count: u32,
-}
-
-impl Span {
-    pub(crate) fn range(self) -> Range<usize> {
-        self.start as usize..self.start as usize + self.count as usize
-    }
-
-    fn end(self) -> u64 {
-        u64::from(self.start) + u64::from(self.count)
-    }
-
-    fn of(start: usize, end: usize, what: &str) -> Result<Span, GpuError> {
-        Ok(Span { start: to_u32(start, what)?, count: to_u32(end.saturating_sub(start), what)? })
-    }
-}
 
 /// One segment of one player's traversal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

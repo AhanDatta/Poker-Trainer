@@ -14,6 +14,9 @@ MSVC as the host compiler. A built binary needs only the NVIDIA driver.
 Experimental. `Solver::use_gpu(precision)` (with `--features gpu`) moves a
 solve to the GPU: river, turn and flop roots, with `f32` or 16-bit
 (compressed) storage, bit-identical to the CPU with `GpuPrecision::Exact`.
+`MultiSolver::use_gpu(GpuPrecision::Exact)` does the same for three-player
+solves, so far with independent opponents (`exact_removal` off), f32
+storage and whole trees (see "Three-player solves").
 
 GPU memory holds the regret/strategy storage, the plan, and scratch buffers:
 opponent reach per "slot" and one row of values per node. When the whole
@@ -31,22 +34,32 @@ is declined (`GpuError::OutOfMemory`) and stays on the CPU.
 | `include/solver/strategy.cuh` | per-hand regret matching and normalization | `cfr::regret_match_into`, `cfr::normalize_in_place` |
 | `include/solver/double_float.cuh` | double-single arithmetic and the `Accumulator` vocabulary (f64 or double-single) of the terminal kernels | |
 | `include/solver/compressed.cuh` | 16-bit storage: decoding views, encoding with the CPU's rounding and saturation | `storage::Storage::Compressed` |
-| `kernels/traverse.cu` | level-by-level traversal: opponent and chance splits (top-down), own-node regret update, opponent and chance sums (bottom-up) | `river::run`, `cfr::chance`, `cfr::own_node_update` |
+| `include/solver/traversal.cuh` | the per-node traversal steps (opponent and chance splits, own update, opponent and chance sums), parameterized by liveness: one opponent slot per node heads-up, two with three players | `river::run`, `cfr::chance`, `cfr::own_node_update`, `multi::cfr::traverse` |
+| `include/solver/terminal.cuh` | terminal-kernel building blocks: chunked sums, per-card prefix sums, a board's strength-order prefix sums (`strength_sums`) | |
+| `kernels/traverse.cu` | heads-up level-by-level traversal: the steps of `traversal.cuh` over one level's nodes | `river::run`, `cfr::chance`, `cfr::own_node_update` |
 | `kernels/traverse_compressed.cu` | the two storage-touching traversal steps for 16-bit storage, one block per node (a block-wide max sets each node's new scale) | `Storage::update_regrets`, `Storage::update_strat` |
 | `kernels/terminal.cu` | fold and showdown values (card removal by inclusion–exclusion, prefix sums), with the rounding of the CPU evaluator that handles each terminal | `eval::fold_batch` / `eval_fold`, `eval::showdown_batch` / `eval_showdown` |
+| `kernels/multi_traverse.cu` | three-player level-by-level traversal: each opponent's splits, two-slot chance splits, own update, sums | `multi::cfr::traverse` |
+| `kernels/multi_terminal.cu` | three-player leaves with independent opponents: fixed payoffs and showdowns | `multi::cfr::pay_all`, `multi::cfr::independent_showdown` |
 | `kernels/regret.cu` | standalone regret matching | `cfr::regret_match_into` |
 | `kernels/selftest.cu` | deliberate out-of-bounds read for `tests/gpu_fault.rs` | |
 | `kernels/double_float_check.cu` | double-single operations for the tests against host f64 | |
 
-The host side (`src/gpu/`): `plan.rs` flattens the tree into arrays and
-per-board showdown lookups, `plan/schedule.rs` splits it into segments and
-lays out a level schedule per traverser, and both validate every index the
-kernels will use; `engine.rs` uploads the plan once and launches one kernel
-per tree level (and segment); `Solver::solve` drives the same loop (iterations,
-exploitability checks, cancellation) for both backends. `multi_plan.rs` is the
-3-way (`solver::multi`) plan: one reach-slot space per opponent, subtrees cut
-off after the traverser's fold, strategy-updater marks, and its own
-validation; it has no kernels yet (see `docs/ROADMAP.md`, section 2).
+The host side (`src/gpu/`):
+
+- `plan.rs` flattens a heads-up tree into arrays, `plan/schedule.rs` splits
+  it into segments and lays out a level schedule per traverser, and both
+  validate every index the kernels will use; `engine.rs` uploads the plan
+  once and launches one kernel per tree level (and segment); `Solver::solve`
+  drives the same loop (iterations, exploitability checks, cancellation) for
+  both backends.
+- `multi/plan.rs` (+ `multi/plan/validate.rs`) and `multi/engine.rs` are the
+  same for three-player trees; `MultiSolver::solve` runs either backend
+  through one loop.
+- Shared by both: `tables.rs` (per-board showdown lookups against one
+  opponent), `shared.rs` (encodings, limits, validation helpers),
+  `device.rs` (buffers with their kernel-visible lengths, launch grids,
+  traversal modes, storage upload and download, memory checks).
 
 ## Ground rules
 
@@ -311,16 +324,79 @@ What remains:
   (e.g. several showdowns per block sharing their board's tables).
 - The 16-bit storage kernels are close to the DRAM minimum for their data.
 
+## Three-player solves
+
+`MultiSolver::use_gpu(GpuPrecision::Exact)` moves a 3-way solve to the GPU,
+so far with independent opponents (`exact_removal` off), f32 storage and
+whole trees; anything else is declined with an error and the solve stays on
+the CPU. A GPU failure mid-solve restarts the solve on the CPU, as heads-up.
+
+How a traversal for player `p` maps to kernels (plan: `src/gpu/multi/plan.rs`):
+
+- Two reach-slot spaces, one per opponent (`opponents(p)`). An opponent's
+  node splits only that opponent's reach (`multi_opponent_split`); a chance
+  node splits both (`multi_chance_split`, one launch per opponent, the
+  chance factor on the first one only, as the CPU applies it). A node is
+  alive when both of its slots are (`TwoOpponents`).
+- A player's average strategy accumulates only in the traversal of the next
+  player still in the hand (the plan's `strategy_update` flags).
+- Nodes after `p`'s fold are fixed-payoff leaves, even when they have
+  children; nothing below them is scheduled.
+- Leaves (`multi_terminal.cu`): `multi_fixed_values` computes `pay * c_q *
+  c_r`, each opponent's compatible mass from its per-card lists;
+  `multi_showdown_values` computes `win * p + lose * (c_q * c_r - p)` with
+  `p = b_q * b_r`, the beaten mass from each opponent's strength-order
+  prefix sums (the heads-up lookup layout). A showdown block handles the
+  first opponent, keeps its two values per hand in registers (at most 6
+  hands per thread: 1326 / 256), then reuses the shared memory for the
+  second. f64 sums only so far; a double-single path waits until these are
+  settled, as heads-up.
+- The per-node steps are the heads-up kernels' (`traversal.cuh`); the
+  showdown prefix sums are shared too (`terminal.cuh`). The CPU evaluates
+  every 3-way leaf one at a time when the opponents are independent (it
+  batches river subtrees only with exact removal), so there is one
+  rounding to mirror.
+
+Checked bit for bit against the CPU (`src/gpu/multi/engine/tests.rs`): root
+values in every mode and CFR iterations from random storage on every 3-way
+test spot (rivers, turns, a sampled flop, all-in runouts, a player folded
+at the root), 5-iteration solves with their progress reports, a solve to
+1% of the pot, a GPU solve continuing a CPU one, and 32 random spots
+(property test). No value differed. Eighteen planted bugs (chance factor on
+the wrong opponents, strategy sums updated in every or no traversal,
+liveness from one opponent, a missing opponent or identical combo in the
+compatible mass, folded opponents or board-blocked hands mishandled at
+showdowns, ties counted fully, blocked hands kept in chance sums, dead
+nodes updated, argument mix-ups, the convergence over two players) were
+each caught by four or more tests, one (the compatible mass not clamped at
+0) by one. memcheck, initcheck, synccheck and racecheck: no errors.
+
+Chart ranges (CO opens, BTN and BB call), 8 sampled turns and 4 sampled
+rivers, independent opponents, f32 storage on both sides, 100 iterations
+with a convergence check every 20 (`multibench`; `F32=1` vs `GPU=1`), on the
+machine above:
+
+| Spot | CPU (20 threads) | GPU | Speedup |
+|---|---|---|---|
+| flop `Js9s4d` (62.7M strategy cells) | 262 ms/iteration | 82 ms/iteration | 3.2× |
+| turn `Js9s4d2c` (2.2M cells) | 33.1 ms/iteration | 4.8 ms/iteration | 6.9× |
+
+Both reach the same convergence at every check (0.245% and 0.157% of the
+pot after 100 iterations). GPU setup (plan and upload): 0.78 s on the flop,
+0.17 s on the turn. Not tuned yet: no fused or split launches, f64 sums
+only.
+
 ## Running the GPU checks
 
 ```bash
 cargo test -p solver --features gpu gpu::
 ```
 
-`gpu::plan` tests need no device: they check the host-side plan, including a
-Rust reference of the showdown/fold formula built from the plan's lookup tables
-against `eval_showdown` / `eval_fold`. `gpu::engine` tests compare GPU
-traversals and solves with the CPU solver.
+`gpu::plan` and `gpu::multi::plan` tests need no device: they check the
+host-side plans, including Rust references of the terminal formulas built
+from the plans' lookup tables against the CPU evaluators. `gpu::engine` and
+`gpu::multi::engine` tests compare GPU traversals and solves with the CPU
+solvers.
 
 ```bash
 cargo test -p solver --features gpu --no-run --message-format=short

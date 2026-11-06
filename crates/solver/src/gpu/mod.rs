@@ -28,15 +28,18 @@ use std::sync::Arc;
 #[cfg(test)]
 mod tests;
 
+mod device;
 mod engine;
-// The 3-way plan has no engine yet (ROADMAP 2.2); only its tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
-mod multi_plan;
+mod multi;
 mod plan;
+mod shared;
+mod tables;
 #[cfg(test)]
 mod testutil;
 
 pub(crate) use engine::{Engine, HostStorage};
+pub(crate) use multi::engine::MultiEngine;
+pub(crate) use multi::plan::MultiPlan;
 
 /// Operations of the double-single test kernel (`Op` in
 /// double_float_check.cu).
@@ -72,6 +75,8 @@ static SELFTEST_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/selftes
 static TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse.fatbin"));
 static TRAVERSE_COMPRESSED_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse_compressed.fatbin"));
 static TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.fatbin"));
+static MULTI_TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_traverse.fatbin"));
+static MULTI_TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_terminal.fatbin"));
 static DOUBLE_FLOAT_CHECK_IMAGE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/double_float_check.fatbin"));
 
@@ -222,6 +227,14 @@ struct Kernels {
     /// Terminal kernels per precision: `[exact, fast]`.
     fold_values: [CudaFunction; 2],
     showdown_values: [CudaFunction; 2],
+    /// Three-player traversal and leaf kernels (multi_traverse.cu, multi_terminal.cu).
+    multi_opponent_split: CudaFunction,
+    multi_chance_split: CudaFunction,
+    multi_own_update: CudaFunction,
+    multi_opponent_sum: CudaFunction,
+    multi_chance_sum: CudaFunction,
+    multi_fixed_values: CudaFunction,
+    multi_showdown_values: CudaFunction,
     double_float_check: CudaFunction,
     double_float_sum: CudaFunction,
 }
@@ -264,6 +277,8 @@ impl Gpu {
         let traverse_compressed = ctx.load_module(Ptx::from_binary(TRAVERSE_COMPRESSED_IMAGE.to_vec()))?;
         let terminal = ctx.load_module(Ptx::from_binary(TERMINAL_IMAGE.to_vec()))?;
         let double_float = ctx.load_module(Ptx::from_binary(DOUBLE_FLOAT_CHECK_IMAGE.to_vec()))?;
+        let multi_traverse = ctx.load_module(Ptx::from_binary(MULTI_TRAVERSE_IMAGE.to_vec()))?;
+        let multi_terminal = ctx.load_module(Ptx::from_binary(MULTI_TERMINAL_IMAGE.to_vec()))?;
         let kernels = Kernels {
             regret_match_f32: regret.load_function("regret_match_f32")?,
             regret_match_i16: regret.load_function("regret_match_i16")?,
@@ -282,6 +297,13 @@ impl Gpu {
                 terminal.load_function("showdown_values_exact")?,
                 terminal.load_function("showdown_values_fast")?,
             ],
+            multi_opponent_split: multi_traverse.load_function("multi_opponent_split")?,
+            multi_chance_split: multi_traverse.load_function("multi_chance_split")?,
+            multi_own_update: multi_traverse.load_function("multi_own_update")?,
+            multi_opponent_sum: multi_traverse.load_function("multi_opponent_sum")?,
+            multi_chance_sum: multi_traverse.load_function("multi_chance_sum")?,
+            multi_fixed_values: multi_terminal.load_function("multi_fixed_values")?,
+            multi_showdown_values: multi_terminal.load_function("multi_showdown_values")?,
             double_float_check: double_float.load_function("double_float_check")?,
             double_float_sum: double_float.load_function("double_float_sum")?,
         };
