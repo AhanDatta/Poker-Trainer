@@ -26,7 +26,7 @@
 //! subtrees after the traverser folded: its payoff there is fixed.
 
 pub(crate) mod cfr;
-mod exact;
+pub(crate) mod exact;
 pub(crate) mod hands;
 mod river;
 pub(crate) mod tree;
@@ -443,23 +443,21 @@ impl MultiSolver {
     }
 
     /// Moves solves to the GPU until [`Self::release_gpu`] (experimental;
-    /// so far only with independent opponents, `exact_removal` off, f32
-    /// storage and `GpuPrecision::Exact`: anything else is an error and
-    /// solves stay on the CPU). Bit-identical to the CPU. Results are copied
-    /// back when `solve` returns, after which `query` and the other read
-    /// methods work as usual. If the GPU fails during a solve, the solver
-    /// discards the GPU state, restarts the solve from scratch on the CPU,
-    /// and [`Self::gpu_error`] says what happened.
+    /// so far only with f32 storage, and `GpuPrecision::Fast` only with
+    /// exact removal: anything else is an error and solves stay on the
+    /// CPU). With `GpuPrecision::Exact`, bit-identical to the CPU; `Fast`
+    /// sums the exact-removal leaves in double-single (each value within
+    /// one f32 rounding of the CPU's). Results are copied back when `solve`
+    /// returns, after which `query` and the other read methods work as
+    /// usual. If the GPU fails during a solve, the solver discards the GPU
+    /// state, restarts the solve from scratch on the CPU, and
+    /// [`Self::gpu_error`] says what happened.
     #[cfg(feature = "gpu")]
     pub fn use_gpu(&mut self, precision: crate::gpu::GpuPrecision) -> Result<(), crate::gpu::GpuError> {
-        if precision != crate::gpu::GpuPrecision::Exact {
-            return Err(crate::gpu::GpuError::InvalidInput(
-                "3-way GPU solves only have the exact precision so far".into(),
-            ));
-        }
         let device = crate::gpu::Gpu::new()?;
         let plan = crate::gpu::MultiPlan::build(&self.ctx())?;
-        self.gpu = Some(Box::new(crate::gpu::MultiEngine::new(device, plan, self.store.gpu_view())?));
+        let engine = crate::gpu::MultiEngine::new(device, plan, self.store.gpu_view(), precision)?;
+        self.gpu = Some(Box::new(engine));
         self.gpu_error = None;
         Ok(())
     }

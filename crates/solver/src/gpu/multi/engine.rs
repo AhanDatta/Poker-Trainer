@@ -1,50 +1,34 @@
 //! Device side of a three-player GPU solve (`solver::multi`): the plan and
 //! the regret/strategy storage are uploaded once; each traversal is a fixed
 //! sequence of level-by-level launches on one stream (see
-//! `cuda/kernels/multi_traverse.cu` and `multi_terminal.cu`).
+//! `cuda/kernels/multi_traverse.cu` and `multi_leaves.cu`).
 //!
-//! So far: independent opponents (`exact_removal` off) and f32 storage,
-//! bit-identical to the CPU. Exact removal, 16-bit storage and tree
-//! splitting come later (ROADMAP 2.3, 2.4).
+//! So far: f32 storage and whole trees, either terminal model. With
+//! `GpuPrecision::Exact` everything is bit-identical to the CPU; `Fast`
+//! sums the leaves in double-single. 16-bit storage and tree splitting come
+//! later (ROADMAP 2.4).
 
+mod leaves;
 #[cfg(test)]
 mod tests;
 
 use super::plan::{MultiPlan, MultiPlayerPlan, OpponentView};
 use crate::cfr::{Discount, Mode};
-use crate::gpu::device::{
-    begin_traversal, check_memory, per_hand_grid, per_terminal_grid, push, push_mut, Buffer, DeviceTables,
-    HostStorage, ModeArgs, THREADS,
-};
-use crate::gpu::shared::{showdown_shared_bytes, SHOWDOWN_SHARED_LIMIT};
-use crate::gpu::{invalid, Gpu, GpuError};
+use crate::gpu::device::{begin_traversal, check_memory, per_hand_grid, push, push_mut, Buffer, HostStorage, ModeArgs};
+use crate::gpu::{invalid, Gpu, GpuError, GpuPrecision};
 use crate::multi::N;
 use cudarc::driver::{CudaSlice, LaunchArgs, PushKernelArg};
 
 /// One opponent of a traverser on the device (`OpponentView`).
 struct DeviceOpponent {
-    seat: u32,
     hands: u32,
     weights: Buffer<f32>,
     cards: Buffer<u32>,
-    same: Buffer<u32>,
-    card_off: Buffer<u32>,
-    card_hands: Buffer<u32>,
-    tables: DeviceTables,
 }
 
 impl DeviceOpponent {
     fn upload(gpu: &Gpu, v: &OpponentView) -> Result<DeviceOpponent, GpuError> {
-        Ok(DeviceOpponent {
-            seat: v.player,
-            hands: v.hands,
-            weights: gpu.upload(&v.weights)?,
-            cards: gpu.upload(&v.cards)?,
-            same: gpu.upload(&v.same)?,
-            card_off: gpu.upload(&v.card_off)?,
-            card_hands: gpu.upload(&v.card_hands)?,
-            tables: DeviceTables::upload(gpu, &v.tables)?,
-        })
+        Ok(DeviceOpponent { hands: v.hands, weights: gpu.upload(&v.weights)?, cards: gpu.upload(&v.cards)? })
     }
 }
 
@@ -59,7 +43,6 @@ struct DevicePlayer {
     fixed: Buffer<u32>,
     fixed_payoff: Buffer<f64>,
     showdowns: Buffer<u32>,
-    showdown_table: Buffer<u32>,
     win: Buffer<f64>,
     lose: Buffer<f64>,
     my_cards: Buffer<u32>,
@@ -82,7 +65,6 @@ impl DevicePlayer {
             fixed: gpu.upload(&pp.fixed)?,
             fixed_payoff: gpu.upload(&pp.fixed_payoff)?,
             showdowns: gpu.upload(&pp.showdowns)?,
-            showdown_table: gpu.upload(&pp.showdown_table)?,
             win: gpu.upload(&pp.win)?,
             lose: gpu.upload(&pp.lose)?,
             my_cards: gpu.upload(&pp.my_cards)?,
@@ -98,7 +80,6 @@ struct DeviceTree {
     offsets: Buffer<u32>,
     cards: Buffer<u32>,
     chance_factor: Buffer<f32>,
-    folded: Buffer<u32>,
     /// Per node: its value row (one per node: the tree isn't split yet).
     rows: Buffer<u32>,
 }
@@ -112,7 +93,6 @@ impl DeviceTree {
             offsets: gpu.upload(&plan.offset)?,
             cards: gpu.upload(&plan.card)?,
             chance_factor: gpu.upload(&plan.chance_factor)?,
-            folded: gpu.upload(&plan.folded)?,
             rows: gpu.upload(&rows)?,
         })
     }
@@ -132,17 +112,20 @@ pub(crate) struct MultiEngine {
     alive: [CudaSlice<u32>; 2],
     /// One value row per node, sized for the largest hand count.
     values: CudaSlice<f32>,
+    /// The leaf kernels' lists, groups and scratch.
+    leaves: leaves::DeviceLeaves,
 }
 
 impl MultiEngine {
     /// Uploads a validated plan and the current storage. Fails (for a CPU
-    /// fallback) on what the GPU can't run yet: exact card removal between
-    /// the opponents and 16-bit storage.
-    pub(crate) fn new(gpu: Gpu, plan: MultiPlan, host: HostStorage<'_>) -> Result<MultiEngine, GpuError> {
+    /// fallback) on what the GPU can't run yet: 16-bit storage.
+    pub(crate) fn new(
+        gpu: Gpu,
+        plan: MultiPlan,
+        host: HostStorage<'_>,
+        precision: GpuPrecision,
+    ) -> Result<MultiEngine, GpuError> {
         plan.validate()?;
-        if plan.exact || plan.batch_river {
-            return Err(invalid("3-way GPU solves need independent opponents (exact_removal off) for now"));
-        }
         let storage_bytes = host.check(plan.storage_len, plan.num_scale_slots)?;
         let HostStorage::F32 { regrets, sums } = host else {
             return Err(invalid("3-way GPU solves need f32 storage for now"));
@@ -159,7 +142,8 @@ impl MultiEngine {
             }
         }
         let values_len = plan.num_nodes as usize * hands;
-        let scratch = 4 * (reach_len.iter().sum::<usize>() + alive_len.iter().sum::<usize>() + values_len) as u64;
+        let scratch = 4 * (reach_len.iter().sum::<usize>() + alive_len.iter().sum::<usize>() + values_len) as u64
+            + leaves::scratch_bytes(&plan)?;
         check_memory(&gpu, plan.device_bytes() + storage_bytes + scratch)?;
         let [p0, p1, p2] = &plan.players;
         let ([r0, r1], [a0, a1]) = (reach_len, alive_len);
@@ -171,6 +155,7 @@ impl MultiEngine {
             reach: [gpu.zeros(r0)?, gpu.zeros(r1)?],
             alive: [gpu.zeros(a0)?, gpu.zeros(a1)?],
             values: gpu.zeros(values_len)?,
+            leaves: leaves::DeviceLeaves::upload(&gpu, &plan, precision)?,
             gpu,
             plan,
         };
@@ -241,7 +226,7 @@ impl MultiEngine {
     /// Enqueues one traversal by player `p`: begin, levels top-down, the
     /// leaves, levels bottom-up. The root's values end up in row 0.
     fn traverse(&mut self, p: usize, mode: Mode) -> Result<(), GpuError> {
-        let MultiEngine { gpu, plan, tree, players, regrets, sums, reach, alive, values } = self;
+        let MultiEngine { gpu, plan, tree, players, regrets, sums, reach, alive, values, leaves, .. } = self;
         let plan: &MultiPlan = plan;
         let (Some(pp), Some(dp)) = (plan.players.get(p), players.get(p)) else {
             return Err(invalid("player out of range"));
@@ -263,6 +248,8 @@ impl MultiEngine {
             reach,
             alive,
             values,
+            leaves,
+            p,
             m: ModeArgs::new(mode),
             reach_len,
             alive_len: pp.num_slots,
@@ -287,6 +274,8 @@ struct Pass<'a> {
     reach: &'a mut [CudaSlice<f32>; 2],
     alive: &'a mut [CudaSlice<u32>; 2],
     values: &'a mut CudaSlice<f32>,
+    leaves: &'a mut leaves::DeviceLeaves,
+    p: usize,
     m: ModeArgs,
     reach_len: [u32; 2],
     alive_len: [u32; 2],
@@ -384,59 +373,29 @@ impl Pass<'_> {
 
     /// Fixed-payoff leaves and showdowns.
     fn leaves(&mut self) -> Result<(), GpuError> {
-        let Pass { gpu, tree, pp, dp, reach, alive, values, reach_len, alive_len, values_len, .. } = self;
-        let (kernels, stream, hands) = (&gpu.kernels, &gpu.stream, pp.hands);
-        let [v0, v1] = &pp.opponents;
-        let opponents = Opponents { dp, reach, alive, reach_len, alive_len };
-        let count = |n: usize| u32::try_from(n).map_err(|_| invalid("too many leaves"));
-        let fixed = count(pp.fixed.len())?;
-        if fixed > 0 {
-            let shared = v0.hands.max(v1.hands).checked_mul(4).ok_or_else(|| invalid("fixed-leaf shared memory"))?;
-            let mut l = stream.launch_builder(&kernels.multi_fixed_values);
-            push(&mut l, &dp.fixed);
-            push(&mut l, &dp.fixed_payoff);
-            push(&mut l, &tree.rows);
-            push_mut(&mut l, values, values_len);
-            push(&mut l, &dp.my_cards);
-            l.arg(&hands);
-            opponents.push_leaf_args(&mut l)?;
-            // SAFETY: arguments match `multi_fixed_values`; indices are
-            // validated, and the dynamic shared memory holds either
-            // opponent's reach.
-            unsafe { l.launch(per_terminal_grid(fixed, THREADS, shared)) }?;
-        }
-        let showdowns = count(pp.showdowns.len())?;
-        if showdowns > 0 {
-            let max_opp = v0.tables.max_opp.max(v1.tables.max_opp);
-            let shared = showdown_shared_bytes(max_opp);
-            if shared > u64::from(SHOWDOWN_SHARED_LIMIT) {
-                return Err(invalid("showdown lists too long for shared memory"));
-            }
-            let shared = shared as u32;
-            let mut l = stream.launch_builder(&kernels.multi_showdown_values);
-            push(&mut l, &dp.showdowns);
-            push(&mut l, &dp.showdown_table);
-            push(&mut l, &dp.win);
-            push(&mut l, &dp.lose);
-            push(&mut l, &tree.folded);
-            push(&mut l, &tree.rows);
-            push_mut(&mut l, values, values_len);
-            push(&mut l, &dp.my_cards);
-            l.arg(&hands).arg(&max_opp);
-            opponents.push_leaf_args(&mut l)?;
-            // SAFETY: arguments match `multi_showdown_values`; indices are
-            // validated and the dynamic shared memory is sized for `max_opp`.
-            unsafe { l.launch(per_terminal_grid(showdowns, THREADS, shared)) }?;
-        }
-        Ok(())
+        let Pass { gpu, tree, pp, dp, reach, alive, values, reach_len, alive_len, values_len, leaves, p, .. } = self;
+        let args = leaves::Leaves {
+            gpu,
+            tree,
+            dp,
+            p: *p,
+            hands: pp.hands,
+            reach,
+            reach_len,
+            alive,
+            alive_len,
+            values,
+            values_len,
+        };
+        leaves::launch(args, leaves)
     }
 
     /// Bottom-up, deepest level first: own updates, opponent sums, chance sums.
     fn bottom_up(&mut self) -> Result<(), GpuError> {
-        let Pass { gpu, plan, tree, pp, dp, regrets, sums, reach, alive, values, m, reach_len, alive_len, values_len } =
+        let Pass { gpu, plan, tree, pp, dp, regrets, sums, alive, values, m, alive_len, values_len, .. } =
             self;
         let (kernels, stream, hands) = (&gpu.kernels, &gpu.stream, pp.hands);
-        let opponents = Opponents { dp, reach, alive, reach_len, alive_len };
+        let opponents = Opponents { dp, alive, alive_len };
         for lv in pp.levels.iter().rev() {
             if lv.own.count > 0 {
                 let mut l = stream.launch_builder(&kernels.multi_own_update);
@@ -491,12 +450,10 @@ impl Pass<'_> {
 }
 
 /// Read access to both opponents' reach state, for the launches that only
-/// read it (liveness, leaves).
+/// read their liveness.
 struct Opponents<'p> {
     dp: &'p DevicePlayer,
-    reach: &'p [CudaSlice<f32>; 2],
     alive: &'p [CudaSlice<u32>; 2],
-    reach_len: &'p [u32; 2],
     alive_len: &'p [u32; 2],
 }
 
@@ -506,22 +463,6 @@ impl<'p> Opponents<'p> {
         for k in 0..2 {
             push(l, nth(&self.dp.slots, k)?);
             l.arg(nth(self.alive, k)?).arg(nth(self.alive_len, k)?);
-        }
-        Ok(())
-    }
-
-    /// Both opponents in the leaf kernels' order (`SOLVER_OPPONENT_PARAMS`).
-    fn push_leaf_args(&self, l: &mut LaunchArgs<'p>) -> Result<(), GpuError> {
-        for k in 0..2 {
-            let view = nth(&self.dp.opponents, k)?;
-            l.arg(&view.seat).arg(&view.hands);
-            push(l, nth(&self.dp.slots, k)?);
-            l.arg(nth(self.alive, k)?).arg(nth(self.alive_len, k)?);
-            l.arg(nth(self.reach, k)?).arg(nth(self.reach_len, k)?);
-            push(l, &view.same);
-            push(l, &view.card_off);
-            push(l, &view.card_hands);
-            view.tables.push(l);
         }
         Ok(())
     }

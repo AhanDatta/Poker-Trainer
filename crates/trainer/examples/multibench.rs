@@ -5,9 +5,9 @@
 //! Env: TURNS / RIVERS (sampled cards, default 8 / 4), EXACT=1 (every card),
 //! EXACT_REMOVAL=1 (card removal between opponents), COMPARE=1 (both, judged
 //! in the exact game), RANGES="r0|r1|r2" (instead of the chart ranges),
-//! GPU=1 (solve on the GPU; needs `--features gpu`, independent opponents and
-//! f32 storage, which it implies), F32=1 (f32 storage on the CPU too, to
-//! compare like with like).
+//! GPU=1 (solve on the GPU; needs `--features gpu` and f32 storage, which it
+//! implies; FAST=1 for double-single leaf sums), F32=1 (f32 storage on the
+//! CPU too, to compare like with like).
 
 use holdem::card::parse_cards;
 use solver::multi::{MultiConfig, MultiSolver, MultiState};
@@ -159,11 +159,14 @@ fn main() {
     }
 }
 
-/// `GPU=1`: solve on the GPU (f64 terminal sums, bit-identical to the CPU).
+/// `GPU=1`: solve on the GPU (f64 leaf sums, bit-identical to the CPU;
+/// with `FAST=1`, double-single).
 #[cfg(feature = "gpu")]
 fn use_gpu(solver: &mut MultiSolver) {
+    use solver::gpu::GpuPrecision;
     let t = Instant::now();
-    match solver.use_gpu(solver::gpu::GpuPrecision::Exact) {
+    let precision = if std::env::var("FAST").is_ok() { GpuPrecision::Fast } else { GpuPrecision::Exact };
+    match solver.use_gpu(precision) {
         Ok(()) => println!("on the GPU (setup {:.2?})", t.elapsed()),
         Err(e) => {
             eprintln!("GPU unavailable: {e}");

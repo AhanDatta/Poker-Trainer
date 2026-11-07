@@ -2,7 +2,7 @@
 
 use super::{nth, opponent_index, updater, MultiPlan, MultiPlayerPlan, OpponentView, Role, ALL_FOLDED, CHANCE};
 use crate::gpu::shared::{
-    at, check_offsets, ensure, to_u32, unpack_cards, Span, CARDS, MAX_ACTIONS, MAX_HANDS, MAX_PAYOFF, MAX_WEIGHT,
+    at, ensure, to_u32, unpack_cards, Span, CARDS, MAX_ACTIONS, MAX_HANDS, MAX_PAYOFF, MAX_WEIGHT,
     NONE,
 };
 use crate::gpu::{invalid, GpuError};
@@ -48,6 +48,10 @@ impl MultiPlan {
         }
         for p in 0..N {
             context(|| format!("player {p}"), self.validate_player(p))?;
+        }
+        context(|| "leaf lists".into(), self.lists.validate(self.num_tables, &self.players))?;
+        for (p, pp) in self.players.iter().enumerate() {
+            context(|| format!("player {p}'s leaf groups"), pp.leaves.validate(self, pp, p))?;
         }
         // Each decision node's average strategy is accumulated in exactly
         // one traversal: its strategy updater's.
@@ -180,42 +184,23 @@ impl MultiPlan {
         to_u32(nn * n as usize, "value buffer")?;
         let (q, r) = opponents(p);
         for (k, (view, seat)) in pp.opponents.iter().zip([q, r]).enumerate() {
-            context(|| format!("opponent {k}"), self.validate_view(pp, view, seat))?;
+            context(|| format!("opponent {k}"), self.validate_view(view, seat))?;
             to_u32(*nth(&pp.num_slots, k, "opponent")? as usize * view.hands as usize, "reach buffer")?;
         }
         self.validate_schedule(p, pp)
     }
 
-    fn validate_view(&self, pp: &MultiPlayerPlan, view: &OpponentView, seat: usize) -> Result<(), GpuError> {
+    fn validate_view(&self, view: &OpponentView, seat: usize) -> Result<(), GpuError> {
         ensure(view.player as usize == seat, || format!("seat {} instead of {seat}", view.player))?;
         let other = nth(&self.players, seat, "player")?;
         let nq = view.hands;
         ensure(nq == other.hands && view.cards == other.my_cards, || {
             "hands differ from the player's own".into()
         })?;
-        ensure(view.same.len() == pp.hands as usize, || "identical-combo array".into())?;
-        ensure(view.same.iter().all(|&j| j == NONE || j < nq), || {
-            "identical-combo index out of range".into()
-        })?;
         ensure(view.weights.len() == nq as usize, || "weights".into())?;
         ensure(view.weights.iter().all(|w| w.is_finite() && (0.0..=MAX_WEIGHT).contains(w)), || {
             "bad weight".into()
-        })?;
-        check_offsets(&view.card_off, view.card_hands.len(), "card lists")?;
-        // Each card's list holds exactly hands with that card (the chance
-        // split zeroes them).
-        for c in 0..CARDS {
-            let (b, e) = (
-                at(&view.card_off, c, "card_off")? as usize,
-                at(&view.card_off, c + 1, "card_off")? as usize,
-            );
-            let list = view.card_hands.get(b..e).ok_or_else(|| invalid("card list out of range"))?;
-            for &j in list {
-                let (c1, c2) = unpack_cards(at(&view.cards, j as usize, "card list entry")?);
-                ensure(c1 == c || c2 == c, || format!("card {c}'s list holds hand {j} without it"))?;
-            }
-        }
-        view.tables.validate(self.num_tables, &pp.my_cards, nq)
+        })
     }
 
     /// Checks player `p`'s schedule: exactly the nodes the CPU traversal

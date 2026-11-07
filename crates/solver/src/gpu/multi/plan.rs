@@ -1,7 +1,7 @@
 //! Host-side plan of a three-player GPU traversal (`solver::multi`): the
 //! tree flattened into the arrays the kernels index, a level schedule per
 //! traverser with one reach slot per opponent, terminal lists with their
-//! payoffs, and per-opponent showdown lookup tables (independent removal).
+//! payoffs, and the leaf kernels' hand lists and groups ([`leaves`]).
 //!
 //! What a traversal by player `p` does, and so what the plan encodes (the
 //! CPU twin is `multi::cfr::traverse`, with `multi::river::subtree` for
@@ -29,7 +29,6 @@
 //! out-of-bounds access on the device.
 
 use crate::gpu::shared::{at, ensure, pack_cards, to_u32, Span, CARDS, NONE};
-use crate::gpu::tables::{Ranked, Tables};
 use crate::gpu::{invalid, GpuError};
 use crate::multi::cfr::{payoffs, strategy_updater, Ctx};
 use crate::multi::tree::{Edge, Kind, Node};
@@ -62,19 +61,8 @@ pub(crate) struct OpponentView {
     pub hands: u32,
     /// The opponent's hands' cards, packed `c1 | c2 << 8`.
     pub cards: Vec<u32>,
-    /// Per traverser hand: the index of the identical combo in this
-    /// opponent's list, or `NONE`.
-    pub same: Vec<u32>,
-    /// For each card, the range of `card_hands` listing this opponent's
-    /// hands that hold it (53 offsets).
-    pub card_off: Vec<u32>,
-    pub card_hands: Vec<u32>,
     /// The opponent's root weights (its reach at the root).
     pub weights: Vec<f32>,
-    /// Showdown lookup of the traverser against this opponent, per board
-    /// (layout of the heads-up [`Tables`]): enough for the independent
-    /// model's `Table::beat`.
-    pub tables: Tables,
 }
 
 /// Everything a traversal by one player needs.
@@ -115,6 +103,8 @@ pub(crate) struct MultiPlayerPlan {
     pub showdown_table: Vec<u32>,
     pub win: Vec<f64>,
     pub lose: Vec<f64>,
+    /// The leaf kernels' warps.
+    pub leaves: LeafGroups,
 }
 
 /// The flattened three-player tree plus a plan per traverser.
@@ -161,6 +151,8 @@ pub(crate) struct MultiPlan {
     pub exact: bool,
     pub num_tables: u32,
     pub players: [MultiPlayerPlan; N],
+    /// The hand lists of the leaf kernels' sweeps.
+    pub lists: SweepLists,
 }
 
 /// The role of an expanded node in one player's traversal.
@@ -273,6 +265,15 @@ impl MultiPlan {
             MultiPlayerPlan::build(ctx, &plan, 1)?,
             MultiPlayerPlan::build(ctx, &plan, 2)?,
         ];
+        plan.lists = SweepLists::build(ctx)?;
+        let groups = [
+            LeafGroups::build(&plan, &plan.players[0])?,
+            LeafGroups::build(&plan, &plan.players[1])?,
+            LeafGroups::build(&plan, &plan.players[2])?,
+        ];
+        for (pp, g) in plan.players.iter_mut().zip(groups) {
+            pp.leaves = g;
+        }
         plan.validate()?;
         Ok(plan)
     }
@@ -300,19 +301,7 @@ impl MultiPlan {
             + b(&self.folded)
             // The engine's value-row map (one row per node).
             + b(&self.actions);
-        let tables = |t: &Tables| {
-            b(&t.opp_off)
-                + b(&t.opp_len)
-                + b(&t.opp_order)
-                + b(&t.card_base)
-                + b(&t.card_off)
-                + b(&t.card_pos)
-                + b(&t.ranges)
-                + b(&t.ranks)
-        };
-        let view = |v: &OpponentView| {
-            b(&v.cards) + b(&v.same) + b(&v.card_off) + b(&v.card_hands) + b(&v.weights) + tables(&v.tables)
-        };
+        let view = |v: &OpponentView| b(&v.cards) + b(&v.weights);
         let player = |pp: &MultiPlayerPlan| {
             pp.slot.iter().chain(&pp.child_slot).chain(&pp.opp_nodes).map(|v| b(v)).sum::<u64>()
                 + b(&pp.own_nodes)
@@ -326,8 +315,9 @@ impl MultiPlan {
                 + b(&pp.lose)
                 + b(&pp.my_cards)
                 + pp.opponents.iter().map(view).sum::<u64>()
+                + pp.leaves.device_bytes()
         };
-        tree + self.players.iter().map(player).sum::<u64>()
+        tree + self.players.iter().map(player).sum::<u64>() + self.lists.device_bytes()
     }
 
     /// Children of node `i` (empty for terminals).
@@ -390,7 +380,7 @@ impl MultiPlayerPlan {
         let mut pp = MultiPlayerPlan {
             hands: to_u32(my_cards.len(), "hands")?,
             my_cards: my_cards.iter().map(|&(a, b)| pack_cards(a, b)).collect(),
-            opponents: [OpponentView::build(ctx, p, q)?, OpponentView::build(ctx, p, r)?],
+            opponents: [OpponentView::build(ctx, q)?, OpponentView::build(ctx, r)?],
             ..MultiPlayerPlan::default()
         };
         pp.build_schedule(ctx, plan, p)?;
@@ -516,41 +506,21 @@ impl MultiPlayerPlan {
 
 impl OpponentView {
     /// Opponent `o` as traverser `p` sees it.
-    fn build(ctx: &Ctx, p: usize, o: usize) -> Result<OpponentView, GpuError> {
-        let hands = ctx.hands;
-        let cards = nth(&hands.cards, o, "player")?;
-        let mut off = Vec::with_capacity(CARDS + 1);
-        let mut list = Vec::with_capacity(2 * cards.len());
-        for held in nth(&hands.blocked, o, "player")?.iter().take(CARDS) {
-            off.push(to_u32(list.len(), "card lists")?);
-            list.extend_from_slice(held);
-        }
-        off.push(to_u32(list.len(), "card lists")?);
-        let my_cards = nth(&hands.cards, p, "player")?;
-        let mut tables = Tables::default();
-        for table in ctx.tables {
-            let ranked = |e: &(u32, u32, u8, u8)| Ranked { strength: e.0, idx: e.1, c1: e.2, c2: e.3 };
-            tables.push(
-                nth(&table.lists, p, "player")?,
-                nth(&table.lists, o, "player")?,
-                my_cards,
-                ranked,
-            )?;
-        }
+    fn build(ctx: &Ctx, o: usize) -> Result<OpponentView, GpuError> {
+        let cards = nth(&ctx.hands.cards, o, "player")?;
         Ok(OpponentView {
             player: to_u32(o, "player")?,
             hands: to_u32(cards.len(), "hands")?,
             cards: cards.iter().map(|&(a, b)| pack_cards(a, b)).collect(),
-            same: nth(nth(&hands.same, p, "player")?, o, "player")?.clone(),
-            card_off: off,
-            card_hands: list,
-            weights: nth(&hands.weights, o, "player")?.clone(),
-            tables,
+            weights: nth(&ctx.hands.weights, o, "player")?.clone(),
         })
     }
 }
 
+pub(crate) mod leaves;
 mod validate;
+
+pub(crate) use leaves::{LeafGroups, SweepLists, LEAF_LANES};
 
 #[cfg(test)]
 mod tests;

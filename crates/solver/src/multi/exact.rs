@@ -311,7 +311,7 @@ pub(super) fn fold_values_lanes<const L: usize>(
 }
 
 /// Single-lane [`fold_values_lanes`].
-pub(super) fn fold_values(hands: &Hands, p: usize, rq: &[f32], rr: &[f32], pay: f64, out: &mut [f32]) {
+pub(crate) fn fold_values(hands: &Hands, p: usize, rq: &[f32], rr: &[f32], pay: f64, out: &mut [f32]) {
     fold_values_lanes::<1>(hands, p, &[rq], &[rr], &[pay], &mut [out]);
 }
 
@@ -443,7 +443,7 @@ pub(super) fn showdown_lanes<const L: usize>(
 
 /// Single-lane [`showdown_lanes`].
 #[allow(clippy::too_many_arguments)]
-pub(super) fn showdown(
+pub(crate) fn showdown(
     table: &Table,
     folded: [bool; N],
     p: usize,

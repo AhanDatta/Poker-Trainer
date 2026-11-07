@@ -1,8 +1,11 @@
 //! 3-way GPU traversals and solves against the CPU solver
-//! (`multi::cfr::traverse`), with independent opponents. Everything here is
-//! bit for bit: the kernels do the CPU's f32 operations in its order and
-//! its terminal sums in f64 (whose summation order differs, which hasn't
-//! changed a single bit in any test). Tests skip without an NVIDIA device.
+//! (`multi::cfr::traverse`), with both terminal models. Everything here is
+//! bit for bit (`GpuPrecision::Exact`): the kernels do the CPU's f32
+//! operations in its order, its independent-removal terminal sums in f64
+//! (whose summation order differs, which hasn't changed a single bit in any
+//! test), and its exact-removal sweeps in its own f64 order. The fast
+//! precision and a brute force are in `tests/exact.rs`. Tests skip without
+//! an NVIDIA device.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use super::*;
@@ -19,6 +22,8 @@ use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+mod leaves;
+
 /// The test spots with independent opponents.
 fn independent_spots() -> Vec<(&'static str, MultiConfig)> {
     spots()
@@ -30,9 +35,47 @@ fn independent_spots() -> Vec<(&'static str, MultiConfig)> {
         .collect()
 }
 
+/// A terminal model: exact removal on or off, river batching on or off
+/// (batching only takes effect with exact removal).
+#[derive(Clone, Copy, Debug)]
+struct Model {
+    exact: bool,
+    batch: bool,
+}
+
+const MODELS: [Model; 3] = [
+    Model { exact: false, batch: true },
+    Model { exact: true, batch: true },
+    Model { exact: true, batch: false },
+];
+
+/// A solver for `cfg` under `model`.
+fn solver(cfg: &MultiConfig, model: Model) -> MultiSolver {
+    let mut cfg = cfg.clone();
+    cfg.exact_removal = model.exact;
+    let mut m = MultiSolver::new(cfg).unwrap();
+    m.set_batch_river(model.batch);
+    m
+}
+
+/// Every test spot under every model.
+fn variants() -> Vec<(String, MultiConfig, Model)> {
+    let mut out = Vec::new();
+    for (name, cfg) in spots() {
+        for model in MODELS {
+            out.push((format!("{name} ({model:?})"), cfg.clone(), model));
+        }
+    }
+    out
+}
+
 fn engine_for(m: &mut MultiSolver, gpu: Gpu) -> MultiEngine {
+    engine_with(m, gpu, GpuPrecision::Exact)
+}
+
+fn engine_with(m: &mut MultiSolver, gpu: Gpu, precision: GpuPrecision) -> MultiEngine {
     let plan = MultiPlan::build(&m.ctx()).unwrap();
-    MultiEngine::new(gpu, plan, m.store_mut().gpu_view()).unwrap()
+    MultiEngine::new(gpu, plan, m.store_mut().gpu_view(), precision).unwrap()
 }
 
 /// Random regrets (some exactly zero, many negative) and strategy sums
@@ -90,10 +133,10 @@ fn opts(iterations: u32, check_every: u32) -> SolveOptions {
 /// sums), from random storage: bit for bit on every spot.
 #[test]
 fn traversals_match_cpu_bit_for_bit_from_random_storage() {
-    for (k, (name, cfg)) in independent_spots().into_iter().enumerate() {
+    for (k, (name, cfg, model)) in variants().into_iter().enumerate() {
         let Some(gpu) = device() else { return };
-        let mut cpu = MultiSolver::new(cfg.clone()).unwrap();
-        let mut on_gpu = MultiSolver::new(cfg).unwrap();
+        let mut cpu = solver(&cfg, model);
+        let mut on_gpu = solver(&cfg, model);
         randomize_storage(&mut cpu, 7 + k as u64);
         randomize_storage(&mut on_gpu, 7 + k as u64);
         let mut engine = engine_for(&mut on_gpu, gpu);
@@ -127,26 +170,28 @@ fn traversals_match_cpu_bit_for_bit_from_random_storage() {
 #[test]
 fn cfr_iterations_match_cpu_bit_for_bit() {
     let (name, cfg) = independent_spots().into_iter().find(|s| s.0 == "sampled turn").unwrap();
-    let Some(gpu) = device() else { return };
-    let mut cpu = MultiSolver::new(cfg.clone()).unwrap();
-    let mut on_gpu = MultiSolver::new(cfg).unwrap();
-    let mut engine = engine_for(&mut on_gpu, gpu);
-    for t in 1..=4 {
-        let d = Discount::new(t, &multiway_dcfr());
-        cpu_iteration(&cpu, d);
-        engine.cfr_iteration(d).unwrap();
+    for model in MODELS {
+        let Some(gpu) = device() else { return };
+        let mut cpu = solver(&cfg, model);
+        let mut on_gpu = solver(&cfg, model);
+        let mut engine = engine_for(&mut on_gpu, gpu);
+        for t in 1..=4 {
+            let d = Discount::new(t, &multiway_dcfr());
+            cpu_iteration(&cpu, d);
+            engine.cfr_iteration(d).unwrap();
+        }
+        engine.download(on_gpu.store_mut().gpu_view()).unwrap();
+        let (diff, total) = differing(&storage_bits(&mut on_gpu), &storage_bits(&mut cpu));
+        assert!(diff == 0, "{name} ({model:?}): {diff} of {total} storage values differ");
     }
-    engine.download(on_gpu.store_mut().gpu_view()).unwrap();
-    let (diff, total) = differing(&storage_bits(&mut on_gpu), &storage_bits(&mut cpu));
-    assert!(diff == 0, "{name}: {diff} of {total} storage values differ");
 }
 
 /// A GPU solve and a CPU solve of the same spot, `iterations` long with a
 /// convergence check every `check_every`: same progress reports, same
 /// storage, bit for bit.
-fn assert_solves_agree(cfg: MultiConfig, iterations: u32, check_every: u32, what: &str) {
-    let mut cpu = MultiSolver::new(cfg.clone()).unwrap();
-    let mut on_gpu = MultiSolver::new(cfg).unwrap();
+fn assert_solves_agree(cfg: MultiConfig, model: Model, iterations: u32, check_every: u32, what: &str) {
+    let mut cpu = solver(&cfg, model);
+    let mut on_gpu = solver(&cfg, model);
     on_gpu.use_gpu(GpuPrecision::Exact).unwrap();
     let (mut seen_cpu, mut seen_gpu) = (Vec::new(), Vec::new());
     let pc = cpu.solve(&opts(iterations, check_every), |p| {
@@ -168,29 +213,31 @@ fn assert_solves_agree(cfg: MultiConfig, iterations: u32, check_every: u32, what
 
 #[test]
 fn short_solves_match_cpu_bit_for_bit() {
-    for (name, cfg) in independent_spots() {
+    for (name, cfg, model) in variants() {
         let Some(_) = device() else { return };
-        assert_solves_agree(cfg, 5, 2, name);
+        assert_solves_agree(cfg, model, 5, 2, &name);
     }
 }
 
-/// `three_way_turn_spot` solved to 1% of the pot on both: the same
-/// iterations, checks and strategies.
+/// `three_way_turn_spot` solved to 1% of the pot on both, with each
+/// terminal model: the same iterations, checks and strategies.
 #[test]
 fn converged_solve_matches_cpu_bit_for_bit() {
-    let Some(_) = device() else { return };
     let cfg = sampled(config("Jh8d4c2s", RANGES, [false; N]), 0, 12, 1);
-    let mut cpu = MultiSolver::new(cfg.clone()).unwrap();
-    let mut on_gpu = MultiSolver::new(cfg).unwrap();
-    on_gpu.use_gpu(GpuPrecision::Exact).unwrap();
-    let opts = SolveOptions { max_iterations: 150, target_exploitability_pct: 1.0, check_every: 25 };
-    let pc = cpu.solve(&opts, |_| true);
-    let pg = on_gpu.solve(&opts, |_| true);
-    assert!(on_gpu.gpu_error().is_none(), "{:?}", on_gpu.gpu_error());
-    assert!(pc.exploitability_pct < 5.0, "the CPU solve didn't converge: {pc:?}");
-    assert_eq!((pc.iteration, pc.exploitability.to_bits()), (pg.iteration, pg.exploitability.to_bits()));
-    assert!(storage_bits(&mut cpu) == storage_bits(&mut on_gpu), "storage differs");
-    assert_eq!(cpu.values().map(f64::to_bits), on_gpu.values().map(f64::to_bits));
+    for model in [MODELS[0], MODELS[1]] {
+        let Some(_) = device() else { return };
+        let mut cpu = solver(&cfg, model);
+        let mut on_gpu = solver(&cfg, model);
+        on_gpu.use_gpu(GpuPrecision::Exact).unwrap();
+        let opts = SolveOptions { max_iterations: 150, target_exploitability_pct: 1.0, check_every: 25 };
+        let pc = cpu.solve(&opts, |_| true);
+        let pg = on_gpu.solve(&opts, |_| true);
+        assert!(on_gpu.gpu_error().is_none(), "{:?}", on_gpu.gpu_error());
+        assert!(pc.exploitability_pct < 5.0, "{model:?}: the CPU solve didn't converge: {pc:?}");
+        assert_eq!((pc.iteration, pc.exploitability.to_bits()), (pg.iteration, pg.exploitability.to_bits()));
+        assert!(storage_bits(&mut cpu) == storage_bits(&mut on_gpu), "{model:?}: storage differs");
+        assert_eq!(cpu.values().map(f64::to_bits), on_gpu.values().map(f64::to_bits));
+    }
 }
 
 /// A GPU solve continues a CPU solve (and the reverse) exactly where it
@@ -199,8 +246,8 @@ fn converged_solve_matches_cpu_bit_for_bit() {
 fn continues_a_cpu_solve_bit_for_bit() {
     let Some(_) = device() else { return };
     let cfg = independent_spots().into_iter().find(|s| s.0 == "all-in turn").unwrap().1;
-    let mut cpu = MultiSolver::new(cfg.clone()).unwrap();
-    let mut mixed = MultiSolver::new(cfg).unwrap();
+    let mut cpu = solver(&cfg, MODELS[1]);
+    let mut mixed = solver(&cfg, MODELS[1]);
     cpu.solve(&opts(6, 3), |_| true);
     mixed.solve(&opts(3, 3), |_| true);
     mixed.use_gpu(GpuPrecision::Exact).unwrap();
@@ -216,14 +263,11 @@ fn continues_a_cpu_solve_bit_for_bit() {
 fn declines_what_it_cannot_run_yet() {
     let Some(_) = device() else { return };
     let (_, base) = independent_spots().into_iter().find(|s| s.0 == "river").unwrap();
-    let mut exact = base.clone();
-    exact.exact_removal = true;
     let mut compressed = base.clone();
     compressed.storage = StorageMode::Compressed;
     for (what, cfg, precision) in [
-        ("exact removal", exact, GpuPrecision::Exact),
-        ("16-bit storage", compressed, GpuPrecision::Exact),
-        ("fast precision", base.clone(), GpuPrecision::Fast),
+        ("16-bit storage", compressed.clone(), GpuPrecision::Exact),
+        ("16-bit storage, fast", compressed, GpuPrecision::Fast),
     ] {
         let mut m = MultiSolver::new(cfg).unwrap();
         assert!(matches!(m.use_gpu(precision), Err(GpuError::InvalidInput(_))), "{what}: accepted");
@@ -231,10 +275,14 @@ fn declines_what_it_cannot_run_yet() {
         let p = m.solve(&opts(2, 2), |_| true);
         assert!(p.exploitability.is_finite() && p.iteration == 2, "{what}: CPU solve");
     }
-    // Switching the terminal model drops the engine (its payoffs are stale).
+    // Switching the terminal model or river batching drops the engine (its
+    // plan is stale).
     let mut m = MultiSolver::new(base).unwrap();
     m.use_gpu(GpuPrecision::Exact).unwrap();
     m.set_exact_removal(true);
+    assert!(!m.uses_gpu());
+    m.use_gpu(GpuPrecision::Exact).unwrap();
+    m.set_batch_river(false);
     assert!(!m.uses_gpu());
 }
 
@@ -249,8 +297,7 @@ fn generated_spots_mostly_run_on_the_gpu() {
     let total = 32;
     let ok = (0..total)
         .filter(|_| {
-            let (mut cfg, _) = strategy.new_tree(&mut runner).unwrap().current();
-            cfg.exact_removal = false;
+            let (cfg, _) = strategy.new_tree(&mut runner).unwrap().current();
             MultiSolver::new(cfg).is_ok_and(|mut m| m.use_gpu(GpuPrecision::Exact).is_ok())
         })
         .count();
@@ -261,15 +308,18 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(32))]
 
     /// Random 3-way spots (rivers, turns and flops with sampled runouts,
-    /// short stacks, a player folded at the root, rake), from random
-    /// storage: 3 iterations bit for bit.
+    /// short stacks, a player folded at the root, rake, either terminal
+    /// model, river batching on or off), from random storage: 3 iterations
+    /// bit for bit.
     #[test]
-    fn random_spots_match_cpu_bit_for_bit((cfg, _) in arb_multi_config(), seed in any::<u64>()) {
+    fn random_spots_match_cpu_bit_for_bit((cfg, batch) in arb_multi_config(), seed in any::<u64>()) {
         let Some(_) = device() else { return Ok(()) };
-        let mut cfg = cfg;
-        cfg.exact_removal = false;
-        let Ok(mut cpu) = MultiSolver::new(cfg.clone()) else { return Ok(()) };
-        let mut on_gpu = MultiSolver::new(cfg).unwrap();
+        if MultiSolver::new(cfg.clone()).is_err() {
+            return Ok(());
+        }
+        let model = Model { exact: cfg.exact_removal, batch };
+        let mut cpu = solver(&cfg, model);
+        let mut on_gpu = solver(&cfg, model);
         randomize_storage(&mut cpu, seed);
         randomize_storage(&mut on_gpu, seed);
         on_gpu.use_gpu(GpuPrecision::Exact).unwrap();

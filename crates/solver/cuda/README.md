@@ -14,9 +14,10 @@ MSVC as the host compiler. A built binary needs only the NVIDIA driver.
 Experimental. `Solver::use_gpu(precision)` (with `--features gpu`) moves a
 solve to the GPU: river, turn and flop roots, with `f32` or 16-bit
 (compressed) storage, bit-identical to the CPU with `GpuPrecision::Exact`.
-`MultiSolver::use_gpu(GpuPrecision::Exact)` does the same for three-player
-solves, so far with independent opponents (`exact_removal` off), f32
-storage and whole trees (see "Three-player solves").
+`MultiSolver::use_gpu(precision)` does the same for three-player solves,
+with either terminal model (independent opponents or exact card removal
+between them), so far with f32 storage and whole trees (see "Three-player
+solves").
 
 GPU memory holds the regret/strategy storage, the plan, and scratch buffers:
 opponent reach per "slot" and one row of values per node. When the whole
@@ -35,12 +36,15 @@ is declined (`GpuError::OutOfMemory`) and stays on the CPU.
 | `include/solver/double_float.cuh` | double-single arithmetic and the `Accumulator` vocabulary (f64 or double-single) of the terminal kernels | |
 | `include/solver/compressed.cuh` | 16-bit storage: decoding views, encoding with the CPU's rounding and saturation | `storage::Storage::Compressed` |
 | `include/solver/traversal.cuh` | the per-node traversal steps (opponent and chance splits, own update, opponent and chance sums), parameterized by liveness: one opponent slot per node heads-up, two with three players | `river::run`, `cfr::chance`, `cfr::own_node_update`, `multi::cfr::traverse` |
-| `include/solver/terminal.cuh` | terminal-kernel building blocks: chunked sums, per-card prefix sums, a board's strength-order prefix sums (`strength_sums`) | |
+| `include/solver/terminal.cuh` | heads-up terminal building blocks: chunked sums, per-card prefix sums, a board's strength-order prefix sums (`strength_sums`) | |
+| `include/solver/lanes.cuh` | three-player leaves one per GPU lane: the sweep lists (`HandList`), a lane's columns of the scratch (`Lane`) | |
+| `include/solver/independent.cuh` | a lane's independent-opponent leaf: hand-order compatible mass, strength-order beaten mass | `Hands::compat`, `Table::beat`, `multi::cfr::independent_showdown`, `pay_all` |
+| `include/solver/exact.cuh` | a lane's exact-removal leaf: the two-set inclusion–exclusion sweep (`Set`) | `multi::exact` (`Pairs`, `showdown`, `fold_values`) |
 | `kernels/traverse.cu` | heads-up level-by-level traversal: the steps of `traversal.cuh` over one level's nodes | `river::run`, `cfr::chance`, `cfr::own_node_update` |
 | `kernels/traverse_compressed.cu` | the two storage-touching traversal steps for 16-bit storage, one block per node (a block-wide max sets each node's new scale) | `Storage::update_regrets`, `Storage::update_strat` |
 | `kernels/terminal.cu` | fold and showdown values (card removal by inclusion–exclusion, prefix sums), with the rounding of the CPU evaluator that handles each terminal | `eval::fold_batch` / `eval_fold`, `eval::showdown_batch` / `eval_showdown` |
 | `kernels/multi_traverse.cu` | three-player level-by-level traversal: each opponent's splits, two-slot chance splits, own update, sums | `multi::cfr::traverse` |
-| `kernels/multi_terminal.cu` | three-player leaves with independent opponents: fixed payoffs and showdowns | `multi::cfr::pay_all`, `multi::cfr::independent_showdown` |
+| `kernels/multi_leaves.cu` | three-player leaves, per terminal model and precision: showdown warps (one board, same folded players), fixed-payoff lanes (one pair of reach slots each) | `multi::cfr::pay_all`, `independent_showdown`, `multi::exact::showdown`, `river::subtree`'s leaves |
 | `kernels/regret.cu` | standalone regret matching | `cfr::regret_match_into` |
 | `kernels/selftest.cu` | deliberate out-of-bounds read for `tests/gpu_fault.rs` | |
 | `kernels/double_float_check.cu` | double-single operations for the tests against host f64 | |
@@ -53,13 +57,14 @@ The host side (`src/gpu/`):
   once and launches one kernel per tree level (and segment); `Solver::solve`
   drives the same loop (iterations, exploitability checks, cancellation) for
   both backends.
-- `multi/plan.rs` (+ `multi/plan/validate.rs`) and `multi/engine.rs` are the
-  same for three-player trees; `MultiSolver::solve` runs either backend
-  through one loop.
-- Shared by both: `tables.rs` (per-board showdown lookups against one
-  opponent), `shared.rs` (encodings, limits, validation helpers),
-  `device.rs` (buffers with their kernel-visible lengths, launch grids,
-  traversal modes, storage upload and download, memory checks).
+- `multi/plan.rs` (+ `multi/plan/validate.rs`, and `multi/plan/leaves.rs`
+  for the leaf kernels' lists and groups) and `multi/engine.rs` (+
+  `multi/engine/leaves.rs`) are the same for three-player trees;
+  `MultiSolver::solve` runs either backend through one loop.
+- `tables.rs`: the heads-up showdown lookups. Shared by both: `shared.rs`
+  (encodings, limits, validation helpers), `device.rs` (buffers with their
+  kernel-visible lengths, launch grids, traversal modes, storage upload and
+  download, memory checks).
 
 ## Ground rules
 
@@ -326,10 +331,13 @@ What remains:
 
 ## Three-player solves
 
-`MultiSolver::use_gpu(GpuPrecision::Exact)` moves a 3-way solve to the GPU,
-so far with independent opponents (`exact_removal` off), f32 storage and
-whole trees; anything else is declined with an error and the solve stays on
-the CPU. A GPU failure mid-solve restarts the solve on the CPU, as heads-up.
+`MultiSolver::use_gpu(precision)` moves a 3-way solve to the GPU, with
+independent opponents or exact card removal between them (`exact_removal`,
+with or without river batching), f32 storage and whole trees; 16-bit
+storage is declined with an error and the solve stays on the CPU. A GPU
+failure mid-solve restarts the solve on the CPU, as heads-up.
+`GpuPrecision::Exact` is bit-identical to the CPU; `Fast` sums the leaves
+in double-single.
 
 How a traversal for player `p` maps to kernels (plan: `src/gpu/multi/plan.rs`):
 
@@ -342,49 +350,111 @@ How a traversal for player `p` maps to kernels (plan: `src/gpu/multi/plan.rs`):
   player still in the hand (the plan's `strategy_update` flags).
 - Nodes after `p`'s fold are fixed-payoff leaves, even when they have
   children; nothing below them is scheduled.
-- Leaves (`multi_terminal.cu`): `multi_fixed_values` computes `pay * c_q *
-  c_r`, each opponent's compatible mass from its per-card lists;
-  `multi_showdown_values` computes `win * p + lose * (c_q * c_r - p)` with
-  `p = b_q * b_r`, the beaten mass from each opponent's strength-order
-  prefix sums (the heads-up lookup layout). A showdown block handles the
-  first opponent, keeps its two values per hand in registers (at most 6
-  hands per thread: 1326 / 256), then reuses the shared memory for the
-  second. f64 sums only so far; a double-single path waits until these are
-  settled, as heads-up.
-- The per-node steps are the heads-up kernels' (`traversal.cuh`); the
-  showdown prefix sums are shared too (`terminal.cuh`). The CPU evaluates
-  every 3-way leaf one at a time when the opponents are independent (it
-  batches river subtrees only with exact removal), so there is one
-  rounding to mirror.
+- The per-node steps are the heads-up kernels' (`traversal.cuh`).
 
-Checked bit for bit against the CPU (`src/gpu/multi/engine/tests.rs`): root
-values in every mode and CFR iterations from random storage on every 3-way
-test spot (rivers, turns, a sampled flop, all-in runouts, a player folded
-at the root), 5-iteration solves with their progress reports, a solve to
-1% of the pot, a GPU solve continuing a CPU one, and 32 random spots
-(property test). No value differed. Eighteen planted bugs (chance factor on
-the wrong opponents, strategy sums updated in every or no traversal,
-liveness from one opponent, a missing opponent or identical combo in the
-compatible mass, folded opponents or board-blocked hands mishandled at
-showdowns, ties counted fully, blocked hands kept in chance sums, dead
-nodes updated, argument mix-ups, the convergence over two players) were
-each caught by four or more tests, one (the compatible mass not clamped at
-0) by one. memcheck, initcheck, synccheck and racecheck: no errors.
+### Leaves: one per lane
 
-Chart ranges (CO opens, BTN and BB call), 8 sampled turns and 4 sampled
-rivers, independent opponents, f32 storage on both sides, 100 iterations
-with a convergence check every 20 (`multibench`; `F32=1` vs `GPU=1`), on the
+The CPU evaluates a leaf with sweeps over the opponents' hands, in hand
+order (the compatible mass, `Hands::compat`; exact removal's pair sums for
+fixed payoffs, `exact::fold_values`) or in a board's strength order
+(`Table::beat`; `exact::showdown`), each traverser hand reading the
+running sums at its turn. The order of a sweep depends only on the board
+and the folded players, so `multi_leaves.cu` runs one leaf per GPU lane:
+the plan groups showdowns into warps of up to 32 on one board with the same
+folded players, and fixed-payoff leaves into lanes by their pair of reach
+slots (leaves with the same reach share the sweep, as `river::subtree`
+groups them), and the 32 lanes of a warp run the same sweep in lockstep,
+each on its own reach, with the CPU's arithmetic in the CPU's order. So
+the f64 path is bit-identical to the CPU, rounding noise included: a value
+that is 0 in exact arithmetic (a hand blocking every remaining combo of an
+opponent) comes out as the CPU's noise, bit for bit.
+
+The independent model used one thread block per leaf with tree reductions
+in step 2.2; a new random-storage seed showed that this was not
+bit-identical after all (6 of 559,296 storage values on the sampled flop,
+from leaf values ~1e-16 of their row's scale whose noise depended on the
+summation order), so both models now share the lanes.
+
+Exact removal (`exact.cuh`) mirrors `multi::exact`'s two sets (`Pairs`):
+the inclusion–exclusion `pairs(h) = tQ'·tR' − Σ_c mQ'[c]·mR'[c] +
+Σ_k xQ'(k)·xR'(k)` from per-card sums updated as hands enter. The plan's
+`SweepLists` give every seat's list in every order with per-card entry
+lists (`by_card`) and a combo-to-position map (`x`), so "is this combo in
+the set" is a position test (a set holds a contiguous range of each list).
+Per-lane state (two sets of 5 × 52 per-card sums, f64 or double-single)
+lives in global scratch, field-major so a warp's accesses to one field are
+coalesced; each lane copies its reach in list order.
+
+Checked against the CPU (`src/gpu/multi/engine/tests.rs` and
+`tests/leaves.rs`), on every 3-way test spot (rivers, turns, a sampled
+flop, all-in runouts, a player folded at the root) under each terminal
+model (independent; exact removal with river batching on and off):
+
+- Exact precision, bit for bit: every leaf value of every traversal from
+  random storage, root values in every mode, CFR iterations,
+  5-iteration solves with their progress reports, a solve to 1% of the pot
+  with each model, a GPU solve continuing a CPU one, and 32 random spots
+  (property test, either model). No value differed.
+- Fast precision: every leaf value within one f32 rounding of the CPU's,
+  `|gpu − cpu| <= 2 eps32 · size · c_q · c_r + 1e-12 · size · T_q · T_r`
+  per hand (`size` the payoff, `c` an opponent's compatible mass, `T` its
+  total reach: the second term bounds the f64 noise of sums that cancel
+  terms of that size, which the CPU itself leaves on values that are 0 in
+  exact arithmetic), and at least 99.9% identical (measured: all but a few
+  hundred of millions). Solves: after 5 iterations exploitability within
+  3% and the range-level root strategy within 0.01 of the CPU's (CFR
+  amplifies rounding near indifference: a regret that is 0 on the CPU and
+  ±1e-19 on the GPU flips an indifferent hand between uniform and pure
+  play; with independent opponents nothing differed at all); a solve to 1%
+  of the pot in as many iterations (±20%) with the same range strategy.
+- A brute force over hand triples (both models, both precisions, small
+  spots): within two f32 roundings plus the noise floor.
+- The plans' lists against the CPU's `Table::lists`, and Rust models of the
+  kernels' sweeps, built only from the plan data, against the CPU
+  evaluators bit for bit (`src/gpu/multi/plan/tests/leaves.rs`, no device
+  needed); 26 corruptions of the leaf data rejected by `validate`.
+
+Planted bugs: 29, each caught (25 of them by 5 to 12 tests; the
+compatible mass not clamped at 0, independent model, by one): the chance
+factor, strategy updates, liveness and convergence of step 2.2, and in the
+leaves a missing identical combo, folded opponents beating everything or
+not blocking, board-blocked hands, ties counted fully or paid two-way,
+tied mass of one card, sums missing a card, the Y and cross sums of the
+exact model, a set's lower bound, the eq set, the payoffs, batched-river
+rounding, overlapping reach rows, every lane on one showdown, stale dead
+leaves, the wrong hand order, fast kernels at the exact precision.
+memcheck, initcheck and synccheck on all 3-way engine tests and racecheck
+on the traversal and leaf tests: no errors.
+
+### Benchmarks
+
+Chart ranges (CO opens, BTN and BB call) on `Js9s4d`, 8 sampled turns and
+4 sampled rivers, f32 storage on both sides, 100 iterations with a
+convergence check every 20 (`multibench`: `F32=1` vs `GPU=1`, `GPU=1
+FAST=1`), runs alternated over two rounds (they agreed within 1%), on the
 machine above:
 
-| Spot | CPU (20 threads) | GPU | Speedup |
+| Terminal model | CPU (20 threads) | GPU exact | GPU fast |
 |---|---|---|---|
-| flop `Js9s4d` (62.7M strategy cells) | 262 ms/iteration | 82 ms/iteration | 3.2× |
-| turn `Js9s4d2c` (2.2M cells) | 33.1 ms/iteration | 4.8 ms/iteration | 6.9× |
+| exact removal (river batching on) | 711 ms/iteration | 770 (0.92×) | 400 (1.78×) |
+| independent | 291 ms/iteration | 140 (2.1×) | 108 (2.7×) |
 
-Both reach the same convergence at every check (0.245% and 0.157% of the
-pot after 100 iterations). GPU setup (plan and upload): 0.78 s on the flop,
-0.17 s on the turn. Not tuned yet: no fused or split launches, f64 sums
-only.
+The exact precision reaches the CPU's convergence bit for bit (0.256% of
+the pot after 100 iterations with exact removal, 0.245% independent);
+fast: 0.259% and 0.244%. GPU setup: 0.55–0.77 s.
+
+Where the time goes (Nsight, exact removal): the showdown kernel is ~83%,
+the fixed payoffs ~15%, the whole traversal ~2%. The leaf kernels are
+latency-bound, not compute-bound: each lane carries about 10 KB of state,
+reach and stash in global scratch, so a resident grid's working set is far
+past L1 and L2 (memory throughput 45 GB/s, achieved occupancy 42%; fewer
+lanes are slower: 8192 lanes 1.3×, 3072 2.3×). Fast is only 1.9× faster
+than exact for the same reason. The f64 work alone bounds the exact
+precision with exact removal at about 150 ms/iteration on this GPU (1/64
+f64 rate), whatever the layout. The independent model was faster with the
+step 2.2 block kernels (82 ms/iteration), which weren't strictly
+bit-identical. Speeding up the leaves (state in shared memory, or a block
+per leaf with in-order scans) is left for a later step.
 
 ## Running the GPU checks
 
@@ -393,8 +463,9 @@ cargo test -p solver --features gpu gpu::
 ```
 
 `gpu::plan` and `gpu::multi::plan` tests need no device: they check the
-host-side plans, including Rust references of the terminal formulas built
-from the plans' lookup tables against the CPU evaluators. `gpu::engine` and
+host-side plans, including Rust references of the terminal formulas (and
+the three-player leaf sweeps) built from the plans' data against the CPU
+evaluators. `gpu::engine` and
 `gpu::multi::engine` tests compare GPU traversals and solves with the CPU
 solvers.
 

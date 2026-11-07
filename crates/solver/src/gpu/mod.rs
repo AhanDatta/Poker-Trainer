@@ -76,7 +76,7 @@ static TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/travers
 static TRAVERSE_COMPRESSED_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/traverse_compressed.fatbin"));
 static TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.fatbin"));
 static MULTI_TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_traverse.fatbin"));
-static MULTI_TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_terminal.fatbin"));
+static MULTI_LEAVES_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_leaves.fatbin"));
 static DOUBLE_FLOAT_CHECK_IMAGE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/double_float_check.fatbin"));
 
@@ -227,14 +227,16 @@ struct Kernels {
     /// Terminal kernels per precision: `[exact, fast]`.
     fold_values: [CudaFunction; 2],
     showdown_values: [CudaFunction; 2],
-    /// Three-player traversal and leaf kernels (multi_traverse.cu, multi_terminal.cu).
+    /// Three-player traversal kernels (multi_traverse.cu).
     multi_opponent_split: CudaFunction,
     multi_chance_split: CudaFunction,
     multi_own_update: CudaFunction,
     multi_opponent_sum: CudaFunction,
     multi_chance_sum: CudaFunction,
-    multi_fixed_values: CudaFunction,
-    multi_showdown_values: CudaFunction,
+    /// Three-player leaves (multi_leaves.cu), `[model][precision]`:
+    /// `[independent, exact removal][exact, fast]`.
+    multi_showdowns: [[CudaFunction; 2]; 2],
+    multi_fixed: [[CudaFunction; 2]; 2],
     double_float_check: CudaFunction,
     double_float_sum: CudaFunction,
 }
@@ -278,7 +280,8 @@ impl Gpu {
         let terminal = ctx.load_module(Ptx::from_binary(TERMINAL_IMAGE.to_vec()))?;
         let double_float = ctx.load_module(Ptx::from_binary(DOUBLE_FLOAT_CHECK_IMAGE.to_vec()))?;
         let multi_traverse = ctx.load_module(Ptx::from_binary(MULTI_TRAVERSE_IMAGE.to_vec()))?;
-        let multi_terminal = ctx.load_module(Ptx::from_binary(MULTI_TERMINAL_IMAGE.to_vec()))?;
+        let multi_leaves = ctx.load_module(Ptx::from_binary(MULTI_LEAVES_IMAGE.to_vec()))?;
+        let leaf = |name: &str| multi_leaves.load_function(name);
         let kernels = Kernels {
             regret_match_f32: regret.load_function("regret_match_f32")?,
             regret_match_i16: regret.load_function("regret_match_i16")?,
@@ -302,11 +305,25 @@ impl Gpu {
             multi_own_update: multi_traverse.load_function("multi_own_update")?,
             multi_opponent_sum: multi_traverse.load_function("multi_opponent_sum")?,
             multi_chance_sum: multi_traverse.load_function("multi_chance_sum")?,
-            multi_fixed_values: multi_terminal.load_function("multi_fixed_values")?,
-            multi_showdown_values: multi_terminal.load_function("multi_showdown_values")?,
+            multi_showdowns: [
+                [leaf("multi_showdowns_independent_exact")?, leaf("multi_showdowns_independent_fast")?],
+                [leaf("multi_showdowns_exact_exact")?, leaf("multi_showdowns_exact_fast")?],
+            ],
+            multi_fixed: [
+                [leaf("multi_fixed_independent_exact")?, leaf("multi_fixed_independent_fast")?],
+                [leaf("multi_fixed_exact_exact")?, leaf("multi_fixed_exact_fast")?],
+            ],
             double_float_check: double_float.load_function("double_float_check")?,
             double_float_sum: double_float.load_function("double_float_sum")?,
         };
+        // The leaf kernels use no shared memory and stream per-lane state:
+        // all of the on-chip memory as L1.
+        for f in kernels.multi_showdowns.iter().chain(&kernels.multi_fixed).flatten() {
+            f.set_attribute(
+                cudarc::driver::sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                0,
+            )?;
+        }
         Ok(Gpu { stream: ctx.default_stream(), kernels, name, compute_capability })
     }
 

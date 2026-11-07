@@ -119,10 +119,28 @@ Steps:
    `terminal.cuh`), and the host code is split into shared modules
    (`device.rs`, `shared.rs`, `tables.rs`). Benchmarks in
    `crates/solver/cuda/README.md` ("Three-player solves"). Left for later:
-   a double-single fast path, `backend` wiring.
-3. Exact-removal terminals; against the CPU and a brute force. `[ ]`
-4. River batching parity, 16-bit storage, splitting, backend wiring,
-   benchmarks. `[ ]`
+   a double-single fast path (done in 3), `backend` wiring.
+3. Exact-removal terminals; against the CPU and a brute force. `[x]`
+   Done (`kernels/multi_leaves.cu`, `include/solver/{lanes,exact,independent}.cuh`,
+   `src/gpu/multi/{plan,engine}/leaves.rs`): every 3-way leaf runs on one
+   GPU lane, a warp's 32 lanes sweeping the same board in lockstep with the
+   CPU's arithmetic in its order. Decided on the way (2026-11-06): one
+   kernel per accumulator, `GpuPrecision::Exact` (f64) and `Fast`
+   (double-single), Fast checked at one f32 rounding per hand
+   (`2 eps32 · |pay| · c_q · c_r`, plus an f64 noise floor); river
+   batching accepted (its leaves' rounding mirrored); and the independent
+   leaves ported to the same lanes after a new seed showed the 2.2 block
+   kernels weren't strictly bit-identical (sum-order noise on values that
+   are 0 in exact arithmetic). Exact: bit-identical in every test, every
+   leaf included; Fast: within the bound; a brute force over hand triples
+   agrees; 29 planted bugs caught; sanitizer clean. Chart-range flop with
+   exact removal: CPU 711 ms/iteration, GPU exact 770, fast 400
+   (independent: 291 / 140 / 108; the 2.2 block kernels took 82). The leaf
+   kernels are latency-bound on per-lane scratch (README, "Three-player
+   solves"); speeding them up is step 4's first item.
+4. Faster leaves (per-lane state in shared memory or a block per leaf with
+   in-order scans, keeping bit-identity), 16-bit storage, splitting,
+   backend wiring, benchmarks. `[ ]`
 
 Target: the chart-range 3-way flop (J♠9♠4♦, 8 × 4 sampled, exact removal)
 from 47 s on the CPU to well under 10 s.

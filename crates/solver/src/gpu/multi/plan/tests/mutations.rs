@@ -287,17 +287,6 @@ fn validate_rejects_corrupted_hand_data() {
     let m = MultiSolver::new(cfg).unwrap();
     let plan = plan_for(&m);
     plan.validate().unwrap();
-    let view = &plan.players[0].opponents[1];
-    let first_ranked = view.tables.ranges.iter().position(|&r| r != NONE).unwrap();
-    // A card whose list is non-empty, and a hand of that opponent without it.
-    let c = (0..CARDS).find(|&c| view.card_off[c] < view.card_off[c + 1]).unwrap();
-    let entry = view.card_off[c] as usize;
-    let without = (0..view.hands as usize)
-        .find(|&j| {
-            let (a, b) = unpack_cards(view.cards[j]);
-            a != c && b != c
-        })
-        .unwrap() as u32;
     let mutations: Vec<(&str, Mutation)> = vec![
         ("bad hand", Box::new(|p| p.players[0].my_cards[0] = pack_cards(52, 1))),
         ("hand with a repeated card", Box::new(|p| p.players[0].my_cards[1] = pack_cards(7, 7))),
@@ -313,19 +302,6 @@ fn validate_rejects_corrupted_hand_data() {
         ("wrong seat", Box::new(|p| p.players[0].opponents[0].player = 2)),
         ("seats swapped", Box::new(|p| p.players[2].opponents.swap(0, 1))),
         ("opponent's cards differ", Box::new(|p| p.players[0].opponents[1].cards.swap(0, 1))),
-        (
-            "identical combo out of range",
-            Box::new(|p| {
-                let v = &mut p.players[1].opponents[0];
-                v.same[0] = v.hands;
-            }),
-        ),
-        (
-            "identical combos missing",
-            Box::new(|p| {
-                p.players[1].opponents[1].same.pop();
-            }),
-        ),
         ("negative weight", Box::new(|p| p.players[1].opponents[0].weights[0] = -1.0)),
         ("NaN weight", Box::new(|p| p.players[2].opponents[1].weights[0] = f32::NAN)),
         ("weight too large", Box::new(|p| p.players[0].opponents[0].weights[0] = 1e7)),
@@ -335,41 +311,6 @@ fn validate_rejects_corrupted_hand_data() {
                 p.players[0].opponents[0].weights.pop();
             }),
         ),
-        (
-            "card list entry out of range",
-            Box::new(|p| {
-                let v = &mut p.players[2].opponents[0];
-                v.card_hands[0] = v.hands;
-            }),
-        ),
-        (
-            "card list entry without the card",
-            Box::new(move |p| p.players[0].opponents[1].card_hands[entry] = without),
-        ),
-        ("card offsets out of order", Box::new(|p| p.players[0].opponents[0].card_off[1] = u32::MAX)),
-        (
-            "card offsets short",
-            Box::new(|p| {
-                p.players[0].opponents[0].card_off.pop();
-            }),
-        ),
-        (
-            "opponent order out of range",
-            Box::new(|p| {
-                let v = &mut p.players[0].opponents[1];
-                v.tables.opp_order[0] = v.hands;
-            }),
-        ),
-        ("card position out of range", Box::new(|p| p.players[1].opponents[1].tables.card_pos[0] = 60_000)),
-        (
-            "card rank past its list",
-            Box::new(move |p| p.players[0].opponents[1].tables.ranks[first_ranked] = u32::MAX),
-        ),
-        (
-            "strength range past the list",
-            Box::new(move |p| p.players[0].opponents[1].tables.ranges[first_ranked] = 0xFFFE_0000),
-        ),
-        ("too much shared memory", Box::new(|p| p.players[2].opponents[1].tables.max_opp = 5000)),
         ("tables for another board count", Box::new(|p| p.num_tables += 1)),
     ];
     assert_all_rejected(&plan, mutations);

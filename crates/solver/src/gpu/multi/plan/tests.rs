@@ -12,6 +12,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::HashMap;
 
+mod leaves;
 mod mutations;
 
 /// `cfg` with each terminal model and river batching on and off (batching
@@ -280,165 +281,6 @@ fn scalar_flags_follow_the_cpu_evaluators() {
     }
 }
 
-/// Random reach with about a quarter of the hands at zero.
-fn random_reach(rng: &mut StdRng, n: usize) -> Vec<f32> {
-    (0..n).map(|_| if rng.random::<f64>() < 0.25 { 0.0 } else { rng.random_range(0.0f32..1.0) }).collect()
-}
-
-/// `Hands::compat` from an opponent view's card lists.
-fn plan_compat(pp: &MultiPlayerPlan, view: &OpponentView, reach: &[f32]) -> Vec<f64> {
-    let total: f64 = reach.iter().map(|&x| f64::from(x)).sum();
-    let minus: Vec<f64> = (0..CARDS)
-        .map(|c| {
-            view.card_hands[view.card_off[c] as usize..view.card_off[c + 1] as usize]
-                .iter()
-                .map(|&j| f64::from(reach[j as usize]))
-                .sum()
-        })
-        .collect();
-    (0..pp.hands as usize)
-        .map(|h| {
-            let (c1, c2) = unpack_cards(pp.my_cards[h]);
-            let same = match view.same[h] {
-                NONE => 0.0,
-                j => f64::from(reach[j as usize]),
-            };
-            (total - minus[c1] - minus[c2] + same).max(0.0)
-        })
-        .collect()
-}
-
-/// `Table::beat` from an opponent view's lookup table `t` (the heads-up
-/// showdown formula's weaker and tied sums).
-fn plan_beat(pp: &MultiPlayerPlan, view: &OpponentView, t: usize, reach: &[f32]) -> Vec<f64> {
-    let tb = &view.tables;
-    let n = pp.hands as usize;
-    let (off, len) = (tb.opp_off[t] as usize, tb.opp_len[t] as usize);
-    let w: Vec<f64> = tb.opp_order[off..off + len].iter().map(|&j| f64::from(reach[j as usize])).collect();
-    let mut prefix = vec![0f64; len + 1];
-    for j in 0..len {
-        prefix[j + 1] = prefix[j] + w[j];
-    }
-    let card_off = &tb.card_off[t * (CARDS + 1)..(t + 1) * (CARDS + 1)];
-    let base = tb.card_base[t] as usize;
-    let card_prefix = |c: usize| -> Vec<f64> {
-        let mut v = vec![0.0];
-        for &j in &tb.card_pos[base + card_off[c] as usize..base + card_off[c + 1] as usize] {
-            v.push(v.last().unwrap() + w[j as usize]);
-        }
-        v
-    };
-    (0..n)
-        .map(|h| {
-            let packed = tb.ranges[t * n + h];
-            if packed == NONE {
-                return 0.0;
-            }
-            let (lo, hi) = ((packed & 0xFFFF) as usize, (packed >> 16) as usize);
-            let r = tb.ranks[t * n + h];
-            let (r1l, r1h, r2l, r2h) = (
-                (r & 0xFF) as usize,
-                (r >> 8 & 0xFF) as usize,
-                (r >> 16 & 0xFF) as usize,
-                (r >> 24) as usize,
-            );
-            let (c1, c2) = unpack_cards(pp.my_cards[h]);
-            let (f, s) = (card_prefix(c1), card_prefix(c2));
-            let weaker = prefix[lo] - f[r1l] - s[r2l];
-            let same = match view.same[h] {
-                NONE => 0.0,
-                j => f64::from(reach[j as usize]),
-            };
-            let equal = (prefix[hi] - prefix[lo]) - ((f[r1h] - f[r1l]) + (s[r2h] - s[r2l])) + same;
-            (weaker + 0.5 * equal).max(0.0)
-        })
-        .collect()
-}
-
-fn assert_close_f64(a: &[f64], b: &[f64], what: &str) {
-    assert_eq!(a.len(), b.len(), "{what}: lengths");
-    let scale = b.iter().fold(0f64, |m, x| m.max(x.abs())).max(1e-30);
-    for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        assert!((x - y).abs() <= 1e-12 * scale, "{what}: hand {i}: {x} vs {y}");
-    }
-}
-
-fn assert_close(a: &[f32], b: &[f32], what: &str) {
-    assert_eq!(a.len(), b.len(), "{what}: lengths");
-    let scale = b.iter().fold(0f32, |m, x| m.max(x.abs())).max(1e-30);
-    for (i, (x, y)) in a.iter().zip(b).enumerate() {
-        assert!((x - y).abs() <= 2e-6 * scale, "{what}: hand {i}: {x} vs {y} (scale {scale})");
-    }
-}
-
-/// The plan's lookup data reproduces the CPU's independent-opponent
-/// terminals (per-opponent compatible and beaten mass, showdown values and
-/// fixed payoffs) for random reach, on every board of the plan.
-fn check_independent_terminals(m: &MultiSolver, plan: &MultiPlan, seed: u64) {
-    let ctx = m.ctx();
-    assert!(!ctx.exact);
-    let mut rng = StdRng::seed_from_u64(seed);
-    for (p, pp) in plan.players.iter().enumerate() {
-        let (q, r) = opponents(p);
-        let rq = random_reach(&mut rng, pp.opponents[0].hands as usize);
-        let rr = random_reach(&mut rng, pp.opponents[1].hands as usize);
-        let cq = plan_compat(pp, &pp.opponents[0], &rq);
-        let cr = plan_compat(pp, &pp.opponents[1], &rr);
-        assert_close_f64(&cq, &ctx.hands.compat(p, q, &rq), "compat q");
-        assert_close_f64(&cr, &ctx.hands.compat(p, r, &rr), "compat r");
-        for t in 0..plan.num_tables as usize {
-            let table = &ctx.tables[t];
-            assert_close_f64(
-                &plan_beat(pp, &pp.opponents[0], t, &rq),
-                &table.beat(ctx.hands, p, q, &rq),
-                "beat q",
-            );
-            assert_close_f64(
-                &plan_beat(pp, &pp.opponents[1], t, &rr),
-                &table.beat(ctx.hands, p, r, &rr),
-                "beat r",
-            );
-        }
-        // A few of the plan's showdowns and fixed leaves, valued from the
-        // plan's sums with the CPU formula.
-        for k in (0..pp.showdowns.len()).step_by(pp.showdowns.len().div_ceil(8).max(1)) {
-            let node = &ctx.tree.nodes[pp.showdowns[k] as usize];
-            let t = pp.showdown_table[k] as usize;
-            let bq = if node.folded[q] { cq.clone() } else { plan_beat(pp, &pp.opponents[0], t, &rq) };
-            let br = if node.folded[r] { cr.clone() } else { plan_beat(pp, &pp.opponents[1], t, &rr) };
-            let (win, lose) = (pp.win[k], pp.lose[k]);
-            let want: Vec<f32> = (0..pp.hands as usize)
-                .map(|h| (win * bq[h] * br[h] + lose * (cq[h] * cr[h] - bq[h] * br[h])) as f32)
-                .collect();
-            let mut cpu = vec![0f32; pp.hands as usize];
-            independent_showdown(ctx.hands, &ctx.tables[t], node.folded, p, &rq, &rr, win, lose, &mut cpu);
-            assert_close(&want, &cpu, "showdown");
-        }
-        for k in (0..pp.fixed.len()).step_by(pp.fixed.len().div_ceil(8).max(1)) {
-            let pay = pp.fixed_payoff[k];
-            let want: Vec<f32> = (0..pp.hands as usize).map(|h| (pay * cq[h] * cr[h]) as f32).collect();
-            let mut cpu = vec![0f32; pp.hands as usize];
-            pay_all(&ctx, p, &rq, &rr, pay, &mut cpu);
-            assert_close(&want, &cpu, "fixed payoff");
-        }
-    }
-}
-
-#[test]
-fn lookup_tables_reproduce_cpu_independent_terminals() {
-    for (name, mut cfg) in spots() {
-        cfg.exact_removal = false;
-        let m = MultiSolver::new(cfg).unwrap();
-        let plan = plan_for(&m);
-        // (A player folded at the root takes part in no showdown.)
-        let in_showdowns = plan.players.iter().filter(|pp| !pp.showdowns.is_empty()).count();
-        assert!(in_showdowns >= 2, "{name}: {in_showdowns} players in showdowns");
-        for seed in 0..3 {
-            check_independent_terminals(&m, &plan, seed);
-        }
-    }
-}
-
 /// Guards against vacuous property tests: most generated spots must be
 /// solvable (the rest have an empty range after board removal).
 #[test]
@@ -457,17 +299,13 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(48))]
 
     /// Random spots give valid plans whose schedules, slots, strategy
-    /// marks, payoffs and rounding flags match the CPU traversal; with
-    /// independent opponents the lookup tables reproduce its terminals.
+    /// marks, payoffs and rounding flags match the CPU traversal.
     #[test]
-    fn random_plans_validate_and_match_the_cpu((cfg, batch) in arb_multi_config(), seed in any::<u64>()) {
+    fn random_plans_validate_and_match_the_cpu((cfg, batch) in arb_multi_config()) {
         let Ok(mut m) = MultiSolver::new(cfg) else { return Ok(()) };
         m.set_batch_river(batch);
         let plan = MultiPlan::build(&m.ctx()).unwrap();
         prop_assert!(plan.validate().is_ok());
         check_all(&m, &plan);
-        if !plan.exact {
-            check_independent_terminals(&m, &plan, seed);
-        }
     }
 }
