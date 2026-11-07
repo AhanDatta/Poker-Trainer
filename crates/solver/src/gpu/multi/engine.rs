@@ -143,7 +143,7 @@ impl MultiEngine {
         }
         let values_len = plan.num_nodes as usize * hands;
         let scratch = 4 * (reach_len.iter().sum::<usize>() + alive_len.iter().sum::<usize>() + values_len) as u64
-            + leaves::scratch_bytes(&plan)?;
+            + leaves::scratch_bytes(&plan, precision)?;
         check_memory(&gpu, plan.device_bytes() + storage_bytes + scratch)?;
         let [p0, p1, p2] = &plan.players;
         let ([r0, r1], [a0, a1]) = (reach_len, alive_len);

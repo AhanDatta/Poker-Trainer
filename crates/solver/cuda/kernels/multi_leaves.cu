@@ -6,7 +6,8 @@
 // CPU twins, per terminal model:
 // * independent opponents (independent.cuh): `multi::cfr::pay_all` and
 //   `independent_showdown`;
-// * exact removal (exact.cuh): `multi::exact::fold_values` and `showdown`
+// * exact removal (exact.cuh; exact_fast.cuh at the fast precision):
+//   `multi::exact::fold_values` and `showdown`
 //   (also `showdown_lanes`, whose lanes compute the same); `river::subtree`
 //   rounds the pair mass to f32 before the payoff multiplies it, which the
 //   plan's per-leaf rounding flag mirrors.
@@ -18,6 +19,7 @@
 // host sizes the scratch for the whole grid.
 
 #include <solver/exact.cuh>
+#include <solver/exact_fast.cuh>
 #include <solver/independent.cuh>
 #include <solver/traversal.cuh>
 
@@ -31,6 +33,10 @@ using lanes::Lists;
 
 /// The terminal models.
 enum class Model { kIndependent, kExact };
+
+/// The fast precision: double-single sums, in any order (exact_fast.cuh).
+template <Accumulator A>
+inline constexpr bool kFast = cuda::std::same_as<A, DoubleFloat>;
 
 /// One opponent's reach state as the leaf kernels read it.
 struct OpponentLeaf {
@@ -144,7 +150,11 @@ __device__ void showdowns_impl(const ShowdownArgs<A>& args) {
     if constexpr (M == Model::kExact) {
       const exact::Payoffs<A> pay{narrow_from<A>(args.win[i]), narrow_from<A>(args.lose[i]),
                                   narrow_from<A>(args.split2[i]), narrow_from<A>(args.split3[i])};
-      exact::showdown(lane, lp, lo[0], lo[1], in[0], in[1], pay, out);
+      if constexpr (kFast<A>) {
+        exact_fast::showdown(lane, lp, lo[0], lo[1], in[0], in[1], pay, out);
+      } else {
+        exact::showdown(lane, lp, lo[0], lo[1], in[0], in[1], pay, out);
+      }
     } else {
       const HandList my_hands{args.lists, args.hand_order, p};
       const HandList by_hand[2] = {HandList{args.lists, args.hand_order, q, rows.by_hand[0]},
@@ -222,8 +232,12 @@ __device__ void fixed_impl(const FixedArgs<A>& args) {
     lane.load(by_hand[0], reach_of(args.opp[0], sq));
     lane.load(by_hand[1], reach_of(args.opp[1], sr));
     if constexpr (M == Model::kExact) {
-      exact::pair_masses(lane, my_hands, by_hand[0], by_hand[1],
-                         [&](u32 h, A pairs) { write_leaves<M>(args, leaves, h, pairs, A{}); });
+      const auto write = [&](u32 h, A pairs) { write_leaves<M>(args, leaves, h, pairs, A{}); };
+      if constexpr (kFast<A>) {
+        exact_fast::pair_masses(lane, my_hands, by_hand[0], by_hand[1], write);
+      } else {
+        exact::pair_masses(lane, my_hands, by_hand[0], by_hand[1], write);
+      }
     } else {
       independent::compat_masses(lane, my_hands, by_hand,
                                  [&](u32 h, A cq, A cr) { write_leaves<M>(args, leaves, h, cq, cr); });

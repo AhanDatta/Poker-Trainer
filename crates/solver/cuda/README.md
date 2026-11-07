@@ -453,8 +453,37 @@ than exact for the same reason. The f64 work alone bounds the exact
 precision with exact removal at about 150 ms/iteration on this GPU (1/64
 f64 rate), whatever the layout. The independent model was faster with the
 step 2.2 block kernels (82 ms/iteration), which weren't strictly
-bit-identical. Speeding up the leaves (state in shared memory, or a block
-per leaf with in-order scans) is left for a later step.
+bit-identical.
+
+### Faster leaves (step 2.4)
+
+Since 2.4, `GpuPrecision::Fast` may sum in any order (decided
+2026-11-06). Each idea was measured on the chart-range flop with exact
+removal, 40 iterations, runs alternated (ms/iteration):
+
+| Idea | Fast | Exact | Kept |
+|---|---|---|---|
+| step 2.3 kernels (baseline) | 392 | 767 | |
+| fast sweep (`exact_fast.cuh`): one merged per-card array `G = xqr + xrq − 2 same_card` and one scalar `same − s` instead of five arrays and two scalars, ties with both opponents summed directly over the tied hands instead of a second set, one stash row per hand (`partial − lose · le`): a third of the per-lane state | 368 (vs 389–410 without it, same packing) | — | yes |
+| packing live leaves into full warps (in-warp ballots over chunks of 128, then a compaction pass per segment) | ±0 | +1.5% | no |
+
+What limits these kernels (Nsight, Fast): only ~16 of a warp's 32 lanes
+are busy, whatever the packing, because the tree has 1,176 boards (all-in
+runouts sample their own) and so 3,514 showdown segments of ~18 showdowns
+each, and lanes can only share a warp when they share a board's sweep;
+and a lane's state still doesn't fit on chip, so the kernel waits on L2
+(26–51% achieved occupancy, memory throughput 16–45 GB/s, far from either
+peak). Dead leaves cost little (their lanes simply wait), which is why
+packing them didn't pay. Estimates for the other layouts (a leaf per warp
+with lanes owning cards and the state in registers, or several lanes per
+leaf) come out no faster: ~180k warp instructions per leaf. The step 2.4
+target for exact removal (well under 10 s, ~150 ms/iteration) is out of
+reach of these designs; independent removal meets it (Fast ~104
+ms/iteration, about 7 s for the solve).
+
+Planted bugs in the fast sweep: 8, all caught but one (the pair mass not
+clamped at 0, which only moves values that are 0 in exact arithmetic,
+inside the tolerance's noise floor).
 
 ## Running the GPU checks
 

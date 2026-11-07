@@ -12,9 +12,12 @@ use cudarc::driver::{CudaFunction, CudaSlice, LaunchArgs, LaunchConfig, PushKern
 /// Threads per block (`lanes::kBlock`).
 const BLOCK: u32 = 128;
 
-/// Per-lane state fields of each model: `independent::kStateFields`, and
-/// `exact::kStateFields` (two sets of 260).
-const STATE_FIELDS: [u64; 2] = [159, 2 * 260];
+/// Per-lane state fields and stash rows per traverser hand, by model and
+/// precision (`[independent, exact removal][exact, fast]`):
+/// `independent::kStateFields`, `exact::kStateFields` (two sets of 260),
+/// `exact_fast::kStateFields`.
+const STATE_FIELDS: [[u64; 2]; 2] = [[159, 159], [2 * 260, 156]];
+const STASH_ROWS: [[u64; 2]; 2] = [[2, 2], [2, 1]];
 
 /// Most lanes the scratch is sized for: about what this GPU keeps resident
 /// (24 SMs, 7 blocks of 128 each at the kernels' register use). The leaf
@@ -124,7 +127,7 @@ fn model(plan: &MultiPlan) -> usize {
 /// Lanes and scratch sizes for `plan`: `(blocks, [state, reach, stash]
 /// lengths)`. A lane needs its model's state, both opponents' reach in two
 /// list orders (`lanes::Lane`) and two stash rows per traverser hand.
-fn scratch_shape(plan: &MultiPlan) -> Result<(u32, [u64; 3]), GpuError> {
+fn scratch_shape(plan: &MultiPlan, precision: GpuPrecision) -> Result<(u32, [u64; 3]), GpuError> {
     let mut warps = 1u64;
     let (mut reach_rows, mut hands) = (1u64, 1u64);
     for pp in &plan.players {
@@ -133,21 +136,31 @@ fn scratch_shape(plan: &MultiPlan) -> Result<(u32, [u64; 3]), GpuError> {
         reach_rows = reach_rows.max(pp.opponents.iter().map(|v| u64::from(v.hands)).sum());
         hands = hands.max(u64::from(pp.hands));
     }
-    let fields = *STATE_FIELDS.get(model(plan)).ok_or_else(|| invalid("terminal model"))?;
-    let per_lane = fields * 8 + 2 * reach_rows * 4 + 2 * hands * 8;
+    let pick = |t: &[[u64; 2]; 2]| t.get(model(plan)).and_then(|m| m.get(precision_index(precision))).copied();
+    let fields = pick(&STATE_FIELDS).ok_or_else(|| invalid("terminal model"))?;
+    let stash = pick(&STASH_ROWS).ok_or_else(|| invalid("terminal model"))? * hands;
+    let per_lane = fields * 8 + 2 * reach_rows * 4 + stash * 8;
     let lanes = (warps * LEAF_LANES as u64).min(MAX_LANES).min(SCRATCH_BUDGET / per_lane);
     let blocks = (lanes / u64::from(BLOCK)).max(1);
     let lanes = blocks * u64::from(BLOCK);
-    let lens = [fields * lanes, 2 * reach_rows * lanes, 2 * hands * lanes];
+    let lens = [fields * lanes, 2 * reach_rows * lanes, stash * lanes];
     for len in lens {
         u32::try_from(len).map_err(|_| invalid("leaf scratch exceeds u32 indexing"))?;
     }
     Ok((u32::try_from(blocks).map_err(|_| invalid("leaf grid"))?, lens))
 }
 
-/// Device bytes of the leaf scratch for `plan`.
-pub(super) fn scratch_bytes(plan: &MultiPlan) -> Result<u64, GpuError> {
-    let (_, [state, reach, stash]) = scratch_shape(plan)?;
+/// The `[exact, fast]` kernel index of a precision.
+fn precision_index(precision: GpuPrecision) -> usize {
+    match precision {
+        GpuPrecision::Exact => 0,
+        GpuPrecision::Fast => 1,
+    }
+}
+
+/// Device bytes of the leaf scratch for `plan` at `precision`.
+pub(super) fn scratch_bytes(plan: &MultiPlan, precision: GpuPrecision) -> Result<u64, GpuError> {
+    let (_, [state, reach, stash]) = scratch_shape(plan, precision)?;
     Ok(state * 8 + reach * 4 + stash * 8)
 }
 
@@ -163,7 +176,7 @@ pub(super) struct DeviceLeaves {
 
 impl DeviceLeaves {
     pub(super) fn upload(gpu: &Gpu, plan: &MultiPlan, precision: GpuPrecision) -> Result<DeviceLeaves, GpuError> {
-        let (blocks, [state, reach, stash]) = scratch_shape(plan)?;
+        let (blocks, [state, reach, stash]) = scratch_shape(plan, precision)?;
         let len = |n: u64| to_u32(n as usize, "leaf scratch");
         let [p0, p1, p2] = &plan.players;
         Ok(DeviceLeaves {
@@ -183,10 +196,7 @@ impl DeviceLeaves {
                 blocks,
             },
             model: model(plan),
-            precision: match precision {
-                GpuPrecision::Exact => 0,
-                GpuPrecision::Fast => 1,
-            },
+            precision: precision_index(precision),
         })
     }
 }

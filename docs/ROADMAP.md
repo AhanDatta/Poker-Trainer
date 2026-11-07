@@ -95,6 +95,18 @@ Decided (2026-11-05):
    then exact removal.
 3. Runout sampling defaults stay as they are until there are GPU numbers.
 
+Decided (2026-11-06, for step 4):
+4. **Fast may reorder:** 3-way `GpuPrecision::Fast` may give up bit-identity
+   and the CPU's summation order for speed (block-parallel or shuffle
+   reductions, 2.2-style block kernels), for both card-removal models. It
+   stays validated within f32 rounding of the CPU (the 2.3 bound plus its
+   f64 noise floor for values that are 0 in exact arithmetic) and by short
+   and converged solves against the CPU with agreeing exploitability, as
+   heads-up fast mode. `GpuPrecision::Exact` keeps the one-leaf-per-lane
+   CPU-order kernels and stays bit-identical as the reference; it gets
+   faster only where bit-identity allows (e.g. per-lane state in shared
+   memory).
+
 Steps:
 1. 3-way plan (host): flattened multi tree, per-traverser schedule with two
    reach slots per node, strategy-updater marks, folded cut-offs, terminal
@@ -143,7 +155,18 @@ Steps:
    backend wiring, benchmarks. `[ ]`
 
 Target: the chart-range 3-way flop (J♠9♠4♦, 8 × 4 sampled, exact removal)
-from 47 s on the CPU to well under 10 s.
+from 47 s on the CPU to well under 10 s. Status (2026-11-07): met for
+independent removal (Fast ~104 ms/iteration, about 7 s); deferred for exact
+removal (Fast ~368 ms/iteration, about 24 s): the one-leaf-per-lane leaves
+are limited by the tree's 1,176 boards (warps ~half full) and by per-lane
+state that doesn't fit on chip, and the alternatives estimated no better
+(`crates/solver/cuda/README.md`, "Faster leaves").
+
+Open ideas (need the user's decision):
+- Share runout boards: all-in runouts reuse the sampled boards of the
+  betting tree (1,176 boards down to ~32), which would fill the warps (and
+  likely speed up the CPU too); it changes the CPU solver's tree and
+  results.
 
 ## 3. Preflop heuristics (no full preflop solving) `[ ]`
 
