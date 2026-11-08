@@ -2,6 +2,7 @@
 
 mod app;
 mod charts_cmd;
+mod export_cmd;
 mod score_ui;
 mod selfplay;
 mod sizes;
@@ -72,6 +73,17 @@ enum Cmd {
         #[arg(short, long, default_value = "charts.txt")]
         out: String,
     },
+    /// Write saved sessions as CSV, one row per hand (poker-trainer-hands.csv)
+    /// and one per graded decision (poker-trainer-decisions.csv), and print
+    /// bb/100 by format.
+    Export {
+        /// Output directory (the two files in it are replaced).
+        #[arg(short, long, default_value = ".")]
+        out: String,
+        /// Only this saved session (its directory name).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Headless: play hands with a scripted hero and print the solver review
     /// (useful to check performance on your machine).
     Selfplay {
@@ -112,6 +124,10 @@ fn main() -> Result<()> {
         }
         Some(Cmd::ImportCharts { dir, format, players, allin_bb, out }) => {
             charts_cmd::import(dir, format, *players, *allin_bb, out)
+        }
+        Some(Cmd::Export { out, session }) => {
+            let (cfg, _) = load_config(&cli)?;
+            export_cmd::run(&cfg, out, session.as_deref())
         }
         Some(Cmd::Selfplay { hands, style }) => {
             let (mut cfg, _) = load_config(&cli)?;

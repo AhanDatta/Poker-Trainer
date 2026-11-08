@@ -40,6 +40,7 @@ preflop charts and the solver's strategy in any spot, GTO Wizard style.
 | Session frequency score: how your action frequencies match the solver's mixes, spot by spot | ✅ (heads-up pots) |
 | Random number (0–99) at each decision, for playing mixed strategies | ✅ |
 | Saved sessions: continue, start new, delete | ✅ |
+| CSV export of saved hands and graded decisions, bb/100 by format | ✅ |
 | Preflop grading | ❌ not yet (charts drive the AIs and the starting ranges) |
 
 ## Quick start
@@ -98,6 +99,7 @@ cargo run --release -- --config my.toml       # use a specific config
 cargo run --release -- --seed 42              # reproducible hands
 cargo run --release -- selfplay --hands 3     # headless: scripted hero + printed reviews (speed check)
 cargo run --release -- import-charts DIR --format lines --players 6 -o charts.txt   # convert your own ranges
+cargo run --release -- export -o DIR          # saved hands as CSV + bb/100 by format (see below)
 cargo test --workspace                        # unit, property and end-to-end tests
 cargo run --release -p solver --example bench -- flop-exact-lean Ks7s2d   # solver benchmarks
 cargo run --release -p solver --example compare -- Ks7s2d                 # fast vs exact accuracy
@@ -133,6 +135,46 @@ Sessions live in `~/.local/share/poker-trainer/sessions` (macOS:
 per reviewed hand). Set `sessions_dir` to keep them elsewhere,
 `save_sessions = false` to turn saving off, or pass `--no-save` for one run.
 A continued session uses its own saved settings.
+
+### Exporting hands (CSV)
+
+`poker-trainer export` writes every saved session (oldest first) as two CSV
+files in the current directory, or in `-o DIR`. Any earlier export there is
+replaced. `--session ID` exports just one session (its directory name). It then
+prints bb/100 by format:
+
+```text
+Format             Hands    Net (bb)    bb/100
+HU 100bb            1200      +54.30      +4.5
+6-max 100bb          800      -21.60      -2.7
+All                 2000      +32.70      +1.6
+```
+
+* `poker-trainer-hands.csv` has one row per hand:
+  * session and session start (UTC; hands have no time of their own), hand
+    number;
+  * players, format (`HU`, `6-max`, …), stack in bb, big blind, your position,
+    your cards, the board, and each opponent's position and style;
+  * net in chips and in bb, and whether you reached showdown;
+  * the review state (`done`, `cancelled`, `error`, or `none` when there was
+    nothing postflop to grade), graded decisions, their total EV loss in bb,
+    and the worst verdict.
+
+  bb/100 for any slice is `100 × sum(net_bb) / rows`.
+* `poker-trainer-decisions.csv` has one row per graded decision:
+  * street, board, the street's earlier actions, your cards, pot and to-call
+    in bb;
+  * your action and the best one, EV loss (bb and % pot), verdict,
+    exploitability, which solver ran, and the solver's notes.
+
+  When a review solved both the GTO and the villain's-actual ranges, both rows
+  are there. `counted = true` marks the one the in-app stats use. Join to the
+  hands file on `session` + `hand`.
+
+Net results come from settling each saved hand, just as the in-app stats do,
+so the totals match the session list. The table size and stacks are read from
+each hand, so a session where you changed the table size is split correctly.
+Fields are RFC 4180 CSV, UTF-8.
 
 ### Frequency score
 
@@ -545,6 +587,14 @@ the turn and flop benchmarks.
   * saved sessions round-trip, with stats, score, reviews, rolls and grids
     to 1/10000;
   * a session can be continued, and quitting mid-review is handled.
+* **CSV export:**
+  * arbitrary fields (commas, quotes, line breaks) round-trip through the CSV
+    writer;
+  * the exported nets, per-format totals and bb/100 equal the session's own
+    stats, for random tables, table-size changes and hero lines;
+  * the counted decisions and their EV loss equal the stats of a reviewed
+    session;
+  * hands saved before reviews recorded their solver still export.
 * **Debug-build sentinels.** The engine re-checks its invariants after every
   action. The solver checks strategies, reach and values for validity at
   every node. They're free in release builds.
