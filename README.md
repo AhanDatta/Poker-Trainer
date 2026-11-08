@@ -120,6 +120,34 @@ twice within two seconds (any other key cancels), so a stray key press
 doesn't end a session; Ctrl+C quits at once. Either way the session is
 saved (see below).
 
+### Your position
+
+**Your position** on the setup screen (`hero_position` in the config) picks
+where you sit:
+
+* **Rotate** (the default): the button moves every hand, as at a real table
+  (heads-up: you alternate SB and BB).
+* **Random**: a random position every hand.
+* **Only …**: only the positions you tick in the rows below it, e.g. only BTN,
+  or CO and BTN. Hands follow the normal rotation but skip the positions you
+  didn't tick (CO, BTN, CO, BTN, …); with one position you play it every
+  hand. The other players keep their seats around you; new players still sit
+  down now and then.
+
+Positions use the table's names. 6-max: UTG, HJ, CO, BTN, SB, BB. 9-max: UTG,
+UTG+1, UTG+2, LJ, HJ, CO, BTN, SB, BB. Heads-up: SB (the button) and BB, and
+`btn` also means the SB. In the config, names are case-insensitive:
+
+```toml
+hero_position = "btn"            # always the button
+hero_position = ["co", "btn"]    # cutoff and button only
+```
+
+A name the table size doesn't have (say `"lj"` at 6-max) is an error. When you
+switch table size on the setup screen, those positions are unticked instead;
+if none are left, you go back to Rotate. The history list and the reviews show
+your position in every hand.
+
 ### Saved sessions
 
 Every finished hand is saved, with its review, as soon as the review is done.
@@ -614,7 +642,7 @@ game = "typical"             # tough | typical | soft | wild | custom
 custom_table = { Reg = 2, TAG = 1, Fish = 1, Maniac = 1 }   # with game = "custom"
 seat_change_pct = 2.0        # chance per opponent and hand that a new player sits down (0 = never, 100 = every hand)
 show_opponent_style = false  # reveal styles during the hand (always shown in the review)
-hero_position = "alternate"  # alternate (rotate) | random | sb | bb
+hero_position = "alternate"  # alternate (rotate) | random | a position ("btn") | a list (["co", "btn"]); see "Your position"
 stack_bb = 100.0
 rake_pct = 5.0               # 0 = no rake
 rake_cap_bb = 3.0

@@ -5,13 +5,130 @@ use holdem::{BetMenu, PostflopMenu, StreetSizes};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// Where the hero sits. The hero always has seat 0; the button is placed
+/// around it.
+///
+/// In TOML: `"alternate"`, `"random"`, a position name such as `"btn"`, or
+/// a list of them such as `["co", "btn"]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeroPosition {
-    Random,
+    /// The button moves every hand (heads-up: alternate SB and BB).
     Alternate,
-    Sb,
-    Bb,
+    /// A random position every hand.
+    Random,
+    /// Only these positions, by the table's names (upper case, no
+    /// duplicates, never empty), in rotation order: the button moves on
+    /// until the hero is in one of them. One name keeps the hero there.
+    Seats(Vec<String>),
+}
+
+impl HeroPosition {
+    /// Only the given positions (any case). Errors for an empty list or a
+    /// name no table size has; duplicates are dropped.
+    pub fn seats<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Result<HeroPosition, String> {
+        let mut seats: Vec<String> = Vec::new();
+        for name in names {
+            let name = name.as_ref().trim().to_ascii_uppercase();
+            if !(2..=9).any(|n| holdem::game::position_offset(n, &name).is_some()) {
+                return Err(format!(
+                    "hero_position: unknown position {name:?} (use \"alternate\", \"random\", or positions \
+                     such as \"utg\", \"hj\", \"co\", \"btn\", \"sb\", \"bb\")"
+                ));
+            }
+            if !seats.contains(&name) {
+                seats.push(name);
+            }
+        }
+        if seats.is_empty() {
+            return Err("hero_position: the list of positions is empty".into());
+        }
+        Ok(HeroPosition::Seats(seats))
+    }
+
+    /// Whether the hero may play the position `offset` seats after the
+    /// button at a table of `players`.
+    pub fn allows(&self, players: usize, offset: usize) -> bool {
+        match self {
+            HeroPosition::Alternate | HeroPosition::Random => true,
+            HeroPosition::Seats(seats) => {
+                seats.iter().any(|s| holdem::game::position_offset(players, s) == Some(offset))
+            }
+        }
+    }
+
+    /// Checks that a table of `players` has every chosen position.
+    pub fn validate(&self, players: usize) -> Result<(), String> {
+        let HeroPosition::Seats(seats) = self else { return Ok(()) };
+        match seats.iter().find(|s| holdem::game::position_offset(players, s).is_none()) {
+            Some(s) => Err(format!(
+                "hero_position: a {players}-player table has no {s} (its positions: {})",
+                holdem::game::positions(players).join(", ")
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// The chosen positions with `name` ticked or unticked, in the preflop
+    /// order of a table of `players` (rotation and random count as none
+    /// chosen). Errors when no position would be left, or the table has no
+    /// `name`.
+    pub fn toggled(&self, players: usize, name: &str) -> Result<HeroPosition, String> {
+        let Some(offset) = holdem::game::position_offset(players, name) else {
+            return Err(format!("A {players}-player table has no {name}."));
+        };
+        let on = |o: usize| {
+            let chosen = matches!(self, HeroPosition::Seats(_)) && self.allows(players, o);
+            chosen != (o == offset)
+        };
+        let names = holdem::game::positions(players)
+            .into_iter()
+            .filter(|p| holdem::game::position_offset(players, p).is_some_and(on));
+        HeroPosition::seats(names).map_err(|_| "At least one position stays ticked.".to_string())
+    }
+
+    /// The setting for a table of `players`: chosen positions the table
+    /// doesn't have are dropped, and rotation is used if none is left.
+    pub fn for_table(&self, players: usize) -> HeroPosition {
+        match self {
+            HeroPosition::Seats(seats) => {
+                let kept: Vec<&String> =
+                    seats.iter().filter(|s| holdem::game::position_offset(players, s).is_some()).collect();
+                HeroPosition::seats(kept).unwrap_or(HeroPosition::Alternate)
+            }
+            other => other.clone(),
+        }
+    }
+}
+
+impl Serialize for HeroPosition {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            HeroPosition::Alternate => s.serialize_str("alternate"),
+            HeroPosition::Random => s.serialize_str("random"),
+            HeroPosition::Seats(seats) if seats.len() == 1 => s.serialize_str(&seats[0].to_ascii_lowercase()),
+            HeroPosition::Seats(seats) => {
+                seats.iter().map(|p| p.to_ascii_lowercase()).collect::<Vec<_>>().serialize(s)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for HeroPosition {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<HeroPosition, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            One(String),
+            Many(Vec<String>),
+        }
+        let pos = match Repr::deserialize(d)? {
+            Repr::One(s) if s.eq_ignore_ascii_case("alternate") => Ok(HeroPosition::Alternate),
+            Repr::One(s) if s.eq_ignore_ascii_case("random") => Ok(HeroPosition::Random),
+            Repr::One(s) => HeroPosition::seats([s]),
+            Repr::Many(v) => HeroPosition::seats(v),
+        };
+        pos.map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +374,7 @@ pub struct TrainerConfig {
     /// Reveal the opponent's style during the hand (it's always shown in the
     /// review).
     pub show_opponent_style: bool,
+    /// Where you sit: rotate, random, or only the chosen positions.
     pub hero_position: HeroPosition,
     /// Rake in percent of the pot (no flop, no drop). 0 disables rake.
     pub rake_pct: f64,
@@ -339,6 +457,7 @@ impl TrainerConfig {
         if !(2..=9).contains(&self.players) {
             return Err(format!("players = {}: tables of 2 to 9 players are supported", self.players));
         }
+        self.hero_position.validate(self.players)?;
         if !(5.0..=1000.0).contains(&self.stack_bb) {
             return Err("stack_bb must be between 5 and 1000".into());
         }
@@ -429,6 +548,108 @@ mod tests {
         let text = cfg.to_toml();
         let back = TrainerConfig::from_toml(&text).unwrap();
         assert_eq!(cfg, back);
+    }
+
+    fn pos(text: &str) -> Result<HeroPosition, String> {
+        TrainerConfig::from_toml(&format!("players = 9\nhero_position = {text}\n")).map(|c| c.hero_position)
+    }
+
+    #[test]
+    fn hero_position_parses() {
+        assert_eq!(pos("\"alternate\""), Ok(HeroPosition::Alternate));
+        assert_eq!(pos("\"Random\""), Ok(HeroPosition::Random));
+        assert_eq!(pos("\"sb\""), Ok(HeroPosition::Seats(vec!["SB".into()])));
+        assert_eq!(pos("\"utg+2\""), Ok(HeroPosition::Seats(vec!["UTG+2".into()])));
+        let co_btn = HeroPosition::Seats(vec!["CO".into(), "BTN".into()]);
+        assert_eq!(pos("[\"co\", \"BTN\", \"Co\"]"), Ok(co_btn));
+        assert!(pos("\"shark\"").unwrap_err().contains("unknown position"));
+        assert!(pos("[]").unwrap_err().contains("empty"));
+        assert!(pos("[\"btn\", \"rotate\"]").is_err());
+        assert!(pos("3").is_err());
+        // A position the table size doesn't have.
+        let err = TrainerConfig::from_toml("players = 6\nhero_position = \"lj\"\n").unwrap_err();
+        assert!(err.contains("6-player table has no LJ"), "{err}");
+        assert!(err.contains("UTG, HJ, CO, BTN, SB, BB"), "{err}");
+        assert!(TrainerConfig::from_toml("players = 2\nhero_position = \"btn\"\n").is_ok());
+        assert!(TrainerConfig::from_toml("players = 2\nhero_position = \"co\"\n").is_err());
+    }
+
+    #[test]
+    fn hero_position_roundtrips() {
+        for p in [
+            HeroPosition::Alternate,
+            HeroPosition::Random,
+            HeroPosition::seats(["btn"]).unwrap(),
+            HeroPosition::seats(["UTG", "UTG+1", "BB"]).unwrap(),
+        ] {
+            let cfg = TrainerConfig { players: 9, hero_position: p.clone(), ..TrainerConfig::default() };
+            let text = cfg.to_toml();
+            assert_eq!(TrainerConfig::from_toml(&text).unwrap().hero_position, p, "{text}");
+            let json = serde_json::to_string(&cfg).unwrap();
+            assert_eq!(serde_json::from_str::<TrainerConfig>(&json).unwrap().hero_position, p, "{json}");
+        }
+        let one = HeroPosition::seats(["BTN"]).unwrap();
+        let one = TrainerConfig { hero_position: one, ..TrainerConfig::default() };
+        assert!(one.to_toml().contains("hero_position = \"btn\""));
+        let two = TrainerConfig { hero_position: HeroPosition::seats(["co", "btn"]).unwrap(), ..one };
+        let text = two.to_toml();
+        assert!(text.contains("hero_position = [\n    \"co\",\n    \"btn\",\n]"), "{text}");
+        assert!(TrainerConfig::default().to_toml().contains("hero_position = \"alternate\""));
+    }
+
+    #[test]
+    fn hero_position_for_other_tables() {
+        let p = HeroPosition::seats(["UTG+2", "BTN", "SB"]).unwrap();
+        assert_eq!(p.for_table(9), p);
+        assert_eq!(p.for_table(6), HeroPosition::seats(["BTN", "SB"]).unwrap());
+        assert_eq!(HeroPosition::seats(["LJ", "UTG+1"]).unwrap().for_table(6), HeroPosition::Alternate);
+        assert_eq!(HeroPosition::Random.for_table(2), HeroPosition::Random);
+        for n in 2..=9 {
+            for p in [&p, &HeroPosition::Alternate, &HeroPosition::Random] {
+                assert_eq!(p.for_table(n).validate(n), Ok(()));
+            }
+        }
+    }
+
+    #[test]
+    fn hero_position_toggles() {
+        let btn = HeroPosition::seats(["BTN"]).unwrap();
+        // Ticking keeps the table's preflop order.
+        let p = btn.toggled(6, "utg").unwrap();
+        assert_eq!(p, HeroPosition::seats(["UTG", "BTN"]).unwrap());
+        assert_eq!(p.toggled(6, "BTN").unwrap(), HeroPosition::seats(["UTG"]).unwrap());
+        // The last one can't be unticked.
+        assert!(btn.toggled(6, "BTN").is_err());
+        assert!(btn.toggled(6, "UTG+2").is_err());
+        // From rotation nothing is ticked yet.
+        assert_eq!(HeroPosition::Alternate.toggled(9, "CO").unwrap(), HeroPosition::seats(["CO"]).unwrap());
+        // Heads-up BTN is the SB.
+        assert_eq!(btn.toggled(2, "BB").unwrap(), HeroPosition::seats(["SB", "BB"]).unwrap());
+    }
+
+    proptest::proptest! {
+        /// Ticking a position flips exactly that one; the result is valid
+        /// for the table.
+        #[test]
+        fn toggling_flips_one_position(n in 2usize..=9, mask in 1u32..512, pick in 0usize..9) {
+            let all = holdem::game::positions(n);
+            let mask = mask & ((1 << n) - 1);
+            proptest::prop_assume!(mask != 0);
+            let chosen: Vec<&str> = (0..n).filter(|i| mask >> i & 1 == 1).map(|i| all[i]).collect();
+            let p = HeroPosition::seats(&chosen).unwrap();
+            proptest::prop_assert_eq!(p.validate(n), Ok(()));
+            let name = all[pick % n];
+            match p.toggled(n, name) {
+                Ok(q) => {
+                    proptest::prop_assert_eq!(q.validate(n), Ok(()));
+                    for o in 0..n {
+                        let flipped = holdem::game::position_offset(n, name) == Some(o);
+                        proptest::prop_assert_eq!(q.allows(n, o), p.allows(n, o) != flipped);
+                    }
+                }
+                Err(_) => proptest::prop_assert_eq!(chosen, vec![name]),
+            }
+        }
     }
 
     #[test]

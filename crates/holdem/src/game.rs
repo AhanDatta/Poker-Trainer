@@ -620,6 +620,25 @@ pub fn position_name(num_players: usize, offset: usize) -> &'static str {
     }
 }
 
+/// Offset after the button of the position called `name` (any case) at a
+/// table of `num_players`, or `None` if the table has no such position.
+/// Heads-up, "BTN" is the small blind (who has the button).
+pub fn position_offset(num_players: usize, name: &str) -> Option<usize> {
+    if num_players == 2 && name.eq_ignore_ascii_case("BTN") {
+        return Some(0);
+    }
+    (0..num_players).find(|&o| position_name(num_players, o).eq_ignore_ascii_case(name))
+}
+
+/// The positions of a table in preflop action order: UTG first, the big
+/// blind last (heads-up: SB, BB).
+pub fn positions(num_players: usize) -> Vec<&'static str> {
+    if num_players == 2 {
+        return vec!["SB", "BB"];
+    }
+    (3..num_players).chain(0..3).map(|o| position_name(num_players, o)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,5 +792,31 @@ mod tests {
         assert_eq!(names, vec!["BTN", "SB", "BB", "UTG", "HJ", "CO"]);
         let names: Vec<_> = (0..9).map(|o| position_name(9, o)).collect();
         assert_eq!(names, vec!["BTN", "SB", "BB", "UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO"]);
+    }
+
+    #[test]
+    fn position_offsets_invert_position_names() {
+        for n in 2..=10 {
+            for o in 0..n {
+                let name = position_name(n, o);
+                assert_eq!(position_offset(n, name), Some(o), "{n} players, {name}");
+                assert_eq!(position_offset(n, &name.to_lowercase()), Some(o), "{n} players, {name}");
+            }
+            let all = positions(n);
+            assert_eq!(all.len(), n);
+            let mut offsets: Vec<usize> = all.iter().map(|p| position_offset(n, p).unwrap()).collect();
+            assert_eq!(*all.last().unwrap(), "BB", "{n} players");
+            offsets.sort_unstable();
+            assert_eq!(offsets, (0..n).collect::<Vec<_>>(), "{n} players: every position once");
+        }
+        assert_eq!(positions(6), vec!["UTG", "HJ", "CO", "BTN", "SB", "BB"]);
+        assert_eq!(positions(9), vec!["UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO", "BTN", "SB", "BB"]);
+        assert_eq!(positions(2), vec!["SB", "BB"]);
+        // Heads-up the button is the small blind.
+        assert_eq!(position_offset(2, "btn"), Some(0));
+        assert_eq!(position_offset(6, "UTG+2"), None);
+        assert_eq!(position_offset(6, "LJ"), None);
+        assert_eq!(position_offset(2, "CO"), None);
+        assert_eq!(position_offset(9, "nope"), None);
     }
 }
