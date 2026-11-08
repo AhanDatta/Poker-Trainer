@@ -194,6 +194,12 @@ pub struct MultiConfig {
     /// 16-bit compressed regrets and strategies (`Auto`: above 1 GB).
     pub storage: StorageMode,
     pub dcfr: DcfrParams,
+    /// Where solves run (`Backend::Gpu`/`Auto` borrow the GPU for each
+    /// solve at the default precision, as heads-up; `Auto` keeps river roots
+    /// on the CPU). Falls back to the CPU when the GPU can't be used or
+    /// fails; [`MultiSolver::gpu_error`] says why, [`MultiSolver::solved_on`]
+    /// where the last solve ran.
+    pub backend: crate::Backend,
 }
 
 /// DCFR scheme for three players: reach-weighted averages without restarts
@@ -231,6 +237,8 @@ pub struct MultiSolver {
     gpu: Option<Box<crate::gpu::MultiEngine>>,
     /// Why the last solve abandoned the GPU, if it did.
     gpu_error: Option<String>,
+    /// Where the last solve ran.
+    solved_on: crate::SolvedOn,
 }
 
 impl MultiSolver {
@@ -276,6 +284,7 @@ impl MultiSolver {
             #[cfg(feature = "gpu")]
             gpu: None,
             gpu_error: None,
+            solved_on: crate::SolvedOn::Cpu,
         })
     }
 
@@ -355,17 +364,81 @@ impl MultiSolver {
         cancel: &std::sync::atomic::AtomicBool,
         mut on_progress: impl FnMut(&Progress) -> bool,
     ) -> Progress {
+        let borrowed = self.borrow_gpu();
+        let progress = self.solve_on_current_backend(opts, cancel, &mut on_progress);
+        if borrowed {
+            self.release_gpu();
+        }
+        progress
+    }
+
+    /// Where the last solve ran.
+    pub fn solved_on(&self) -> crate::SolvedOn {
+        self.solved_on
+    }
+
+    /// Whether `config.backend` asks for the GPU for this tree.
+    fn wants_gpu(&self) -> bool {
+        match self.config.backend {
+            crate::Backend::Cpu => false,
+            crate::Backend::Gpu => true,
+            crate::Backend::Auto => self.config.root.street != holdem::Street::River,
+        }
+    }
+
+    /// Takes the GPU for one solve if `config.backend` asks for it and no
+    /// engine is in place yet; true if it did. A GPU that can't be used is
+    /// recorded in [`Self::gpu_error`] and the solve stays on the CPU.
+    fn borrow_gpu(&mut self) -> bool {
+        if !self.wants_gpu() {
+            return false;
+        }
+        #[cfg(feature = "gpu")]
+        {
+            if self.gpu.is_some() {
+                return false;
+            }
+            match self.use_gpu(crate::gpu::GpuPrecision::default()) {
+                Ok(()) => true,
+                Err(e) => {
+                    self.gpu_error = Some(e.to_string());
+                    false
+                }
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            self.gpu_error = Some("this build has no GPU support (the solver's `gpu` feature)".into());
+            false
+        }
+    }
+
+    fn solve_on_current_backend(
+        &mut self,
+        opts: &SolveOptions,
+        cancel: &std::sync::atomic::AtomicBool,
+        on_progress: &mut impl FnMut(&Progress) -> bool,
+    ) -> Progress {
         #[cfg(feature = "gpu")]
         if self.gpu.is_some() {
             let result = self
-                .run_solve(opts, cancel, &mut on_progress, Self::gpu_iteration, Self::gpu_convergence)
+                .run_solve(opts, cancel, on_progress, Self::gpu_iteration, Self::gpu_convergence)
                 .and_then(|p| self.download_from_gpu().map(|()| p));
             match result {
-                Ok(p) => return p,
+                Ok(p) => {
+                    if let Some(engine) = &self.gpu {
+                        self.solved_on = match engine.precision() {
+                            crate::gpu::GpuPrecision::Fast => crate::SolvedOn::GpuFast,
+                            crate::gpu::GpuPrecision::Exact => crate::SolvedOn::GpuExact,
+                        };
+                    }
+                    return p;
+                }
                 Err(e) => self.fall_back_to_cpu(e),
             }
         }
-        match self.run_solve(opts, cancel, &mut on_progress, Self::cpu_iteration, Self::cpu_convergence) {
+        self.solved_on = crate::SolvedOn::Cpu;
+        match self.run_solve(opts, cancel, on_progress, Self::cpu_iteration, Self::cpu_convergence) {
             Ok(p) => p,
             Err(never) => match never {},
         }
@@ -745,6 +818,7 @@ pub(crate) mod tests {
             exact_removal: false,
             storage: StorageMode::F32,
             dcfr: multiway_dcfr(),
+            backend: crate::Backend::Cpu,
         }
     }
 
@@ -967,6 +1041,28 @@ pub(crate) mod tests {
         }
     }
 
+    /// Without GPU support a GPU backend solves on the CPU (bit for bit)
+    /// and says why.
+    #[cfg(not(feature = "gpu"))]
+    #[test]
+    fn gpu_backend_without_gpu_support_solves_on_the_cpu() {
+        let cfg = config("Jh8d4c2s", RANGES_FOR_BACKEND, [false; N]);
+        let opts = SolveOptions { max_iterations: 4, target_exploitability_pct: 0.0, check_every: 2 };
+        let mut cpu = MultiSolver::new(cfg.clone()).unwrap();
+        let pc = cpu.solve(&opts, |_| true);
+        for backend in [crate::Backend::Gpu, crate::Backend::Auto] {
+            let mut m = MultiSolver::new(MultiConfig { backend, ..cfg.clone() }).unwrap();
+            let p = m.solve(&opts, |_| true);
+            assert_eq!(pc.exploitability.to_bits(), p.exploitability.to_bits(), "{backend:?}");
+            assert!(!m.uses_gpu());
+            assert_eq!(m.solved_on(), crate::SolvedOn::Cpu);
+            assert!(m.gpu_error().is_some_and(|e| e.contains("gpu")), "{backend:?}: {:?}", m.gpu_error());
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    const RANGES_FOR_BACKEND: [&str; N] = ["JJ, 88, AJ, KJ", "AA, KK, AJ, QJ", "TT, 99, KJ, QJ"];
+
     /// With exact card removal between opponents (and no rake) the game is
     /// exactly zero-sum, for any strategies.
     #[test]
@@ -1037,6 +1133,7 @@ mod size_tests {
                 exact_removal: false,
                 storage: StorageMode::Auto,
                 dcfr: multiway_dcfr(),
+                backend: crate::Backend::Cpu,
             };
             let t = Instant::now();
             let mut m = MultiSolver::new(cfg).unwrap();

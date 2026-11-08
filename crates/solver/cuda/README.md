@@ -345,7 +345,9 @@ strategy-updater flags); bit-identical to the CPU in every test (solves on
 every spot and model, a converged solve, random spots), 4 planted bugs
 caught, sanitizer clean.
 `GpuPrecision::Exact` is bit-identical to the CPU; `Fast` sums the leaves
-in double-single.
+in double-single. `MultiConfig::backend` (`Gpu`, or `Auto` off the river)
+takes the GPU for each solve at the default precision, as heads-up, and
+`MultiSolver::solved_on` says where a solve ran (the trainer's solver tag).
 
 How a traversal for player `p` maps to kernels (plan: `src/gpu/multi/plan.rs`):
 

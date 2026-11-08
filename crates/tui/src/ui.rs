@@ -238,8 +238,8 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
             SolverBackend::Auto => s(
                 "Auto",
                 if solver::GPU_SUPPORT {
-                    "Heads-up turn and flop solves run on the NVIDIA GPU when one is free (several times \
-                     faster), otherwise on the CPU."
+                    "Turn and flop solves (heads-up and 3-way) run on the NVIDIA GPU when one is free \
+                     (several times faster heads-up, about 2-3x for 3-way), otherwise on the CPU."
                 } else {
                     "This build has no GPU support (build with --features gpu), so solves run on the CPU."
                 },
@@ -247,7 +247,8 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
             SolverBackend::Gpu => s(
                 "GPU",
                 if solver::GPU_SUPPORT {
-                    "Heads-up solves run on the NVIDIA GPU; if it can't be used, on the CPU (with a note)."
+                    "Solves (heads-up and 3-way) run on the NVIDIA GPU; if it can't be used, on the CPU \
+                     (with a note)."
                 } else {
                     "This build has no GPU support (build with --features gpu), so solves run on the CPU."
                 },

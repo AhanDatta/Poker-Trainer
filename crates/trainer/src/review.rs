@@ -1026,6 +1026,7 @@ pub(crate) fn multi_config(
         exact_removal: s.multiway_exact_removal,
         storage: solver::StorageMode::Auto,
         dcfr: solver::multi::multiway_dcfr(),
+        backend: s.backend.into(),
     }
 }
 
@@ -1140,8 +1141,18 @@ pub(crate) fn run_multi(
     if cancel.load(Ordering::Relaxed) {
         return Err(CANCELLED.into());
     }
-    // 3-way solves run on the CPU.
-    Ok((solver, SolveSummary { exploitability_pct: progress.exploitability_pct, solver: SolverTag::default() }))
+    if let (SolverBackend::Gpu, Some(e)) = (s.backend, solver.gpu_error()) {
+        sink.note(format!("{label}: solved on the CPU (GPU not used: {e})."));
+    }
+    let gpu_fallback = match s.backend {
+        SolverBackend::Cpu => None,
+        SolverBackend::Auto | SolverBackend::Gpu => solver.gpu_error().map(str::to_string),
+    };
+    let summary = SolveSummary {
+        exploitability_pct: progress.exploitability_pct,
+        solver: SolverTag { by: solver.solved_on().into(), gpu_fallback },
+    };
+    Ok((solver, summary))
 }
 
 /// Seats still in the hand at the start of `street`.

@@ -118,6 +118,7 @@ pub(crate) struct MultiEngine {
     values: CudaSlice<f32>,
     /// The leaf kernels' lists, groups and scratch.
     leaves: leaves::DeviceLeaves,
+    precision: GpuPrecision,
 }
 
 impl MultiEngine {
@@ -155,11 +156,17 @@ impl MultiEngine {
             alive: [gpu.zeros(a0)?, gpu.zeros(a1)?],
             values: gpu.zeros(values_len)?,
             leaves: leaves::DeviceLeaves::upload(&gpu, &plan, precision)?,
+            precision,
             gpu,
             plan,
         };
         engine.gpu.stream.synchronize()?;
         Ok(engine)
+    }
+
+    /// How the leaves are summed.
+    pub(crate) fn precision(&self) -> GpuPrecision {
+        self.precision
     }
 
     /// Copies the regrets and strategy sums back into host storage.

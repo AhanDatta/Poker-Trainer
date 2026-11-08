@@ -101,6 +101,7 @@ fn main() {
             solver::StorageMode::Auto
         },
         dcfr: dcfr_from_env(),
+        backend: solver::Backend::Cpu,
     };
     if std::env::var("COMPARE").is_ok() {
         compare(mc, iters);

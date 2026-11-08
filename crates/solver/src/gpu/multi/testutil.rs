@@ -95,6 +95,7 @@ pub(crate) fn arb_multi_config() -> impl Strategy<Value = (MultiConfig, bool)> {
                 exact_removal: exact,
                 storage: StorageMode::F32,
                 dcfr: multiway_dcfr(),
+                backend: crate::Backend::Cpu,
             };
             (cfg, batch)
         },

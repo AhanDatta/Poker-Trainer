@@ -22,6 +22,7 @@ use proptest::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+mod backend;
 mod leaves;
 
 /// The test spots with independent opponents.

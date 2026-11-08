@@ -24,7 +24,7 @@ pub enum FlopMode {
     Exact,
 }
 
-/// Where heads-up solves run (three-way solves always use the CPU).
+/// Where solves run (heads-up and three-way).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SolverBackend {
@@ -34,8 +34,8 @@ pub enum SolverBackend {
     /// The GPU, for turn and flop spots, when the build has GPU support and
     /// an NVIDIA GPU is free; the CPU otherwise.
     Auto,
-    /// The GPU for every heads-up solve; the CPU (with a note saying why)
-    /// when it can't be used.
+    /// The GPU for every solve; the CPU (with a note saying why) when it
+    /// can't be used.
     Gpu,
 }
 
