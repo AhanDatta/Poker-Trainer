@@ -3,10 +3,9 @@
 //! sequence of level-by-level launches on one stream (see
 //! `cuda/kernels/multi_traverse.cu` and `multi_leaves.cu`).
 //!
-//! So far: f32 storage and whole trees, either terminal model. With
+//! Whole trees, either terminal model, f32 or 16-bit storage. With
 //! `GpuPrecision::Exact` everything is bit-identical to the CPU; `Fast`
-//! sums the leaves in double-single. 16-bit storage and tree splitting come
-//! later (ROADMAP 2.4).
+//! sums the leaves in double-single.
 
 mod leaves;
 #[cfg(test)]
@@ -14,7 +13,10 @@ mod tests;
 
 use super::plan::{MultiPlan, MultiPlayerPlan, OpponentView};
 use crate::cfr::{Discount, Mode};
-use crate::gpu::device::{begin_traversal, check_memory, per_hand_grid, push, push_mut, Buffer, HostStorage, ModeArgs};
+use crate::gpu::device::{
+    begin_traversal, check_memory, per_hand_grid, per_terminal_grid, push, push_mut, Buffer, DeviceStorage, HostStorage,
+    ModeArgs, THREADS,
+};
 use crate::gpu::{invalid, Gpu, GpuError, GpuPrecision};
 use crate::multi::N;
 use cudarc::driver::{CudaSlice, LaunchArgs, PushKernelArg};
@@ -80,6 +82,8 @@ struct DeviceTree {
     offsets: Buffer<u32>,
     cards: Buffer<u32>,
     chance_factor: Buffer<f32>,
+    /// Per node: a decision node's scale slot in 16-bit storage.
+    scale_slots: Buffer<u32>,
     /// Per node: its value row (one per node: the tree isn't split yet).
     rows: Buffer<u32>,
 }
@@ -93,6 +97,7 @@ impl DeviceTree {
             offsets: gpu.upload(&plan.offset)?,
             cards: gpu.upload(&plan.card)?,
             chance_factor: gpu.upload(&plan.chance_factor)?,
+            scale_slots: gpu.upload(&plan.scale_slot)?,
             rows: gpu.upload(&rows)?,
         })
     }
@@ -104,8 +109,7 @@ pub(crate) struct MultiEngine {
     plan: MultiPlan,
     tree: DeviceTree,
     players: [DevicePlayer; N],
-    regrets: CudaSlice<f32>,
-    sums: CudaSlice<f32>,
+    storage: DeviceStorage,
     /// Per opponent (of whichever traverser runs): reach slots and their
     /// alive flags, sized for the largest traversal.
     reach: [CudaSlice<f32>; 2],
@@ -117,8 +121,7 @@ pub(crate) struct MultiEngine {
 }
 
 impl MultiEngine {
-    /// Uploads a validated plan and the current storage. Fails (for a CPU
-    /// fallback) on what the GPU can't run yet: 16-bit storage.
+    /// Uploads a validated plan and the current storage.
     pub(crate) fn new(
         gpu: Gpu,
         plan: MultiPlan,
@@ -127,9 +130,6 @@ impl MultiEngine {
     ) -> Result<MultiEngine, GpuError> {
         plan.validate()?;
         let storage_bytes = host.check(plan.storage_len, plan.num_scale_slots)?;
-        let HostStorage::F32 { regrets, sums } = host else {
-            return Err(invalid("3-way GPU solves need f32 storage for now"));
-        };
         let mut reach_len = [0usize; 2];
         let mut alive_len = [0usize; 2];
         let mut hands = 0usize;
@@ -150,8 +150,7 @@ impl MultiEngine {
         let engine = MultiEngine {
             tree: DeviceTree::upload(&gpu, &plan)?,
             players: [DevicePlayer::upload(&gpu, p0)?, DevicePlayer::upload(&gpu, p1)?, DevicePlayer::upload(&gpu, p2)?],
-            regrets: gpu.upload(regrets)?.data,
-            sums: gpu.upload(sums)?.data,
+            storage: DeviceStorage::upload(&gpu, host)?,
             reach: [gpu.zeros(r0)?, gpu.zeros(r1)?],
             alive: [gpu.zeros(a0)?, gpu.zeros(a1)?],
             values: gpu.zeros(values_len)?,
@@ -166,20 +165,8 @@ impl MultiEngine {
     /// Copies the regrets and strategy sums back into host storage.
     pub(crate) fn download(&self, host: HostStorage<'_>) -> Result<(), GpuError> {
         host.check(self.plan.storage_len, self.plan.num_scale_slots)?;
-        let HostStorage::F32 { regrets, sums } = host else {
-            return Err(invalid("host and device storage kinds differ"));
-        };
-        let stream = &self.gpu.stream;
-        for (src, dst) in [(&self.regrets, regrets), (&self.sums, sums)] {
-            if dst.is_empty() {
-                continue;
-            }
-            // Exactly `dst.len()` elements, so cudarc's length assertion
-            // can't fire.
-            let view = src.try_slice(..dst.len()).ok_or_else(|| invalid("device storage too short"))?;
-            stream.memcpy_dtoh(&view, dst)?;
-        }
-        stream.synchronize()?;
+        self.storage.download(&self.gpu, host)?;
+        self.gpu.stream.synchronize()?;
         Ok(())
     }
 
@@ -226,7 +213,7 @@ impl MultiEngine {
     /// Enqueues one traversal by player `p`: begin, levels top-down, the
     /// leaves, levels bottom-up. The root's values end up in row 0.
     fn traverse(&mut self, p: usize, mode: Mode) -> Result<(), GpuError> {
-        let MultiEngine { gpu, plan, tree, players, regrets, sums, reach, alive, values, leaves, .. } = self;
+        let MultiEngine { gpu, plan, tree, players, storage, reach, alive, values, leaves, .. } = self;
         let plan: &MultiPlan = plan;
         let (Some(pp), Some(dp)) = (plan.players.get(p), players.get(p)) else {
             return Err(invalid("player out of range"));
@@ -243,8 +230,7 @@ impl MultiEngine {
             tree,
             pp,
             dp,
-            regrets,
-            sums,
+            storage,
             reach,
             alive,
             values,
@@ -269,8 +255,7 @@ struct Pass<'a> {
     tree: &'a DeviceTree,
     pp: &'a MultiPlayerPlan,
     dp: &'a DevicePlayer,
-    regrets: &'a mut CudaSlice<f32>,
-    sums: &'a mut CudaSlice<f32>,
+    storage: &'a mut DeviceStorage,
     reach: &'a mut [CudaSlice<f32>; 2],
     alive: &'a mut [CudaSlice<u32>; 2],
     values: &'a mut CudaSlice<f32>,
@@ -311,7 +296,7 @@ impl Pass<'_> {
     /// Top-down, root first: each opponent's nodes split its reach, chance
     /// nodes split both (one launch per opponent).
     fn top_down(&mut self) -> Result<(), GpuError> {
-        let Pass { gpu, plan, tree, pp, dp, regrets, sums, reach, alive, m, reach_len, alive_len, .. } = self;
+        let Pass { gpu, plan, tree, pp, dp, storage, reach, alive, m, reach_len, alive_len, .. } = self;
         let (kernels, stream) = (&gpu.kernels, &gpu.stream);
         for lv in &pp.levels {
             for (k, span) in lv.opp.iter().enumerate() {
@@ -321,11 +306,17 @@ impl Pass<'_> {
                 let opp_hands = nth(&dp.opponents, k)?.hands;
                 let (reach, _) = this_and_other(reach, k)?;
                 let (alive, other_alive) = this_and_other(alive, k)?;
-                let mut l = stream.launch_builder(&kernels.multi_opponent_split);
+                let compressed = matches!(storage, DeviceStorage::Compressed { .. });
+                let kernel =
+                    if compressed { &kernels.multi_opponent_split_compressed } else { &kernels.multi_opponent_split };
+                let mut l = stream.launch_builder(kernel);
                 push(&mut l, nth(&dp.opp_nodes, k)?);
                 l.arg(&span.start).arg(&span.count);
                 push(&mut l, &tree.actions);
                 push(&mut l, &tree.offsets);
+                if compressed {
+                    push(&mut l, &tree.scale_slots);
+                }
                 push(&mut l, &dp.strategy_update);
                 push(&mut l, nth(&dp.slots, k)?);
                 push(&mut l, nth(&dp.child_slots, k)?);
@@ -333,12 +324,25 @@ impl Pass<'_> {
                 push_mut(&mut l, alive, nth(alive_len, k)?);
                 push(&mut l, nth(&dp.slots, 1 - k)?);
                 l.arg(other_alive).arg(nth(alive_len, 1 - k)?);
-                l.arg(&**regrets).arg(&plan.storage_len);
-                push_mut(&mut l, sums, &plan.storage_len);
+                let grid = match storage {
+                    DeviceStorage::F32 { regrets, sums } => {
+                        l.arg(&*regrets).arg(&plan.storage_len);
+                        push_mut(&mut l, sums, &plan.storage_len);
+                        per_hand_grid(opp_hands, span.count)
+                    }
+                    DeviceStorage::Compressed { regrets, sums, strategy_scale, .. } => {
+                        l.arg(&*regrets).arg(&plan.storage_len);
+                        push_mut(&mut l, sums, &plan.storage_len);
+                        push_mut(&mut l, strategy_scale, &plan.num_scale_slots);
+                        // One block per node.
+                        per_terminal_grid(span.count, THREADS, 0)
+                    }
+                };
                 l.arg(&opp_hands).arg(&m.mode).arg(&m.strategy_discount).arg(&m.reach_weighted);
-                // SAFETY: arguments match `multi_opponent_split`; every index
-                // the kernel reads comes from the validated plan.
-                unsafe { l.launch(per_hand_grid(opp_hands, span.count)) }?;
+                // SAFETY: arguments match `multi_opponent_split` (or its
+                // 16-bit twin); every index the kernel reads, scale slots
+                // included, comes from the validated plan.
+                unsafe { l.launch(grid) }?;
             }
             if lv.chance.count == 0 {
                 continue;
@@ -392,26 +396,43 @@ impl Pass<'_> {
 
     /// Bottom-up, deepest level first: own updates, opponent sums, chance sums.
     fn bottom_up(&mut self) -> Result<(), GpuError> {
-        let Pass { gpu, plan, tree, pp, dp, regrets, sums, alive, values, m, alive_len, values_len, .. } =
-            self;
+        let Pass { gpu, plan, tree, pp, dp, storage, alive, values, m, alive_len, values_len, .. } = self;
         let (kernels, stream, hands) = (&gpu.kernels, &gpu.stream, pp.hands);
         let opponents = Opponents { dp, alive, alive_len };
         for lv in pp.levels.iter().rev() {
             if lv.own.count > 0 {
-                let mut l = stream.launch_builder(&kernels.multi_own_update);
+                let compressed = matches!(storage, DeviceStorage::Compressed { .. });
+                let kernel = if compressed { &kernels.multi_own_update_compressed } else { &kernels.multi_own_update };
+                let mut l = stream.launch_builder(kernel);
                 push(&mut l, &dp.own_nodes);
                 l.arg(&lv.own.start).arg(&lv.own.count);
                 push(&mut l, &tree.actions);
                 push(&mut l, &tree.offsets);
+                if compressed {
+                    push(&mut l, &tree.scale_slots);
+                }
                 push(&mut l, &tree.first_child);
                 opponents.push_liveness(&mut l)?;
-                push_mut(&mut l, regrets, &plan.storage_len);
-                l.arg(&**sums).arg(&plan.storage_len);
+                let grid = match &mut **storage {
+                    DeviceStorage::F32 { regrets, sums } => {
+                        push_mut(&mut l, regrets, &plan.storage_len);
+                        l.arg(&*sums).arg(&plan.storage_len);
+                        per_hand_grid(hands, lv.own.count)
+                    }
+                    DeviceStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => {
+                        push_mut(&mut l, regrets, &plan.storage_len);
+                        push_mut(&mut l, regret_scale, &plan.num_scale_slots);
+                        l.arg(&*sums).arg(&plan.storage_len);
+                        l.arg(&*strategy_scale).arg(&plan.num_scale_slots);
+                        per_terminal_grid(lv.own.count, THREADS, 0)
+                    }
+                };
                 push(&mut l, &tree.rows);
                 push_mut(&mut l, values, values_len);
                 l.arg(&hands).arg(&m.mode).arg(&m.positive_discount).arg(&m.negative_discount);
-                // SAFETY: arguments match `multi_own_update`; indices are validated.
-                unsafe { l.launch(per_hand_grid(hands, lv.own.count)) }?;
+                // SAFETY: arguments match `multi_own_update` (or its 16-bit
+                // twin); indices, scale slots included, are validated.
+                unsafe { l.launch(grid) }?;
             }
             for (k, span) in lv.opp.iter().enumerate() {
                 if span.count == 0 {

@@ -16,7 +16,7 @@ solve to the GPU: river, turn and flop roots, with `f32` or 16-bit
 (compressed) storage, bit-identical to the CPU with `GpuPrecision::Exact`.
 `MultiSolver::use_gpu(precision)` does the same for three-player solves,
 with either terminal model (independent opponents or exact card removal
-between them), so far with f32 storage and whole trees (see "Three-player
+between them), f32 or 16-bit storage, so far whole trees (see "Three-player
 solves").
 
 GPU memory holds the regret/strategy storage, the plan, and scratch buffers:
@@ -41,7 +41,9 @@ is declined (`GpuError::OutOfMemory`) and stays on the CPU.
 | `include/solver/independent.cuh` | a lane's independent-opponent leaf: hand-order compatible mass, strength-order beaten mass | `Hands::compat`, `Table::beat`, `multi::cfr::independent_showdown`, `pay_all` |
 | `include/solver/exact.cuh` | a lane's exact-removal leaf: the two-set inclusion–exclusion sweep (`Set`) | `multi::exact` (`Pairs`, `showdown`, `fold_values`) |
 | `kernels/traverse.cu` | heads-up level-by-level traversal: the steps of `traversal.cuh` over one level's nodes | `river::run`, `cfr::chance`, `cfr::own_node_update` |
-| `kernels/traverse_compressed.cu` | the two storage-touching traversal steps for 16-bit storage, one block per node (a block-wide max sets each node's new scale) | `Storage::update_regrets`, `Storage::update_strat` |
+| `include/solver/compressed_steps.cuh` | the two storage-touching traversal steps for 16-bit storage, one block per node (a block-wide max sets each node's new scale), shared by both player counts | `Storage::update_regrets`, `Storage::update_strat` |
+| `kernels/traverse_compressed.cu` | heads-up entry points of the 16-bit steps | |
+| `kernels/multi_traverse_compressed.cu` | three-player entry points of the 16-bit steps (both opponents' liveness, strategy-updater flags) | |
 | `kernels/terminal.cu` | fold and showdown values (card removal by inclusion–exclusion, prefix sums), with the rounding of the CPU evaluator that handles each terminal | `eval::fold_batch` / `eval_fold`, `eval::showdown_batch` / `eval_showdown` |
 | `kernels/multi_traverse.cu` | three-player level-by-level traversal: each opponent's splits, two-slot chance splits, own update, sums | `multi::cfr::traverse` |
 | `kernels/multi_leaves.cu` | three-player leaves, per terminal model and precision: showdown warps (one board, same folded players), fixed-payoff lanes (one pair of reach slots each) | `multi::cfr::pay_all`, `independent_showdown`, `multi::exact::showdown`, `river::subtree`'s leaves |
@@ -333,9 +335,15 @@ What remains:
 
 `MultiSolver::use_gpu(precision)` moves a 3-way solve to the GPU, with
 independent opponents or exact card removal between them (`exact_removal`,
-with or without river batching), f32 storage and whole trees; 16-bit
-storage is declined with an error and the solve stays on the CPU. A GPU
-failure mid-solve restarts the solve on the CPU, as heads-up.
+with or without river batching), f32 or 16-bit storage and whole trees. A
+GPU failure mid-solve restarts the solve on the CPU, as heads-up. 16-bit
+storage uses the heads-up kernels' two storage-touching steps
+(`compressed_steps.cuh`, one block per node, the CPU's encoding and
+saturation, a block-wide maximum for each node's new scale) behind 3-way
+entry points (`multi_traverse_compressed.cu`: both opponents' liveness, the
+strategy-updater flags); bit-identical to the CPU in every test (solves on
+every spot and model, a converged solve, random spots), 4 planted bugs
+caught, sanitizer clean.
 `GpuPrecision::Exact` is bit-identical to the CPU; `Fast` sums the leaves
 in double-single.
 

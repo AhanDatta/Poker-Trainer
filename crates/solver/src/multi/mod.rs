@@ -443,11 +443,10 @@ impl MultiSolver {
     }
 
     /// Moves solves to the GPU until [`Self::release_gpu`] (experimental;
-    /// so far only with f32 storage, and `GpuPrecision::Fast` only with
-    /// exact removal: anything else is an error and solves stay on the
-    /// CPU). With `GpuPrecision::Exact`, bit-identical to the CPU; `Fast`
-    /// sums the exact-removal leaves in double-single (each value within
-    /// one f32 rounding of the CPU's). Results are copied back when `solve`
+    /// either terminal model, f32 or 16-bit storage). With
+    /// `GpuPrecision::Exact`, bit-identical to the CPU; `Fast` sums the
+    /// leaves in double-single (each value within one f32 rounding of the
+    /// CPU's). Results are copied back when `solve`
     /// returns, after which `query` and the other read methods work as
     /// usual. If the GPU fails during a solve, the solver discards the GPU
     /// state, restarts the solve from scratch on the CPU, and

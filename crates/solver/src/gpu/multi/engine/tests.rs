@@ -94,8 +94,15 @@ fn randomize_storage(m: &mut MultiSolver, seed: u64) {
 
 /// Every regret and strategy sum, as raw bits.
 fn storage_bits(m: &mut MultiSolver) -> Vec<u32> {
-    let HostStorage::F32 { regrets, sums } = m.store_mut().gpu_view() else { panic!("f32 storage expected") };
-    regrets.iter().chain(sums.iter()).map(|x| x.to_bits()).collect()
+    match m.store_mut().gpu_view() {
+        HostStorage::F32 { regrets, sums } => regrets.iter().chain(sums.iter()).map(|x| x.to_bits()).collect(),
+        HostStorage::Compressed { regrets, sums, regret_scale, strategy_scale } => regrets
+            .iter()
+            .map(|&x| x as u16 as u32)
+            .chain(sums.iter().map(|&x| u32::from(x)))
+            .chain(regret_scale.iter().chain(strategy_scale.iter()).map(|x| x.to_bits()))
+            .collect(),
+    }
 }
 
 /// `(differing values, total)` between two equally long bit vectors.
@@ -258,25 +265,12 @@ fn continues_a_cpu_solve_bit_for_bit() {
     assert!(storage_bits(&mut cpu) == storage_bits(&mut mixed), "storage differs");
 }
 
-/// What the GPU can't run yet is an error, and solves stay on the CPU.
+/// Switching the terminal model or river batching drops the engine (its
+/// plan is stale), and the solver goes on on the CPU.
 #[test]
-fn declines_what_it_cannot_run_yet() {
+fn model_changes_release_the_engine() {
     let Some(_) = device() else { return };
     let (_, base) = independent_spots().into_iter().find(|s| s.0 == "river").unwrap();
-    let mut compressed = base.clone();
-    compressed.storage = StorageMode::Compressed;
-    for (what, cfg, precision) in [
-        ("16-bit storage", compressed.clone(), GpuPrecision::Exact),
-        ("16-bit storage, fast", compressed, GpuPrecision::Fast),
-    ] {
-        let mut m = MultiSolver::new(cfg).unwrap();
-        assert!(matches!(m.use_gpu(precision), Err(GpuError::InvalidInput(_))), "{what}: accepted");
-        assert!(!m.uses_gpu(), "{what}");
-        let p = m.solve(&opts(2, 2), |_| true);
-        assert!(p.exploitability.is_finite() && p.iteration == 2, "{what}: CPU solve");
-    }
-    // Switching the terminal model or river batching drops the engine (its
-    // plan is stale).
     let mut m = MultiSolver::new(base).unwrap();
     m.use_gpu(GpuPrecision::Exact).unwrap();
     m.set_exact_removal(true);
@@ -284,6 +278,44 @@ fn declines_what_it_cannot_run_yet() {
     m.use_gpu(GpuPrecision::Exact).unwrap();
     m.set_batch_river(false);
     assert!(!m.uses_gpu());
+    let p = m.solve(&opts(2, 2), |_| true);
+    assert!(p.exploitability.is_finite() && p.iteration == 2);
+}
+
+/// `cfg` with 16-bit storage.
+fn compressed(mut cfg: MultiConfig) -> MultiConfig {
+    cfg.storage = StorageMode::Compressed;
+    cfg
+}
+
+/// 16-bit storage (the CPU's encoding and saturation, per-node scales):
+/// 5-iteration solves with their progress reports, bit for bit, on every
+/// spot under every model.
+#[test]
+fn compressed_storage_solves_match_cpu_bit_for_bit() {
+    for (name, cfg, model) in variants() {
+        let Some(_) = device() else { return };
+        assert_solves_agree(compressed(cfg), model, 5, 2, &format!("{name}, 16-bit"));
+    }
+}
+
+/// 16-bit storage to 1% of the pot, both models: bit for bit.
+#[test]
+fn compressed_converged_solve_matches_cpu_bit_for_bit() {
+    let cfg = compressed(sampled(config("Jh8d4c2s", RANGES, [false; N]), 0, 12, 1));
+    for model in [MODELS[0], MODELS[1]] {
+        let Some(_) = device() else { return };
+        let mut cpu = solver(&cfg, model);
+        let mut on_gpu = solver(&cfg, model);
+        on_gpu.use_gpu(GpuPrecision::Exact).unwrap();
+        let opts = SolveOptions { max_iterations: 150, target_exploitability_pct: 1.0, check_every: 25 };
+        let pc = cpu.solve(&opts, |_| true);
+        let pg = on_gpu.solve(&opts, |_| true);
+        assert!(on_gpu.gpu_error().is_none(), "{:?}", on_gpu.gpu_error());
+        assert!(pc.exploitability_pct < 5.0, "{model:?}: the CPU solve didn't converge: {pc:?}");
+        assert_eq!((pc.iteration, pc.exploitability.to_bits()), (pg.iteration, pg.exploitability.to_bits()));
+        assert!(storage_bits(&mut cpu) == storage_bits(&mut on_gpu), "{model:?}: storage differs");
+    }
 }
 
 /// Guards against vacuous property tests: most generated spots are
@@ -302,6 +334,30 @@ fn generated_spots_mostly_run_on_the_gpu() {
         })
         .count();
     assert!(ok * 4 >= total * 3, "only {ok} of {total} generated spots run on the GPU");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// Random spots with 16-bit storage: 3 iterations bit for bit.
+    #[test]
+    fn random_compressed_spots_match_cpu_bit_for_bit((cfg, batch) in arb_multi_config()) {
+        let Some(_) = device() else { return Ok(()) };
+        let cfg = compressed(cfg);
+        if MultiSolver::new(cfg.clone()).is_err() {
+            return Ok(());
+        }
+        let model = Model { exact: cfg.exact_removal, batch };
+        let mut cpu = solver(&cfg, model);
+        let mut on_gpu = solver(&cfg, model);
+        on_gpu.use_gpu(GpuPrecision::Exact).unwrap();
+        let pc = cpu.solve(&opts(3, 3), |_| true);
+        let pg = on_gpu.solve(&opts(3, 3), |_| true);
+        prop_assert!(on_gpu.gpu_error().is_none());
+        prop_assert_eq!(pc.exploitability.to_bits(), pg.exploitability.to_bits());
+        let (diff, total) = differing(&storage_bits(&mut on_gpu), &storage_bits(&mut cpu));
+        prop_assert!(diff == 0, "{} of {} storage values differ", diff, total);
+    }
 }
 
 proptest! {

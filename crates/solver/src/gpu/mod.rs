@@ -77,6 +77,8 @@ static TRAVERSE_COMPRESSED_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR")
 static TERMINAL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/terminal.fatbin"));
 static MULTI_TRAVERSE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_traverse.fatbin"));
 static MULTI_LEAVES_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/multi_leaves.fatbin"));
+static MULTI_TRAVERSE_COMPRESSED_IMAGE: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/multi_traverse_compressed.fatbin"));
 static DOUBLE_FLOAT_CHECK_IMAGE: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/double_float_check.fatbin"));
 
@@ -233,6 +235,9 @@ struct Kernels {
     multi_own_update: CudaFunction,
     multi_opponent_sum: CudaFunction,
     multi_chance_sum: CudaFunction,
+    /// The 16-bit storage steps (multi_traverse_compressed.cu).
+    multi_opponent_split_compressed: CudaFunction,
+    multi_own_update_compressed: CudaFunction,
     /// Three-player leaves (multi_leaves.cu), `[model][precision]`:
     /// `[independent, exact removal][exact, fast]`.
     multi_showdowns: [[CudaFunction; 2]; 2],
@@ -281,6 +286,7 @@ impl Gpu {
         let double_float = ctx.load_module(Ptx::from_binary(DOUBLE_FLOAT_CHECK_IMAGE.to_vec()))?;
         let multi_traverse = ctx.load_module(Ptx::from_binary(MULTI_TRAVERSE_IMAGE.to_vec()))?;
         let multi_leaves = ctx.load_module(Ptx::from_binary(MULTI_LEAVES_IMAGE.to_vec()))?;
+        let multi_compressed = ctx.load_module(Ptx::from_binary(MULTI_TRAVERSE_COMPRESSED_IMAGE.to_vec()))?;
         let leaf = |name: &str| multi_leaves.load_function(name);
         let kernels = Kernels {
             regret_match_f32: regret.load_function("regret_match_f32")?,
@@ -305,6 +311,8 @@ impl Gpu {
             multi_own_update: multi_traverse.load_function("multi_own_update")?,
             multi_opponent_sum: multi_traverse.load_function("multi_opponent_sum")?,
             multi_chance_sum: multi_traverse.load_function("multi_chance_sum")?,
+            multi_opponent_split_compressed: multi_compressed.load_function("multi_opponent_split_compressed")?,
+            multi_own_update_compressed: multi_compressed.load_function("multi_own_update_compressed")?,
             multi_showdowns: [
                 [leaf("multi_showdowns_independent_exact")?, leaf("multi_showdowns_independent_fast")?],
                 [leaf("multi_showdowns_exact_exact")?, leaf("multi_showdowns_exact_fast")?],

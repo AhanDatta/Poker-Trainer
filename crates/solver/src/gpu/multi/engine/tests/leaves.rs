@@ -303,6 +303,28 @@ fn fast_short_solves_match_cpu() {
     }
 }
 
+/// Fast precision with 16-bit storage, 5 iterations: as the f32 short solves.
+#[test]
+fn fast_compressed_short_solves_match_cpu() {
+    for (name, cfg, model) in variants() {
+        let Some(_) = device() else { return };
+        let mut cfg = cfg;
+        cfg.storage = StorageMode::Compressed;
+        let mut cpu = solver(&cfg, model);
+        let mut fast = solver(&cfg, model);
+        fast.use_gpu(GpuPrecision::Fast).unwrap();
+        let pc = cpu.solve(&opts(5, 5), |_| true);
+        let pf = fast.solve(&opts(5, 5), |_| true);
+        assert!(fast.uses_gpu() && fast.gpu_error().is_none(), "{name}: {:?}", fast.gpu_error());
+        let rel = (pc.exploitability - pf.exploitability).abs() / pc.exploitability.abs().max(1e-9);
+        assert!(rel <= 0.03, "{name}: exploitability {} vs {}", pc.exploitability, pf.exploitability);
+        let (a, b) = (cpu.query(&[]).unwrap().range_strategy(), fast.query(&[]).unwrap().range_strategy());
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() <= 0.01, "{name}: range strategy {a:?} vs {b:?}");
+        }
+    }
+}
+
 /// A fast-precision solve to 1% of the pot: as many iterations as the CPU
 /// (within 20%) and the same range-level root strategy (CFR amplifies
 /// rounding differences in single hands near indifference, so those can't
