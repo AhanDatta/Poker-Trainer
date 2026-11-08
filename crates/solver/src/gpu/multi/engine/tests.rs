@@ -24,6 +24,7 @@ use rand::{Rng, SeedableRng};
 
 mod backend;
 mod leaves;
+mod split;
 
 /// The test spots with independent opponents.
 fn independent_spots() -> Vec<(&'static str, MultiConfig)> {

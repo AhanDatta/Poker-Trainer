@@ -16,8 +16,8 @@ solve to the GPU: river, turn and flop roots, with `f32` or 16-bit
 (compressed) storage, bit-identical to the CPU with `GpuPrecision::Exact`.
 `MultiSolver::use_gpu(precision)` does the same for three-player solves,
 with either terminal model (independent opponents or exact card removal
-between them), f32 or 16-bit storage, so far whole trees (see "Three-player
-solves").
+between them), f32 or 16-bit storage, whole or split trees (see
+"Three-player solves").
 
 GPU memory holds the regret/strategy storage, the plan, and scratch buffers:
 opponent reach per "slot" and one row of values per node. When the whole
@@ -25,6 +25,7 @@ tree's scratch doesn't fit in free memory (keeping a 0.5 GB margin), the tree
 is **split**: the subtrees under the root street's chance nodes (turn
 subtrees on a flop, river subtrees on a turn) become *chunks*, and groups of
 chunks run one after another in one shared scratch region (see
+`src/gpu/segments.rs`, shared by both player counts, and
 `src/gpu/plan/schedule.rs`). Splitting changes no result bit; it only costs
 more, smaller launches. A tree whose storage plus a single chunk doesn't fit
 is declined (`GpuError::OutOfMemory`) and stays on the CPU.
@@ -335,8 +336,9 @@ What remains:
 
 `MultiSolver::use_gpu(precision)` moves a 3-way solve to the GPU, with
 independent opponents or exact card removal between them (`exact_removal`,
-with or without river batching), f32 or 16-bit storage and whole trees. A
-GPU failure mid-solve restarts the solve on the CPU, as heads-up. 16-bit
+with or without river batching), f32 or 16-bit storage, whole trees or
+trees split to fit the device (below). A GPU failure mid-solve restarts the
+solve on the CPU, as heads-up. 16-bit
 storage uses the heads-up kernels' two storage-touching steps
 (`compressed_steps.cuh`, one block per node, the CPU's encoding and
 saturation, a block-wide maximum for each node's new scale) behind 3-way
@@ -361,6 +363,30 @@ How a traversal for player `p` maps to kernels (plan: `src/gpu/multi/plan.rs`):
 - Nodes after `p`'s fold are fixed-payoff leaves, even when they have
   children; nothing below them is scheduled.
 - The per-node steps are the heads-up kernels' (`traversal.cuh`).
+
+### Splitting
+
+A tree whose scratch doesn't fit splits as heads-up does (`gpu::segments`):
+the top of the tree, and groups of the subtrees under the root street's
+chance nodes run one after another. With three players a traverser has two
+reach-slot spaces, one per opponent, each with a top region and a group
+region (a group's alive flags are cleared before it runs); the split
+weighs six slot spaces (three traversers by two opponents) and a value row
+per node for the most hands, against the free memory minus the storage, a
+0.5 GB margin and the leaf kernels' scratch (at most 528 MB). The leaf
+groups (showdown warps, fixed-payoff jobs) are built per segment, and each
+segment's leaves run with that segment. Checked: split solves bit for bit
+against whole solves (both precisions, both models, 16-bit storage, random
+storage, one chunk per group) and an exact split solve against the CPU; a
+memory budget that splits the tree, and one too small for any group
+(declined); split plans against whole plans (same nodes, leaves, marks;
+property test); 15 corruptions of the segment data rejected; 5 planted bugs
+(a group's alive flags not cleared, groups not summed, one opponent's flags
+cleared, groups or jobs of the wrong segment) each caught by 4 tests;
+sanitizer clean. Whole-tree solves are unchanged in speed (chart-range
+flop, alternating runs, ms/iteration before / after: exact removal fast
+440 / 410 and 394 / 407, exact 981 / 868 and 918 / 920, independent fast
+110 / 110 and 131 / 131).
 
 ### Leaves: one per lane
 

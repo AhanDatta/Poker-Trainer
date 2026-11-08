@@ -527,7 +527,21 @@ impl MultiSolver {
     #[cfg(feature = "gpu")]
     pub fn use_gpu(&mut self, precision: crate::gpu::GpuPrecision) -> Result<(), crate::gpu::GpuError> {
         let device = crate::gpu::Gpu::new()?;
-        let plan = crate::gpu::MultiPlan::build(&self.ctx())?;
+        let budget = crate::gpu::MultiEngine::scratch_budget(&device, &self.store.gpu_view())?;
+        self.use_gpu_with(device, precision, crate::gpu::Scratch::Budget(budget))
+    }
+
+    /// [`Self::use_gpu`] with the tree split as `scratch` says (trees too
+    /// big for the device's memory run in groups of subtrees).
+    #[cfg(feature = "gpu")]
+    pub(crate) fn use_gpu_with(
+        &mut self,
+        device: crate::gpu::Gpu,
+        precision: crate::gpu::GpuPrecision,
+        scratch: crate::gpu::Scratch,
+    ) -> Result<(), crate::gpu::GpuError> {
+        let fixed = crate::gpu::MultiEngine::fixed_bytes();
+        let plan = crate::gpu::MultiPlan::build_with(&self.ctx(), scratch, fixed)?;
         let engine = crate::gpu::MultiEngine::new(device, plan, self.store.gpu_view(), precision)?;
         self.gpu = Some(Box::new(engine));
         self.gpu_error = None;
@@ -561,7 +575,7 @@ impl MultiSolver {
     }
 
     #[cfg(feature = "gpu")]
-    fn gpu_engine(&mut self) -> Result<&mut crate::gpu::MultiEngine, crate::gpu::GpuError> {
+    pub(crate) fn gpu_engine(&mut self) -> Result<&mut crate::gpu::MultiEngine, crate::gpu::GpuError> {
         self.gpu.as_deref_mut().ok_or_else(|| crate::gpu::GpuError::InvalidInput("no GPU engine".into()))
     }
 

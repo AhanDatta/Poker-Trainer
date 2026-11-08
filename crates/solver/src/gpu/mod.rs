@@ -32,6 +32,7 @@ mod device;
 mod engine;
 mod multi;
 mod plan;
+mod segments;
 mod shared;
 mod tables;
 #[cfg(test)]

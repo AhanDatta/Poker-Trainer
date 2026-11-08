@@ -100,6 +100,9 @@ __device__ inline void zero(Span<float> out) noexcept {
 template <Accumulator A>
 struct ShowdownArgs {
   Span<const u32> groups;
+  /// The segment's groups: `[first_group, first_group + group_count)`.
+  u32 first_group;
+  u32 group_count;
   Span<const u32> lanes;
   Span<const u32> showdowns;
   Span<const double> win;
@@ -122,10 +125,12 @@ __device__ void showdowns_impl(const ShowdownArgs<A>& args) {
   const Grid g = grid();
   const Lane<A> lane = args.scratch.lane(g);
   const ReachRows rows = ReachRows::of(args.opp);
-  const u32 num_groups = static_cast<u32>(args.groups.size() / 4u);
+  // This segment's groups.
+  const u32 num_groups = args.group_count;
   const auto [p, q, r] = args.seats;
   const TwoOpponents live{args.opp[0].slots, args.opp[0].alive, args.opp[1].slots, args.opp[1].alive};
-  for (u32 w = g.warp; w < num_groups; w += g.warps) {
+  for (u32 k = g.warp; k < num_groups; k += g.warps) {
+    const u32 w = args.first_group + k;
     const u32 order = args.groups[4u * w];
     const u32 folded = args.groups[4u * w + 1u];
     const u32 start = args.groups[4u * w + 2u];
@@ -169,6 +174,9 @@ __device__ void showdowns_impl(const ShowdownArgs<A>& args) {
 
 template <Accumulator A>
 struct FixedArgs {
+  /// The segment's jobs: `[first_job, first_job + job_count)`.
+  u32 first_job;
+  u32 job_count;
   Span<const u32> job_slots[2];
   Span<const u32> job_off;
   Span<const u32> job_leaves;
@@ -210,13 +218,14 @@ __device__ void fixed_impl(const FixedArgs<A>& args) {
   const Grid g = grid();
   const Lane<A> lane = args.scratch.lane(g);
   const ReachRows rows = ReachRows::of(args.opp);
-  const u32 jobs = static_cast<u32>(args.job_slots[0].size());
+  // This segment's jobs.
+  const u32 jobs = args.job_count;
   const auto [p, q, r] = args.seats;
   for (u32 w = g.warp; w * kLanes < jobs; w += g.warps) {
-    const u32 job = w * kLanes + g.lane;
-    if (job >= jobs) {
+    if (w * kLanes + g.lane >= jobs) {
       continue;
     }
+    const u32 job = args.first_job + w * kLanes + g.lane;
     const u32 sq = args.job_slots[0][job];
     const u32 sr = args.job_slots[1][job];
     const auto leaves = args.job_leaves.subspan(args.job_off[job], args.job_off[job + 1u] - args.job_off[job]);
@@ -282,7 +291,7 @@ using u16 = cuda::std::uint16_t;
 /// for all of their threads.
 #define SOLVER_SHOWDOWN_ENTRY(NAME, M, A)                                                               \
   extern "C" __global__ void __launch_bounds__(solver::lanes::kBlock)                                  \
-      NAME(const u32* groups_ptr, u32 groups_len, const u32* lanes_ptr, u32 lanes_len,                  \
+      NAME(const u32* groups_ptr, u32 groups_len, u32 first_group, u32 group_count, const u32* lanes_ptr, u32 lanes_len,                  \
            const u32* showdowns_ptr, u32 showdowns_len, const double* win_ptr, u32 win_len,             \
            const double* lose_ptr, u32 lose_len, const double* split2_ptr, u32 split2_len,              \
            const double* split3_ptr, u32 split3_len, const u32* rows_ptr, u32 rows_len, float* values_ptr, \
@@ -290,7 +299,7 @@ using u16 = cuda::std::uint16_t;
            SOLVER_LEAF_OPPONENT_PARAMS(q_), SOLVER_LEAF_OPPONENT_PARAMS(r_), SOLVER_LEAF_SCRATCH_PARAMS(A)) { \
     using namespace solver;                                                                             \
     const ShowdownArgs<A> args{                                                                         \
-        .groups = view(groups_ptr, groups_len),                                                         \
+        .groups = view(groups_ptr, groups_len), .first_group = first_group, .group_count = group_count,                                                         \
         .lanes = view(lanes_ptr, lanes_len),                                                            \
         .showdowns = view(showdowns_ptr, showdowns_len),                                                \
         .win = view(win_ptr, win_len),                                                                  \
@@ -312,7 +321,7 @@ using u16 = cuda::std::uint16_t;
 /// Fixed payoffs. Grid as for the showdowns.
 #define SOLVER_FIXED_ENTRY(NAME, M, A)                                                                  \
   extern "C" __global__ void __launch_bounds__(solver::lanes::kBlock)                                  \
-      NAME(const u32* job_q_ptr, u32 job_q_len, const u32* job_r_ptr, u32 job_r_len, const u32* job_off_ptr, \
+      NAME(u32 first_job, u32 job_count, const u32* job_q_ptr, u32 job_q_len, const u32* job_r_ptr, u32 job_r_len, const u32* job_off_ptr, \
            u32 job_off_len, const u32* job_leaves_ptr, u32 job_leaves_len, const u32* fixed_ptr,          \
            u32 fixed_len, const double* payoff_ptr, u32 payoff_len, const u32* scalar_ptr, u32 scalar_len, \
            const u32* rows_ptr, u32 rows_len, float* values_ptr, u32 values_len, u32 hands, u32 p, u32 q,  \
@@ -320,7 +329,7 @@ using u16 = cuda::std::uint16_t;
            SOLVER_LEAF_OPPONENT_PARAMS(r_), SOLVER_LEAF_SCRATCH_PARAMS(A)) {                             \
     using namespace solver;                                                                             \
     const FixedArgs<A> args{                                                                            \
-        .job_slots = {view(job_q_ptr, job_q_len), view(job_r_ptr, job_r_len)},                          \
+        .first_job = first_job, .job_count = job_count, .job_slots = {view(job_q_ptr, job_q_len), view(job_r_ptr, job_r_len)},                          \
         .job_off = view(job_off_ptr, job_off_len),                                                      \
         .job_leaves = view(job_leaves_ptr, job_leaves_len),                                             \
         .fixed = view(fixed_ptr, fixed_len),                                                            \

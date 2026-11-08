@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 mod leaves;
 mod mutations;
+mod split;
 
 /// `cfg` with each terminal model and river batching on and off (batching
 /// only takes effect with exact removal).

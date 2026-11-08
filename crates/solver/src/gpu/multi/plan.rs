@@ -22,12 +22,15 @@
 //! * a node either opponent can't reach is dead (a run-time property of
 //!   the reach, tracked by the kernels as in the heads-up port).
 //!
-//! The plan is a single segment: tree splitting, fused opponent nodes and
-//! grouping fixed-payoff leaves by reach pair (as `river::subtree` does)
-//! come later. [`MultiPlan::validate`] checks every invariant the kernels
-//! will rely on, so a malformed plan is an error here rather than an
+//! A tree too big for the device's scratch memory is split into segments
+//! (`gpu::segments`, as heads-up): the top of the tree and groups of the
+//! subtrees under the root street's chance nodes, run one group at a time
+//! in shared scratch regions of value rows and of each opponent's reach
+//! slots. [`MultiPlan::validate`] checks every invariant the kernels will
+//! rely on, so a malformed plan is an error here rather than an
 //! out-of-bounds access on the device.
 
+use crate::gpu::segments::{self, Scratch, Segmentation, Shape};
 use crate::gpu::shared::{at, ensure, pack_cards, to_u32, Span, CARDS, NONE};
 use crate::gpu::{invalid, GpuError};
 use crate::multi::cfr::{payoffs, strategy_updater, Ctx};
@@ -50,6 +53,23 @@ pub(crate) struct MultiLevel {
     pub opp: [Span; 2],
     pub own: Span,
     pub chance: Span,
+}
+
+/// One segment of one traverser's schedule.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MultiSegment {
+    /// Into `levels`.
+    pub levels: Span,
+    /// Into `fixed` / `fixed_payoff`.
+    pub fixed: Span,
+    /// Into the showdown arrays.
+    pub showdowns: Span,
+    /// Per opponent: the reach slots this segment's nodes hand out (a
+    /// group's alive flags are cleared before it runs).
+    pub fresh_slots: [Span; 2],
+    /// Into the leaf groups: showdown groups and fixed-payoff jobs.
+    pub groups: Span,
+    pub jobs: Span,
 }
 
 /// One opponent as one traverser sees it.
@@ -82,10 +102,15 @@ pub(crate) struct MultiPlayerPlan {
     /// opponent's reach splits (its own nodes and chance nodes; children's
     /// slots are consecutive), `NONE` elsewhere.
     pub child_slot: [Vec<u32>; 2],
-    /// Per opponent: slots used (slot 0 is the root's).
+    /// Per opponent: slots used (slot 0 is the root's), and the end of the
+    /// top region (the group region follows).
     pub num_slots: [u32; 2],
-    /// Top-down order (no level is empty); bottom-up walks it backwards.
+    pub top_slots: [u32; 2],
+    /// Top-down order (no level is empty) within each segment; bottom-up
+    /// walks a segment's levels backwards.
     pub levels: Vec<MultiLevel>,
+    /// Segment 0 (the top) first, then the groups.
+    pub segments: Vec<MultiSegment>,
     /// Per opponent: that opponent's nodes this traversal expands.
     pub opp_nodes: [Vec<u32>; 2],
     pub own_nodes: Vec<u32>,
@@ -103,7 +128,7 @@ pub(crate) struct MultiPlayerPlan {
     pub showdown_table: Vec<u32>,
     pub win: Vec<f64>,
     pub lose: Vec<f64>,
-    /// The leaf kernels' warps.
+    /// The leaf kernels' warps (each segment's groups and jobs contiguous).
     pub leaves: LeafGroups,
 }
 
@@ -153,6 +178,12 @@ pub(crate) struct MultiPlan {
     pub players: [MultiPlayerPlan; N],
     /// The hand lists of the leaf kernels' sweeps.
     pub lists: SweepLists,
+    /// Per node: its segment and value row (`gpu::segments`).
+    pub segment_of: Vec<u32>,
+    pub num_segments: u32,
+    pub row: Vec<u32>,
+    pub top_rows: u32,
+    pub num_rows: u32,
 }
 
 /// The role of an expanded node in one player's traversal.
@@ -201,8 +232,17 @@ fn nth<'a, T>(v: &'a [T], k: usize, what: &str) -> Result<&'a T, GpuError> {
 }
 
 impl MultiPlan {
-    /// Flattens the three-player tree behind `ctx`.
+    /// Flattens the three-player tree behind `ctx`, whole (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build(ctx: &Ctx) -> Result<MultiPlan, GpuError> {
+        Self::build_with(ctx, Scratch::Unlimited, 0)
+    }
+
+    /// Flattens the three-player tree behind `ctx`, split into segments
+    /// under `scratch` given the device bytes the solve needs besides the
+    /// split-dependent scratch (`fixed_bytes`: storage excluded, as the
+    /// budget is).
+    pub(crate) fn build_with(ctx: &Ctx, scratch: Scratch, fixed_bytes: u64) -> Result<MultiPlan, GpuError> {
         let tree = ctx.tree;
         let nodes = &tree.nodes;
         let nn = nodes.len();
@@ -260,6 +300,12 @@ impl MultiPlan {
                     .is_some_and(|n| matches!(n.kind, Kind::Player(_)) && n.street == holdem::Street::River);
             plan.scalar.push(u32::from(!batched));
         }
+        let seg = plan.segment(ctx, scratch, fixed_bytes)?;
+        plan.segment_of = seg.segment_of;
+        plan.num_segments = seg.num_segments;
+        plan.row = seg.row;
+        plan.top_rows = seg.top_rows;
+        plan.num_rows = seg.num_rows;
         plan.players = [
             MultiPlayerPlan::build(ctx, &plan, 0)?,
             MultiPlayerPlan::build(ctx, &plan, 1)?,
@@ -271,11 +317,82 @@ impl MultiPlan {
             LeafGroups::build(&plan, &plan.players[1])?,
             LeafGroups::build(&plan, &plan.players[2])?,
         ];
-        for (pp, g) in plan.players.iter_mut().zip(groups) {
+        for (pp, (g, spans)) in plan.players.iter_mut().zip(groups) {
             pp.leaves = g;
+            for (segment, (groups, jobs)) in pp.segments.iter_mut().zip(spans) {
+                segment.groups = groups;
+                segment.jobs = jobs;
+            }
         }
         plan.validate()?;
         Ok(plan)
+    }
+
+    /// Splits the tree under `scratch` (`gpu::segments`): six slot spaces,
+    /// one per traverser and opponent; a pass needs, per opponent buffer,
+    /// the most reach slots of any traverser times that opponent's hands,
+    /// one alive flag per slot, and a value row per node for the most hands.
+    fn segment(&self, ctx: &Ctx, scratch: Scratch, fixed_bytes: u64) -> Result<Segmentation, GpuError> {
+        let nodes = &ctx.tree.nodes;
+        let root_street = nodes.first().ok_or_else(|| invalid("empty tree"))?.street;
+        let mut roots: Vec<usize> = Vec::new();
+        for node in nodes.iter().filter(|n| matches!(n.kind, Kind::Chance) && n.street == root_street) {
+            roots.extend(node.children());
+        }
+        let hands: Vec<u64> = (0..N).map(|x| ctx.hands.len(x) as u64).collect();
+        let fresh = |i: usize| -> Result<Vec<u64>, GpuError> {
+            let mut out = Vec::with_capacity(2 * N);
+            for p in 0..N {
+                let expands = self.expands(i, p)?;
+                let actor = at(&self.actor, i, "actor")?;
+                let children = u64::from(at(&self.actions, i, "actions")?);
+                for k in 0..2 {
+                    let splits = expands
+                        && match actor {
+                            CHANCE => true,
+                            a if a as usize == p => false,
+                            a => opponent_index(p, a as usize) == Some(k),
+                        };
+                    out.push(if splits { children } else { 0 });
+                }
+            }
+            Ok(out)
+        };
+        let shape = Shape { num_nodes: nodes.len(), children: &|i| self.children(i), roots, fresh: &fresh, spaces: 2 * N };
+        let bytes = |rows: u64, slots: &[u64]| -> u64 {
+            let mut reach = [0u64; 2];
+            let mut alive = [0u64; 2];
+            for p in 0..N {
+                let (q, r) = opponents(p);
+                let buffers = reach.iter_mut().zip(alive.iter_mut());
+                for (k, (o, (reach_k, alive_k))) in [q, r].into_iter().zip(buffers).enumerate() {
+                    let s = slots.get(2 * p + k).copied().unwrap_or(0);
+                    *reach_k = (*reach_k).max(s * hands.get(o).copied().unwrap_or(0));
+                    *alive_k = (*alive_k).max(s);
+                }
+            }
+            let values = rows * hands.iter().copied().max().unwrap_or(0);
+            fixed_bytes + 4 * (reach[0] + reach[1] + alive[0] + alive[1] + values)
+        };
+        segments::segment(&shape, scratch, &bytes)
+    }
+
+    /// Per segment (index 0 empty): its chunk roots, in node order.
+    fn segment_roots(&self) -> Result<Vec<Vec<u32>>, GpuError> {
+        let mut roots = vec![Vec::new(); self.num_segments as usize];
+        for i in 0..self.num_nodes as usize {
+            let seg = at(&self.segment_of, i, "segment_of")?;
+            for c in self.children(i)? {
+                let child_seg = at(&self.segment_of, c, "segment_of")?;
+                if child_seg != seg {
+                    roots
+                        .get_mut(child_seg as usize)
+                        .ok_or_else(|| invalid("segment out of range"))?
+                        .push(to_u32(c, "nodes")?);
+                }
+            }
+        }
+        Ok(roots)
     }
 
     /// Player `p`'s root weights (as its opponents' plans hold them).
@@ -299,8 +416,8 @@ impl MultiPlan {
             + b(&self.card)
             + b(&self.chance_factor)
             + b(&self.folded)
-            // The engine's value-row map (one row per node).
-            + b(&self.actions);
+            // The engine's value-row map.
+            + b(&self.row);
         let view = |v: &OpponentView| b(&v.cards) + b(&v.weights);
         let player = |pp: &MultiPlayerPlan| {
             pp.slot.iter().chain(&pp.child_slot).chain(&pp.opp_nodes).map(|v| b(v)).sum::<u64>()
@@ -388,9 +505,10 @@ impl MultiPlayerPlan {
     }
 
     /// Levels, reach slots, strategy-update marks and leaf lists of player
-    /// `p`'s traversal, breadth-first from the root.
+    /// `p`'s traversal, segment by segment (the top from the root, each
+    /// group from its chunk roots), breadth-first. Each group's fresh slots
+    /// start where the top's end, so groups share that region.
     fn build_schedule(&mut self, ctx: &Ctx, plan: &MultiPlan, p: usize) -> Result<(), GpuError> {
-        let nodes = &ctx.tree.nodes;
         let nn = plan.num_nodes as usize;
         self.slot = [vec![NONE; nn], vec![NONE; nn]];
         self.child_slot = [vec![NONE; nn], vec![NONE; nn]];
@@ -398,8 +516,65 @@ impl MultiPlayerPlan {
         for s in &mut self.slot {
             put(s, 0, 0, "slot")?;
         }
+        let roots = plan.segment_roots()?;
         let mut next_slot = [1u64; 2];
-        let mut frontier = vec![0u32];
+        let mut top_slots = [1u64; 2];
+        let mut max_group = [0u64; 2];
+        for seg in 0..plan.num_segments {
+            if seg == 1 {
+                top_slots = next_slot;
+            }
+            if seg >= 1 {
+                next_slot = top_slots;
+            }
+            let fresh_start = next_slot;
+            let (level_start, fixed_start, showdown_start) = (self.levels.len(), self.fixed.len(), self.showdowns.len());
+            let frontier: Vec<u32> = if seg == 0 {
+                vec![0]
+            } else {
+                let mine = roots.get(seg as usize).ok_or_else(|| invalid("segment out of range"))?;
+                // The chunk roots this traversal reaches (a chance node it
+                // expands gave them slots).
+                mine.iter().copied().filter(|&r| self.slot[0].get(r as usize).is_some_and(|&s| s != NONE)).collect()
+            };
+            self.schedule_segment(ctx, plan, p, seg, frontier, &mut next_slot)?;
+            if seg >= 1 {
+                for ((m, &n), &t) in max_group.iter_mut().zip(&next_slot).zip(&top_slots) {
+                    *m = (*m).max(n - t);
+                }
+            }
+            let span = |a: u64, b: u64| -> Result<Span, GpuError> {
+                Span::of(usize::try_from(a).map_err(|_| invalid("slots"))?, usize::try_from(b).map_err(|_| invalid("slots"))?, "reach slots")
+            };
+            self.segments.push(MultiSegment {
+                levels: Span::of(level_start, self.levels.len(), "levels")?,
+                fixed: Span::of(fixed_start, self.fixed.len(), "fixed leaves")?,
+                showdowns: Span::of(showdown_start, self.showdowns.len(), "showdowns")?,
+                fresh_slots: [span(fresh_start[0], next_slot[0])?, span(fresh_start[1], next_slot[1])?],
+                ..MultiSegment::default()
+            });
+        }
+        if plan.num_segments == 1 {
+            top_slots = next_slot;
+        }
+        let slots = |x: u64| u32::try_from(x).map_err(|_| invalid("too many reach slots"));
+        self.top_slots = [slots(top_slots[0])?, slots(top_slots[1])?];
+        self.num_slots = [slots(top_slots[0] + max_group[0])?, slots(top_slots[1] + max_group[1])?];
+        Ok(())
+    }
+
+    /// Schedules segment `seg` of player `p`'s traversal from `frontier`,
+    /// handing out fresh reach slots from `next_slot`.
+    fn schedule_segment(
+        &mut self,
+        ctx: &Ctx,
+        plan: &MultiPlan,
+        p: usize,
+        seg: u32,
+        mut frontier: Vec<u32>,
+        next_slot: &mut [u64; 2],
+    ) -> Result<(), GpuError> {
+        let nodes = &ctx.tree.nodes;
         while !frontier.is_empty() {
             let start = |v: &[u32]| -> Result<Span, GpuError> {
                 Ok(Span { start: to_u32(v.len(), "node list")?, count: 0 })
@@ -482,7 +657,10 @@ impl MultiPlayerPlan {
                     }
                 }
                 for c in node.children() {
-                    next.push(to_u32(c, "nodes")?);
+                    // Chunk roots belong to their group's segment.
+                    if at(&plan.segment_of, c, "segment_of")? == seg {
+                        next.push(to_u32(c, "nodes")?);
+                    }
                 }
             }
             let count =
@@ -496,10 +674,6 @@ impl MultiPlayerPlan {
             }
             frontier = next;
         }
-        self.num_slots = [
-            u32::try_from(next_slot[0]).map_err(|_| invalid("too many reach slots"))?,
-            u32::try_from(next_slot[1]).map_err(|_| invalid("too many reach slots"))?,
-        ];
         Ok(())
     }
 }

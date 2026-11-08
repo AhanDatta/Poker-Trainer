@@ -3,7 +3,8 @@
 //! sequence of level-by-level launches on one stream (see
 //! `cuda/kernels/multi_traverse.cu` and `multi_leaves.cu`).
 //!
-//! Whole trees, either terminal model, f32 or 16-bit storage. With
+//! Either terminal model, f32 or 16-bit storage, whole trees or trees split
+//! into segments run group by group (`gpu::segments`). With
 //! `GpuPrecision::Exact` everything is bit-identical to the CPU; `Fast`
 //! sums the leaves in double-single.
 
@@ -11,15 +12,15 @@ mod leaves;
 #[cfg(test)]
 mod tests;
 
-use super::plan::{MultiPlan, MultiPlayerPlan, OpponentView};
+use super::plan::{MultiLevel, MultiPlan, MultiPlayerPlan, MultiSegment, OpponentView};
 use crate::cfr::{Discount, Mode};
 use crate::gpu::device::{
     begin_traversal, check_memory, per_hand_grid, per_terminal_grid, push, push_mut, Buffer, DeviceStorage, HostStorage,
-    ModeArgs, THREADS,
+    ModeArgs, MAX_TERMINAL_BLOCKS, MEMORY_MARGIN, THREADS,
 };
 use crate::gpu::{invalid, Gpu, GpuError, GpuPrecision};
 use crate::multi::N;
-use cudarc::driver::{CudaSlice, LaunchArgs, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchArgs, LaunchConfig, PushKernelArg};
 
 /// One opponent of a traverser on the device (`OpponentView`).
 struct DeviceOpponent {
@@ -84,13 +85,12 @@ struct DeviceTree {
     chance_factor: Buffer<f32>,
     /// Per node: a decision node's scale slot in 16-bit storage.
     scale_slots: Buffer<u32>,
-    /// Per node: its value row (one per node: the tree isn't split yet).
+    /// Per node: its value row (`MultiPlan::row`).
     rows: Buffer<u32>,
 }
 
 impl DeviceTree {
     fn upload(gpu: &Gpu, plan: &MultiPlan) -> Result<DeviceTree, GpuError> {
-        let rows: Vec<u32> = (0..plan.num_nodes).collect();
         Ok(DeviceTree {
             actions: gpu.upload(&plan.actions)?,
             first_child: gpu.upload(&plan.first_child)?,
@@ -98,7 +98,7 @@ impl DeviceTree {
             cards: gpu.upload(&plan.card)?,
             chance_factor: gpu.upload(&plan.chance_factor)?,
             scale_slots: gpu.upload(&plan.scale_slot)?,
-            rows: gpu.upload(&rows)?,
+            rows: gpu.upload(&plan.row)?,
         })
     }
 }
@@ -142,7 +142,7 @@ impl MultiEngine {
                 *alive = (*alive).max(slots as usize);
             }
         }
-        let values_len = plan.num_nodes as usize * hands;
+        let values_len = plan.num_rows as usize * hands;
         let scratch = 4 * (reach_len.iter().sum::<usize>() + alive_len.iter().sum::<usize>() + values_len) as u64
             + leaves::scratch_bytes(&plan, precision)?;
         check_memory(&gpu, plan.device_bytes() + storage_bytes + scratch)?;
@@ -162,6 +162,21 @@ impl MultiEngine {
         };
         engine.gpu.stream.synchronize()?;
         Ok(engine)
+    }
+
+    /// Device bytes the plan and its split-dependent scratch may take next
+    /// to `host`'s storage: the free memory minus the storage and a margin
+    /// for the display and the CUDA runtime (`Scratch::Budget` for
+    /// `MultiPlan::build_with`).
+    pub(crate) fn scratch_budget(gpu: &Gpu, host: &HostStorage<'_>) -> Result<u64, GpuError> {
+        let (free, _total) = gpu.stream.context().mem_get_info()?;
+        Ok((free as u64).saturating_sub(MEMORY_MARGIN).saturating_sub(host.bytes()))
+    }
+
+    /// Device bytes besides the plan's arrays and the split-dependent
+    /// scratch: at most the leaf kernels' per-lane scratch.
+    pub(crate) fn fixed_bytes() -> u64 {
+        leaves::MAX_SCRATCH_BYTES
     }
 
     /// How the leaves are summed.
@@ -230,7 +245,7 @@ impl MultiEngine {
         for ((len, &slots), view) in reach_len.iter_mut().zip(&pp.num_slots).zip(&pp.opponents) {
             *len = slots.checked_mul(view.hands).ok_or_else(|| invalid("reach buffer overflow"))?;
         }
-        let values_len = plan.num_nodes.checked_mul(pp.hands).ok_or_else(|| invalid("value buffer overflow"))?;
+        let values_len = plan.num_rows.checked_mul(pp.hands).ok_or_else(|| invalid("value buffer overflow"))?;
         let mut pass = Pass {
             gpu,
             plan,
@@ -248,10 +263,21 @@ impl MultiEngine {
             alive_len: pp.num_slots,
             values_len,
         };
+        // The segments as `gpu::segments` lays them out: the top top-down
+        // and its leaves, each group in full (its reach slots' alive flags
+        // cleared first), then the top bottom-up.
+        let levels = |seg: &MultiSegment| pp.levels.get(seg.levels.range()).ok_or_else(|| invalid("segment levels"));
+        let (top, groups) = pp.segments.split_first().ok_or_else(|| invalid("plan has no segments"))?;
         pass.begin()?;
-        pass.top_down()?;
-        pass.leaves()?;
-        pass.bottom_up()
+        pass.top_down(levels(top)?)?;
+        pass.leaves(top)?;
+        for group in groups {
+            pass.reset_alive(group)?;
+            pass.top_down(levels(group)?)?;
+            pass.leaves(group)?;
+            pass.bottom_up(levels(group)?)?;
+        }
+        pass.bottom_up(levels(top)?)
     }
 }
 
@@ -300,12 +326,37 @@ impl Pass<'_> {
         Ok(())
     }
 
+    /// Clears the alive flags of a group's reach slots (each opponent's):
+    /// the previous group left its own there.
+    fn reset_alive(&mut self, group: &MultiSegment) -> Result<(), GpuError> {
+        let Pass { gpu, alive, alive_len, .. } = self;
+        for k in 0..2 {
+            let span = *nth(&group.fresh_slots, k)?;
+            if span.count == 0 {
+                continue;
+            }
+            let (alive, _) = this_and_other(alive, k)?;
+            let mut l = gpu.stream.launch_builder(&gpu.kernels.reset_alive);
+            push_mut(&mut l, alive, nth(alive_len, k)?);
+            l.arg(&span.start).arg(&span.count);
+            let cfg = LaunchConfig {
+                grid_dim: (span.count.div_ceil(THREADS).clamp(1, MAX_TERMINAL_BLOCKS), 1, 1),
+                block_dim: (THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            // SAFETY: arguments match `reset_alive`; the span is validated
+            // to lie inside the opponent's slots.
+            unsafe { l.launch(cfg) }?;
+        }
+        Ok(())
+    }
+
     /// Top-down, root first: each opponent's nodes split its reach, chance
     /// nodes split both (one launch per opponent).
-    fn top_down(&mut self) -> Result<(), GpuError> {
-        let Pass { gpu, plan, tree, pp, dp, storage, reach, alive, m, reach_len, alive_len, .. } = self;
+    fn top_down(&mut self, levels: &[MultiLevel]) -> Result<(), GpuError> {
+        let Pass { gpu, plan, tree, dp, storage, reach, alive, m, reach_len, alive_len, .. } = self;
         let (kernels, stream) = (&gpu.kernels, &gpu.stream);
-        for lv in &pp.levels {
+        for lv in levels {
             for (k, span) in lv.opp.iter().enumerate() {
                 if span.count == 0 {
                     continue;
@@ -382,11 +433,12 @@ impl Pass<'_> {
         Ok(())
     }
 
-    /// Fixed-payoff leaves and showdowns.
-    fn leaves(&mut self) -> Result<(), GpuError> {
+    /// A segment's fixed-payoff leaves and showdowns.
+    fn leaves(&mut self, segment: &MultiSegment) -> Result<(), GpuError> {
         let Pass { gpu, tree, pp, dp, reach, alive, values, reach_len, alive_len, values_len, leaves, p, .. } = self;
         let args = leaves::Leaves {
             gpu,
+            segment,
             tree,
             dp,
             p: *p,
@@ -402,11 +454,11 @@ impl Pass<'_> {
     }
 
     /// Bottom-up, deepest level first: own updates, opponent sums, chance sums.
-    fn bottom_up(&mut self) -> Result<(), GpuError> {
+    fn bottom_up(&mut self, levels: &[MultiLevel]) -> Result<(), GpuError> {
         let Pass { gpu, plan, tree, pp, dp, storage, alive, values, m, alive_len, values_len, .. } = self;
         let (kernels, stream, hands) = (&gpu.kernels, &gpu.stream, pp.hands);
         let opponents = Opponents { dp, alive, alive_len };
-        for lv in pp.levels.iter().rev() {
+        for lv in levels.iter().rev() {
             if lv.own.count > 0 {
                 let compressed = matches!(storage, DeviceStorage::Compressed { .. });
                 let kernel = if compressed { &kernels.multi_own_update_compressed } else { &kernels.multi_own_update };

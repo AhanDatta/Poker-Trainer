@@ -5,6 +5,7 @@ use crate::gpu::shared::{
     at, ensure, to_u32, unpack_cards, Span, CARDS, MAX_ACTIONS, MAX_HANDS, MAX_PAYOFF, MAX_WEIGHT,
     NONE,
 };
+use crate::gpu::segments::{self, Segmentation};
 use crate::gpu::{invalid, GpuError};
 use crate::multi::{opponents, N};
 
@@ -46,6 +47,17 @@ impl MultiPlan {
         for i in 0..nn {
             context(|| format!("node {i}"), self.validate_edges(i, &parent))?;
         }
+        let seg = Segmentation {
+            segment_of: self.segment_of.clone(),
+            num_segments: self.num_segments,
+            row: self.row.clone(),
+            top_rows: self.top_rows,
+            num_rows: self.num_rows,
+        };
+        context(
+            || "segments".into(),
+            segments::validate(&seg, nn, &parent, &|i| Ok(at(&self.actor, i, "actor")? == CHANCE)),
+        )?;
         for p in 0..N {
             context(|| format!("player {p}"), self.validate_player(p))?;
         }
@@ -170,7 +182,6 @@ impl MultiPlan {
 
     fn validate_player(&self, p: usize) -> Result<(), GpuError> {
         let pp = nth(&self.players, p, "player")?;
-        let nn = self.num_nodes as usize;
         let n = pp.hands;
         ensure((1..=MAX_HANDS).contains(&n), || format!("{n} hands"))?;
         ensure(pp.my_cards.len() == n as usize, || "hand array".into())?;
@@ -180,8 +191,8 @@ impl MultiPlan {
                 format!("bad hand {packed:#x}")
             })?;
         }
-        // Value rows: one per node.
-        to_u32(nn * n as usize, "value buffer")?;
+        // Value rows.
+        to_u32(self.num_rows as usize * n as usize, "value buffer")?;
         let (q, r) = opponents(p);
         for (k, (view, seat)) in pp.opponents.iter().zip([q, r]).enumerate() {
             context(|| format!("opponent {k}"), self.validate_view(view, seat))?;
@@ -230,12 +241,41 @@ impl MultiPlan {
             }))
         };
 
+        // Segments: one per plan segment, spans contiguous and covering the
+        // lists, each opponent's fresh slots in its region (the top's from
+        // 1, every group's from the end of the top's).
+        ensure(pp.segments.len() == self.num_segments as usize, || "segment count".into())?;
+        let (mut lv, mut fx, mut sd) = (0u64, 0u64, 0u64);
+        for (s, seg) in pp.segments.iter().enumerate() {
+            ensure(
+                u64::from(seg.levels.start) == lv && u64::from(seg.fixed.start) == fx && u64::from(seg.showdowns.start) == sd,
+                || format!("segment {s}: spans aren't contiguous"),
+            )?;
+            (lv, fx, sd) = (seg.levels.end(), seg.fixed.end(), seg.showdowns.end());
+            for k in 0..2 {
+                let fresh = *nth(&seg.fresh_slots, k, "opponent")?;
+                let (top, num) = (*nth(&pp.top_slots, k, "opponent")?, *nth(&pp.num_slots, k, "opponent")?);
+                ensure(top >= 1 && top <= num, || format!("opponent {k}'s slot regions"))?;
+                if s == 0 {
+                    ensure(fresh.start == 1 && fresh.end() == u64::from(top), || format!("top segment's slots of opponent {k}"))?;
+                } else {
+                    ensure(fresh.start == top && fresh.end() <= u64::from(num), || {
+                        format!("segment {s}: opponent {k}'s slots outside the group region")
+                    })?;
+                }
+            }
+        }
+        ensure(
+            lv == pp.levels.len() as u64 && fx == pp.fixed.len() as u64 && sd == pp.showdowns.len() as u64,
+            || "segments don't cover the lists".into(),
+        )?;
+
         // Slots.
         for k in 0..2 {
             let (slot, child_slot) = (nth(&pp.slot, k, "opponent")?, nth(&pp.child_slot, k, "opponent")?);
             let num_slots = *nth(&pp.num_slots, k, "opponent")?;
             ensure(slot.first() == Some(&0), || format!("root must use slot 0 of opponent {k}"))?;
-            let mut fresh_used = vec![false; num_slots as usize];
+            let mut fresh_used: Vec<(u32, u32)> = Vec::new();
             for i in 0..nn {
                 let (s, cs) = (at(slot, i, "slot")?, at(child_slot, i, "child_slot")?);
                 if !at(&reached, i, "reached")? {
@@ -263,20 +303,23 @@ impl MultiPlan {
                 }
                 let children = self.children(i)?;
                 let end = u64::from(cs) + children.len() as u64;
-                ensure(cs != NONE && cs >= 1 && end <= u64::from(num_slots), || {
-                    format!("node {i}: opponent {k}'s child slots out of range")
+                let seg = at(&self.segment_of, i, "segment_of")?;
+                let region = *nth(&nth(&pp.segments, seg as usize, "segment")?.fresh_slots, k, "opponent")?;
+                ensure(cs != NONE && cs >= region.start && end <= region.end() && end <= u64::from(num_slots), || {
+                    format!("node {i}: opponent {k}'s child slots outside its segment's region")
                 })?;
                 for (a, c) in children.enumerate() {
                     let fresh = cs + a as u32;
                     ensure(at(slot, c, "slot")? == fresh, || {
                         format!("node {i}: child {c} has the wrong slot of opponent {k}")
                     })?;
-                    let used =
-                        fresh_used.get_mut(fresh as usize).ok_or_else(|| invalid("slot out of range"))?;
-                    ensure(!*used, || format!("opponent {k}'s slot {fresh} handed out twice"))?;
-                    *used = true;
+                    fresh_used.push((seg, fresh));
                 }
             }
+            fresh_used.sort_unstable();
+            ensure(fresh_used.windows(2).all(|w| w.first() != w.get(1)), || {
+                format!("opponent {k}'s slot handed out twice in a segment")
+            })?;
         }
 
         // Strategy updates only at expanded opponent nodes.
@@ -289,11 +332,22 @@ impl MultiPlan {
             }
         }
 
-        // Levels: every expanded node once, in the list of its role, its
-        // expanded children one level deeper; no empty levels.
+        // Levels: every expanded node once, in its segment and the list of
+        // its role, its expanded children in the same segment one level
+        // deeper, chunk roots at their group's first level; no empty levels.
         let mut level_of = vec![NONE; nn];
         let mut expect = [0u64; 4];
+        let mut segment_of_level = Vec::with_capacity(pp.levels.len());
+        let mut depth_of_level = Vec::with_capacity(pp.levels.len());
+        for (s, seg) in pp.segments.iter().enumerate() {
+            for d in 0..seg.levels.count {
+                segment_of_level.push(s as u32);
+                depth_of_level.push(d);
+            }
+        }
         for (d, lv) in pp.levels.iter().enumerate() {
+            let s = at(&segment_of_level, d, "level segment")?;
+            let depth = at(&depth_of_level, d, "level depth")?;
             let parts: [(Span, &[u32], Role); 4] = [
                 (lv.opp[0], &pp.opp_nodes[0], Role::Opponent(0)),
                 (lv.opp[1], &pp.opp_nodes[1], Role::Opponent(1)),
@@ -312,10 +366,11 @@ impl MultiPlan {
                     ensure(at(&reached, i, "reached")? && role(i)? == Some(list_role), || {
                         format!("level {d}: node {id} in the wrong list")
                     })?;
+                    ensure(at(&self.segment_of, i, "segment_of")? == s, || format!("level {d}: node {id} in the wrong segment"))?;
                     let entry =
                         level_of.get_mut(i).ok_or_else(|| invalid(format!("node {id} out of range")))?;
                     ensure(*entry == NONE, || format!("node {id} scheduled twice"))?;
-                    *entry = d as u32;
+                    *entry = depth;
                 }
             }
             ensure(size > 0, || format!("level {d} is empty"))?;
@@ -340,9 +395,21 @@ impl MultiPlan {
             "non-finite payoff".into()
         })?;
         let mut leaf_seen = vec![false; nn];
+        let mut leaf_segment = vec![NONE; pp.fixed.len() + pp.showdowns.len()];
+        for (s, seg) in pp.segments.iter().enumerate() {
+            for i in seg.fixed.range() {
+                *leaf_segment.get_mut(i).ok_or_else(|| invalid("fixed span"))? = s as u32;
+            }
+            for i in seg.showdowns.range() {
+                *leaf_segment.get_mut(pp.fixed.len() + i).ok_or_else(|| invalid("showdown span"))? = s as u32;
+            }
+        }
         let listed = pp.fixed.iter().map(|&id| (id, false)).chain(pp.showdowns.iter().map(|&id| (id, true)));
-        for (id, showdown) in listed {
+        for (k, (id, showdown)) in listed.enumerate() {
             let i = id as usize;
+            ensure(at(&self.segment_of, i, "segment_of")? == at(&leaf_segment, k, "leaf segment")?, || {
+                format!("leaf {id} in another segment's list")
+            })?;
             ensure(at(&reached, i, "reached")? && !self.expands(i, p)?, || {
                 format!("leaf list entry {id} isn't a leaf")
             })?;
@@ -365,10 +432,12 @@ impl MultiPlan {
             }
             ensure(level != NONE, || format!("node {i} not scheduled"))?;
             ensure(i != 0 || level == 0, || "the root isn't at level 0".into())?;
+            let seg = at(&self.segment_of, i, "segment_of")?;
             for c in self.children(i)? {
                 if self.expands(c, p)? {
-                    ensure(at(&level_of, c, "level")? == level + 1, || {
-                        format!("node {c} isn't one level below its parent {i}")
+                    let want = if at(&self.segment_of, c, "segment_of")? == seg { level + 1 } else { 0 };
+                    ensure(at(&level_of, c, "level")? == want, || {
+                        format!("node {c} isn't one level below its parent {i} (or first in its group)")
                     })?;
                 }
             }

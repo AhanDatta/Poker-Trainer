@@ -20,7 +20,7 @@
 //!   their pair of reach slots (leaves with the same reach have the same
 //!   value per unit of payoff; `river::subtree` groups them the same way).
 
-use super::{at, ensure, nth, pack_cards, to_u32, MultiPlan, MultiPlayerPlan, CARDS};
+use super::{at, ensure, nth, pack_cards, to_u32, MultiPlan, MultiPlayerPlan, Span, CARDS, NONE};
 use crate::gpu::shared::{unpack_cards, MAX_HANDS, MAX_PAYOFF};
 use crate::gpu::{invalid, GpuError};
 use crate::multi::cfr::Ctx;
@@ -237,43 +237,60 @@ pub(crate) struct LeafGroups {
 pub(crate) const GROUP_FIELDS: usize = 4;
 
 impl LeafGroups {
-    pub(crate) fn build(plan: &MultiPlan, pp: &MultiPlayerPlan) -> Result<LeafGroups, GpuError> {
+    /// The traverser's groups, segment by segment (a group's or job's
+    /// leaves are all in one segment, which runs them); per segment, its
+    /// spans of `groups` (in groups) and of the jobs.
+    pub(crate) fn build(plan: &MultiPlan, pp: &MultiPlayerPlan) -> Result<(LeafGroups, Vec<(Span, Span)>), GpuError> {
         let mut x = LeafGroups::default();
-        // Showdowns: by board, then folded players, then list order.
-        let mut keyed = Vec::with_capacity(pp.showdowns.len());
-        for (i, (&node, &table)) in pp.showdowns.iter().zip(&pp.showdown_table).enumerate() {
-            keyed.push((table, at(&plan.folded, node as usize, "folded")?, to_u32(i, "showdowns")?));
-        }
-        keyed.sort_unstable();
-        for chunk in keyed.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
-            for warp in chunk.chunks(LEAF_LANES) {
-                let first = warp.first().ok_or_else(|| invalid("empty showdown group"))?;
-                x.groups.extend([first.0, first.1, to_u32(x.showdown_lanes.len(), "showdown lanes")?, to_u32(warp.len(), "lanes")?]);
-                x.showdown_lanes.extend(warp.iter().map(|e| e.2));
+        let mut spans = Vec::with_capacity(pp.segments.len());
+        x.job_off.push(0);
+        for seg in &pp.segments {
+            let (group_start, job_start) = (x.showdown_warps(), x.jobs());
+            // Showdowns: by board, then folded players, then list order.
+            let mut keyed = Vec::with_capacity(seg.showdowns.count as usize);
+            for i in seg.showdowns.range() {
+                let (node, table) = (at(&pp.showdowns, i, "showdowns")?, at(&pp.showdown_table, i, "showdown_table")?);
+                keyed.push((table, at(&plan.folded, node as usize, "folded")?, to_u32(i, "showdowns")?));
             }
+            keyed.sort_unstable();
+            for chunk in keyed.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
+                for warp in chunk.chunks(LEAF_LANES) {
+                    let first = warp.first().ok_or_else(|| invalid("empty showdown group"))?;
+                    x.groups.extend([
+                        first.0,
+                        first.1,
+                        to_u32(x.showdown_lanes.len(), "showdown lanes")?,
+                        to_u32(warp.len(), "lanes")?,
+                    ]);
+                    x.showdown_lanes.extend(warp.iter().map(|e| e.2));
+                }
+            }
+            // Fixed leaves: by their pair of reach slots.
+            let mut keyed = Vec::with_capacity(seg.fixed.count as usize);
+            for i in seg.fixed.range() {
+                let node = at(&pp.fixed, i, "fixed")? as usize;
+                let slots = [at(&pp.slot[0], node, "slot")?, at(&pp.slot[1], node, "slot")?];
+                keyed.push((slots, to_u32(i, "fixed leaves")?));
+            }
+            keyed.sort_unstable();
+            for job in keyed.chunk_by(|a, b| a.0 == b.0) {
+                let first = job.first().ok_or_else(|| invalid("empty fixed job"))?;
+                for (slots, &s) in x.job_slots.iter_mut().zip(&first.0) {
+                    slots.push(s);
+                }
+                x.job_leaves.extend(job.iter().map(|e| e.1));
+                x.job_off.push(to_u32(x.job_leaves.len(), "fixed jobs")?);
+            }
+            spans.push((Span::of(group_start, x.showdown_warps(), "groups")?, Span::of(job_start, x.jobs(), "jobs")?));
         }
         for (&win, &lose) in pp.win.iter().zip(&pp.lose) {
             x.split2.push(split(win, lose, 2.0));
             x.split3.push(split(win, lose, 3.0));
         }
-        // Fixed leaves: by their pair of reach slots.
-        let mut keyed = Vec::with_capacity(pp.fixed.len());
-        for (i, &node) in pp.fixed.iter().enumerate() {
-            let slots = [at(&pp.slot[0], node as usize, "slot")?, at(&pp.slot[1], node as usize, "slot")?];
-            keyed.push((slots, to_u32(i, "fixed leaves")?));
+        for &node in &pp.fixed {
             x.fixed_scalar.push(at(&plan.scalar, node as usize, "scalar")?);
         }
-        keyed.sort_unstable();
-        x.job_off.push(0);
-        for job in keyed.chunk_by(|a, b| a.0 == b.0) {
-            let first = job.first().ok_or_else(|| invalid("empty fixed job"))?;
-            for (slots, &s) in x.job_slots.iter_mut().zip(&first.0) {
-                slots.push(s);
-            }
-            x.job_leaves.extend(job.iter().map(|e| e.1));
-            x.job_off.push(to_u32(x.job_leaves.len(), "fixed jobs")?);
-        }
-        Ok(x)
+        Ok((x, spans))
     }
 
     /// Number of fixed-payoff jobs.
@@ -286,9 +303,9 @@ impl LeafGroups {
         self.groups.len() / GROUP_FIELDS
     }
 
-    /// Number of fixed-payoff warps.
-    pub(crate) fn fixed_warps(&self) -> usize {
-        self.jobs().div_ceil(LEAF_LANES)
+    /// Most showdown warps and fixed-payoff warps any segment launches.
+    pub(crate) fn max_segment_warps(&self, pp: &MultiPlayerPlan) -> usize {
+        pp.segments.iter().map(|s| (s.groups.count as usize).max((s.jobs.count as usize).div_ceil(LEAF_LANES))).max().unwrap_or(0)
     }
 
     /// Checks traverser `p`'s groups: every showdown in exactly one warp of
@@ -299,9 +316,30 @@ impl LeafGroups {
         let (groups, rest) = self.groups.as_chunks::<GROUP_FIELDS>();
         ensure(rest.is_empty(), || "showdown groups".into())?;
         ensure(self.showdown_lanes.len() == ns, || "showdown lanes".into())?;
+        // Per group and job: the segment whose span holds it.
+        let mut group_segment = vec![NONE; groups.len()];
+        let mut job_segment = vec![NONE; self.jobs()];
+        let (mut next_group, mut next_job) = (0u64, 0u64);
+        for (s, seg) in pp.segments.iter().enumerate() {
+            ensure(u64::from(seg.groups.start) == next_group && u64::from(seg.jobs.start) == next_job, || {
+                format!("segment {s}: group spans aren't contiguous")
+            })?;
+            (next_group, next_job) = (seg.groups.end(), seg.jobs.end());
+            for g in seg.groups.range() {
+                *group_segment.get_mut(g).ok_or_else(|| invalid("group span"))? = s as u32;
+            }
+            for j in seg.jobs.range() {
+                *job_segment.get_mut(j).ok_or_else(|| invalid("job span"))? = s as u32;
+            }
+        }
+        ensure(next_group == groups.len() as u64 && next_job == self.jobs() as u64, || {
+            "segments don't cover the groups".into()
+        })?;
+        let span_of = |s: u32| pp.segments.get(s as usize).ok_or_else(|| invalid("segment out of range"));
         let mut seen = vec![false; ns];
         let mut next = 0u64;
         for (g, &[order, folded, start, count]) in groups.iter().enumerate() {
+            let showdowns = span_of(at(&group_segment, g, "group segment")?)?.showdowns;
             ensure(order < plan.num_tables, || format!("showdown group {g}: board {order} out of range"))?;
             ensure(folded >> p & 1 == 0 && folded < 1 << N, || format!("showdown group {g}: folded {folded:#b}"))?;
             ensure(u64::from(start) == next && (1..=LEAF_LANES as u32).contains(&count), || {
@@ -313,6 +351,7 @@ impl LeafGroups {
                 let entry = seen.get_mut(i).ok_or_else(|| invalid(format!("showdown group {g}: showdown {i}")))?;
                 ensure(!*entry, || format!("showdown {i} in two groups"))?;
                 *entry = true;
+                ensure(showdowns.range().contains(&i), || format!("showdown group {g}: showdown {i} of another segment"))?;
                 let node = at(&pp.showdowns, i, "showdowns")? as usize;
                 ensure(at(&pp.showdown_table, i, "showdown_table")? == order && at(&plan.folded, node, "folded")? == folded, || {
                     format!("showdown group {g}: showdown {i} has another board or folded players")
@@ -347,8 +386,10 @@ impl LeafGroups {
             let (b, e) = (at(&self.job_off, j, "job_off")? as usize, at(&self.job_off, j + 1, "job_off")? as usize);
             ensure(b < e, || format!("fixed job {j} is empty"))?;
             let leaves = self.job_leaves.get(b..e).ok_or_else(|| invalid(format!("fixed job {j} out of range")))?;
+            let fixed = span_of(at(&job_segment, j, "job segment")?)?.fixed;
             for &i in leaves {
                 let i = i as usize;
+                ensure(fixed.range().contains(&i), || format!("fixed job {j}: leaf {i} of another segment"))?;
                 let entry = seen.get_mut(i).ok_or_else(|| invalid(format!("fixed job {j}: leaf {i}")))?;
                 ensure(!*entry, || format!("fixed leaf {i} in two jobs"))?;
                 *entry = true;

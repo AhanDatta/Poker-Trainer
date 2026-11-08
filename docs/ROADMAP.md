@@ -152,15 +152,18 @@ Steps:
    solves"); speeding them up is step 4's first item.
 4. Faster leaves (per-lane state in shared memory or a block per leaf with
    in-order scans, keeping bit-identity), 16-bit storage, splitting,
-   backend wiring, benchmarks. `[ ]`
+   backend wiring, benchmarks. `[x]`
    So far (2026-11-07): the fast exact-removal sweep (`exact_fast.cuh`,
    392 to 368 ms/iteration; warp packing measured and rejected, README
    "Faster leaves"); 16-bit storage (`compressed_steps.cuh`, shared with
    heads-up; bit-identical); backend wiring: `MultiConfig::backend` and
    the trainer's `[solver] backend` move 3-way solves to the GPU (default
    precision, CPU fallback with the reason), and reviews and study tag
-   them (CPU / GPU fast / GPU exact). Left: splitting trees that don't
-   fit.
+   them (CPU / GPU fast / GPU exact). Done (2026-11-08): splitting trees
+   that don't fit, the heads-up segmentation made generic over reach-slot
+   spaces (`gpu/segments.rs`), two per traverser with three players, leaf
+   groups per segment; bit-identical to whole-tree solves, whole trees no
+   slower. The exact-removal speed target stays deferred (below).
 
 Target: the chart-range 3-way flop (J♠9♠4♦, 8 × 4 sampled, exact removal)
 from 47 s on the CPU to well under 10 s. Status (2026-11-07): met for

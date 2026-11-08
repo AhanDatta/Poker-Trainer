@@ -3,7 +3,7 @@
 
 use super::{nth, DevicePlayer, DeviceTree};
 use crate::gpu::device::{push, push_mut, Buffer};
-use crate::gpu::multi::plan::{LeafGroups, MultiPlan, SweepLists, LEAF_LANES};
+use crate::gpu::multi::plan::{LeafGroups, MultiPlan, MultiSegment, SweepLists, LEAF_LANES};
 use crate::gpu::shared::to_u32;
 use crate::gpu::{invalid, Gpu, GpuError, GpuPrecision};
 use crate::multi::{opponents, N};
@@ -27,6 +27,10 @@ const MAX_LANES: u64 = 24_576;
 
 /// Scratch bytes the lanes may take; fewer lanes when hand lists are long.
 const SCRATCH_BUDGET: u64 = 512 << 20;
+
+/// The most the leaf scratch takes (the lanes' budget and the lane count
+/// rounding), for sizing a split.
+pub(super) const MAX_SCRATCH_BYTES: u64 = SCRATCH_BUDGET + (16 << 20);
 
 /// The plan's [`SweepLists`] on the device.
 struct DeviceLists {
@@ -76,8 +80,6 @@ struct DeviceGroups {
     job_off: Buffer<u32>,
     job_leaves: Buffer<u32>,
     fixed_scalar: Buffer<u32>,
-    showdown_warps: u32,
-    fixed_warps: u32,
 }
 
 impl DeviceGroups {
@@ -92,8 +94,6 @@ impl DeviceGroups {
             job_off: gpu.upload(&x.job_off)?,
             job_leaves: gpu.upload(&x.job_leaves)?,
             fixed_scalar: gpu.upload(&x.fixed_scalar)?,
-            showdown_warps: to_u32(x.showdown_warps(), "showdown warps")?,
-            fixed_warps: to_u32(x.fixed_warps(), "fixed warps")?,
         })
     }
 }
@@ -131,8 +131,7 @@ fn scratch_shape(plan: &MultiPlan, precision: GpuPrecision) -> Result<(u32, [u64
     let mut warps = 1u64;
     let (mut reach_rows, mut hands) = (1u64, 1u64);
     for pp in &plan.players {
-        let x = &pp.leaves;
-        warps = warps.max(x.showdown_warps().max(x.fixed_warps()) as u64);
+        warps = warps.max(pp.leaves.max_segment_warps(pp) as u64);
         reach_rows = reach_rows.max(pp.opponents.iter().map(|v| u64::from(v.hands)).sum());
         hands = hands.max(u64::from(pp.hands));
     }
@@ -205,6 +204,8 @@ impl DeviceLeaves {
 /// and value rows, and the traverser's plan.
 pub(super) struct Leaves<'a> {
     pub gpu: &'a Gpu,
+    /// The segment whose leaves run (its spans of groups and jobs).
+    pub segment: &'a MultiSegment,
     pub tree: &'a DeviceTree,
     pub dp: &'a DevicePlayer,
     pub p: usize,
@@ -245,7 +246,7 @@ fn pick(k: &[[CudaFunction; 2]; 2], model: usize, precision: usize) -> Result<&C
 
 /// Enqueues traverser `leaves.p`'s fixed payoffs and showdowns.
 pub(super) fn launch(leaves: Leaves<'_>, device: &mut DeviceLeaves) -> Result<(), GpuError> {
-    let Leaves { gpu, tree, dp, p, hands, reach, reach_len, alive, alive_len, values, values_len } = leaves;
+    let Leaves { gpu, segment, tree, dp, p, hands, reach, reach_len, alive, alive_len, values, values_len } = leaves;
     let DeviceLeaves { lists, groups, scratch, model, precision } = device;
     let g = groups.get(p).ok_or_else(|| invalid("player out of range"))?;
     let (q, r) = opponents(p);
@@ -258,8 +259,10 @@ pub(super) fn launch(leaves: Leaves<'_>, device: &mut DeviceLeaves) -> Result<()
         shared_mem_bytes: 0,
     };
     let opponents = Opponents { dp, reach, reach_len, alive, alive_len };
-    if g.fixed_warps > 0 {
+    let fixed_warps = segment.jobs.count.div_ceil(LEAF_LANES as u32);
+    if fixed_warps > 0 {
         let mut l = gpu.stream.launch_builder(pick(&kernels.multi_fixed, *model, *precision)?);
+        l.arg(&segment.jobs.start).arg(&segment.jobs.count);
         push(&mut l, &g.job_slots[0]);
         push(&mut l, &g.job_slots[1]);
         push(&mut l, &g.job_off);
@@ -276,11 +279,12 @@ pub(super) fn launch(leaves: Leaves<'_>, device: &mut DeviceLeaves) -> Result<()
         // SAFETY: arguments match `multi_fixed_*`; every index comes from
         // the validated plan, and the scratch has a column per thread of the
         // grid (at most `scratch.blocks` blocks).
-        unsafe { l.launch(cfg(g.fixed_warps)) }?;
+        unsafe { l.launch(cfg(fixed_warps)) }?;
     }
-    if g.showdown_warps > 0 {
+    if segment.groups.count > 0 {
         let mut l = gpu.stream.launch_builder(pick(&kernels.multi_showdowns, *model, *precision)?);
         push(&mut l, &g.groups);
+        l.arg(&segment.groups.start).arg(&segment.groups.count);
         push(&mut l, &g.showdown_lanes);
         push(&mut l, &dp.showdowns);
         push(&mut l, &dp.win);
@@ -294,7 +298,7 @@ pub(super) fn launch(leaves: Leaves<'_>, device: &mut DeviceLeaves) -> Result<()
         opponents.push(&mut l)?;
         scratch.push(&mut l);
         // SAFETY: arguments match `multi_showdowns_*`; as above.
-        unsafe { l.launch(cfg(g.showdown_warps)) }?;
+        unsafe { l.launch(cfg(segment.groups.count)) }?;
     }
     Ok(())
 }

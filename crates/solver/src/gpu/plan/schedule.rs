@@ -1,6 +1,7 @@
 //! The traversal schedule. A tree too big for the device's scratch memory
-//! is split into **segments**: the top of the tree (segment 0), and groups
-//! of **chunks** (the subtrees under the root street's chance nodes: turn
+//! is split into **segments** (`gpu::segments`, shared with the
+//! three-player plan): the top of the tree (segment 0), and groups of
+//! **chunks** (the subtrees under the root street's chance nodes: turn
 //! subtrees on a flop, river subtrees on a turn), each group run in turn in
 //! one shared scratch region:
 //!
@@ -22,8 +23,9 @@
 
 use super::{at, ensure, invalid, to_u32, Kind, LevelRange, Plan, PlayerPlan, Role, Span, CHANCE, NONE};
 use crate::cfr::{fold_payoff, showdown_payoffs, Ctx};
+use crate::gpu::segments::{self, Shape};
+pub(crate) use crate::gpu::segments::{Scratch, Segmentation};
 use crate::gpu::GpuError;
-use std::ops::Range;
 
 /// One segment of one player's traversal.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,21 +41,6 @@ pub(crate) struct Segment {
     pub fresh_slots: Span,
 }
 
-/// How much device memory the scratch buffers may take.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Scratch {
-    /// Never split the tree (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
-    Unlimited,
-    /// Split only if the plan plus the whole tree's scratch would need more
-    /// than this many bytes, into groups that fit.
-    Budget(u64),
-    /// Always split (where the tree has chunks), with at most this many
-    /// nodes per group (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
-    ForceGroups { max_nodes: u32 },
-}
-
 /// Bytes of the engine's scratch buffers for the given reach slots per
 /// traverser and value rows (it allocates each buffer for the larger
 /// traversal): reach slots x opponent hands, rows x hands, one alive flag
@@ -63,15 +50,6 @@ pub(crate) fn scratch_bytes(slots: [u64; 2], rows: u64, hands: [u64; 2]) -> u64 
     let values = rows * hands[0].max(hands[1]);
     let alive = slots[0].max(slots[1]);
     4 * (reach + values + alive)
-}
-
-/// The split of the tree into segments, and every node's value row.
-pub(crate) struct Segmentation {
-    pub segment_of: Vec<u32>,
-    pub num_segments: u32,
-    pub row: Vec<u32>,
-    pub top_rows: u32,
-    pub num_rows: u32,
 }
 
 impl Plan {
@@ -91,149 +69,25 @@ impl Plan {
     /// the plan itself needs (`fixed_bytes`).
     pub(super) fn segment(&self, ctx: &Ctx, scratch: Scratch, fixed_bytes: u64) -> Result<Segmentation, GpuError> {
         let nodes = &ctx.tree.nodes;
-        let nn = nodes.len();
         let hands = [ctx.hands.len(0) as u64, ctx.hands.len(1) as u64];
-        let mut whole_slots = [1u64; 2];
-        for i in 0..nn {
-            for (p, s) in whole_slots.iter_mut().enumerate() {
-                *s += self.fresh_slots(i, p)?;
-            }
-        }
-        let whole = || -> Result<Segmentation, GpuError> {
-            let rows = (0..nn).map(|i| to_u32(i, "rows")).collect::<Result<Vec<u32>, _>>()?;
-            Ok(Segmentation {
-                segment_of: vec![0; nn],
-                num_segments: 1,
-                row: rows,
-                top_rows: to_u32(nn, "rows")?,
-                num_rows: to_u32(nn, "rows")?,
-            })
-        };
-
         // Chunk roots: the children of the root street's chance nodes.
         let root_street = nodes.first().ok_or_else(|| invalid("empty tree"))?.street;
         let mut roots: Vec<usize> = Vec::new();
         for node in nodes.iter().filter(|n| matches!(n.kind, Kind::Chance) && n.street == root_street) {
             roots.extend(node.children());
         }
-        match scratch {
-            Scratch::Unlimited => return whole(),
-            Scratch::Budget(b) => {
-                if roots.is_empty() || fixed_bytes + scratch_bytes(whole_slots, nn as u64, hands) <= b {
-                    return whole();
-                }
-            }
-            Scratch::ForceGroups { .. } => {
-                if roots.is_empty() {
-                    return whole();
-                }
-            }
-        }
-
-        // Each chunk's nodes (the subtree under its root).
-        let mut chunk_of = vec![NONE; nn];
-        let mut chunk_nodes: Vec<Vec<usize>> = Vec::with_capacity(roots.len());
-        for (k, &root) in roots.iter().enumerate() {
-            let k32 = to_u32(k, "chunks")?;
-            let mut members = Vec::new();
-            let mut stack = vec![root];
-            while let Some(i) = stack.pop() {
-                let entry = chunk_of.get_mut(i).ok_or_else(|| invalid("chunk node out of range"))?;
-                ensure(*entry == NONE, || format!("node {i} in two chunks"))?;
-                *entry = k32;
-                members.push(i);
-                stack.extend(self.children(i)?);
-            }
-            members.sort_unstable();
-            chunk_nodes.push(members);
-        }
-
-        // Top-region needs: rows for the top nodes and the chunk roots,
-        // slots handed out by the top nodes.
-        let top_nodes: Vec<usize> = (0..nn).filter(|&i| chunk_of.get(i) == Some(&NONE)).collect();
-        let top_rows = (top_nodes.len() + roots.len()) as u64;
-        let mut top_slots = [1u64; 2];
-        for &i in &top_nodes {
-            for (p, s) in top_slots.iter_mut().enumerate() {
-                *s += self.fresh_slots(i, p)?;
-            }
-        }
-        // Per chunk: rows for its non-root nodes, slots its nodes hand out.
-        let mut chunk_rows = Vec::with_capacity(roots.len());
-        let mut chunk_slots = Vec::with_capacity(roots.len());
-        for members in &chunk_nodes {
-            chunk_rows.push(members.len() as u64 - 1);
-            let mut s = [0u64; 2];
-            for &i in members {
-                for (p, sp) in s.iter_mut().enumerate() {
-                    *sp += self.fresh_slots(i, p)?;
-                }
-            }
-            chunk_slots.push(s);
-        }
-        let group_bytes = |rows: u64, slots: [u64; 2]| {
-            fixed_bytes + scratch_bytes([top_slots[0] + slots[0], top_slots[1] + slots[1]], top_rows + rows, hands)
+        let shape = Shape {
+            num_nodes: nodes.len(),
+            children: &|i| self.children(i),
+            roots,
+            fresh: &|i| Ok(vec![self.fresh_slots(i, 0)?, self.fresh_slots(i, 1)?]),
+            spaces: 2,
         };
-
-        // Greedy grouping of consecutive chunks.
-        let mut groups: Vec<Range<usize>> = Vec::new();
-        let (mut rows, mut slots, mut members, mut start) = (0u64, [0u64; 2], 0u64, 0usize);
-        for (k, (&cr, &cs)) in chunk_rows.iter().zip(&chunk_slots).enumerate() {
-            let size = cr + 1;
-            let fits_with = match scratch {
-                Scratch::Budget(b) => group_bytes(rows + cr, [slots[0] + cs[0], slots[1] + cs[1]]) <= b,
-                Scratch::ForceGroups { max_nodes } => members + size <= u64::from(max_nodes),
-                Scratch::Unlimited => true,
-            };
-            if k > start && !fits_with {
-                groups.push(start..k);
-                (rows, slots, members, start) = (0, [0; 2], 0, k);
-            }
-            if let Scratch::Budget(b) = scratch {
-                let needed = group_bytes(cr, cs);
-                if needed > b {
-                    return Err(GpuError::OutOfMemory { needed, available: b });
-                }
-            }
-            rows += cr;
-            slots = [slots[0] + cs[0], slots[1] + cs[1]];
-            members += size;
-        }
-        groups.push(start..roots.len());
-
-        // Segments and rows.
-        let mut segment_of = vec![0u32; nn];
-        let mut row = vec![NONE; nn];
-        let mut next_row = 0u32;
-        for &i in top_nodes.iter().chain(&roots) {
-            *row.get_mut(i).ok_or_else(|| invalid("row out of range"))? = next_row;
-            next_row += 1;
-        }
-        let top_rows = next_row;
-        let mut num_rows = top_rows;
-        for (g, chunks) in groups.iter().enumerate() {
-            let seg = to_u32(g + 1, "segments")?;
-            let mut cursor = top_rows;
-            for k in chunks.clone() {
-                let members = chunk_nodes.get(k).ok_or_else(|| invalid("chunk out of range"))?;
-                let root = *roots.get(k).ok_or_else(|| invalid("chunk out of range"))?;
-                for &i in members {
-                    *segment_of.get_mut(i).ok_or_else(|| invalid("node out of range"))? = seg;
-                    if i != root {
-                        *row.get_mut(i).ok_or_else(|| invalid("row out of range"))? = cursor;
-                        cursor = cursor.checked_add(1).ok_or_else(|| invalid("too many rows"))?;
-                    }
-                }
-            }
-            num_rows = num_rows.max(cursor);
-        }
-        Ok(Segmentation {
-            segment_of,
-            num_segments: to_u32(groups.len() + 1, "segments")?,
-            row,
-            top_rows,
-            num_rows,
-        })
+        let bytes = |rows: u64, slots: &[u64]| {
+            let s = [slots.first().copied().unwrap_or(0), slots.get(1).copied().unwrap_or(0)];
+            fixed_bytes + scratch_bytes(s, rows, hands)
+        };
+        segments::segment(&shape, scratch, &bytes)
     }
 
     /// Per node: its parent (`NONE` for the root), checking that every node
@@ -473,38 +327,15 @@ impl PlayerPlan {
 /// plus groups hanging off the root street's chance nodes, and value rows
 /// are in the right region and unique where they must be.
 pub(super) fn validate_segments(plan: &Plan) -> Result<(), GpuError> {
-    let nn = plan.num_nodes as usize;
-    ensure(plan.segment_of.len() == nn && plan.row.len() == nn, || "segment and row arrays".into())?;
-    ensure(plan.num_segments >= 1, || "no segments".into())?;
-    ensure(plan.segment_of.first() == Some(&0), || "the root must be in the top segment".into())?;
-    ensure(plan.segment_of.iter().all(|&s| s < plan.num_segments), || "segment out of range".into())?;
-    ensure(plan.top_rows <= plan.num_rows, || "row regions".into())?;
+    let seg = Segmentation {
+        segment_of: plan.segment_of.clone(),
+        num_segments: plan.num_segments,
+        row: plan.row.clone(),
+        top_rows: plan.top_rows,
+        num_rows: plan.num_rows,
+    };
     let parent = plan.parents()?;
-    let mut top_used = vec![false; plan.top_rows as usize];
-    let mut group_rows: Vec<(u32, u32)> = Vec::new();
-    for i in 0..nn {
-        let seg = at(&plan.segment_of, i, "segment_of")?;
-        let row = at(&plan.row, i, "row")?;
-        ensure(row < plan.num_rows, || format!("node {i}: row {row} out of range"))?;
-        let pa = at(&parent, i, "parent")?;
-        let is_chunk_root = pa != NONE && at(&plan.segment_of, pa as usize, "segment_of")? != seg;
-        if is_chunk_root {
-            ensure(at(&plan.segment_of, pa as usize, "segment_of")? == 0 && seg >= 1, || {
-                format!("node {i}: segments change other than below the top")
-            })?;
-            ensure(plan.node(pa as usize)?.actor == CHANCE, || format!("chunk root {i}: parent isn't a chance node"))?;
-        }
-        if seg == 0 || is_chunk_root {
-            let used = top_used.get_mut(row as usize).ok_or_else(|| invalid(format!("node {i}: row not in the top region")))?;
-            ensure(!*used, || format!("node {i}: top row {row} shared"))?;
-            *used = true;
-        } else {
-            ensure(row >= plan.top_rows, || format!("node {i}: group node in the top row region"))?;
-            group_rows.push((seg, row));
-        }
-    }
-    group_rows.sort_unstable();
-    ensure(group_rows.windows(2).all(|w| w.first() != w.get(1)), || "a row is shared within a group".into())
+    segments::validate(&seg, plan.num_nodes as usize, &parent, &|i| Ok(plan.node(i)?.actor == CHANCE))
 }
 
 /// Checks player `p`'s schedule: every node scheduled once in its segment,
