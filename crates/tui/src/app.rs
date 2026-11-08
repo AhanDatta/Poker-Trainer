@@ -50,6 +50,9 @@ pub enum SetupItem {
     Count(usize),
     SeatChanges,
     Position,
+    /// With chosen positions: whether you play position `i` (index into
+    /// the table's positions in preflop order).
+    Seat(usize),
     Stack,
     Rake,
     FlopSolve,
@@ -364,9 +367,11 @@ impl App {
         if self.current_opponent_choice() == OpponentChoice::Game(GameType::Custom) {
             v.extend((0..self.session.config.profiles().len()).map(SetupItem::Count));
         }
+        v.extend([SetupItem::SeatChanges, SetupItem::Position]);
+        if matches!(self.session.config.hero_position, HeroPosition::Seats(_)) {
+            v.extend((0..self.session.config.players).map(SetupItem::Seat));
+        }
         v.extend([
-            SetupItem::SeatChanges,
-            SetupItem::Position,
             SetupItem::Stack,
             SetupItem::Rake,
             SetupItem::FlopSolve,
@@ -554,8 +559,14 @@ impl App {
                 let sizes = [2usize, 6, 9];
                 let cur = sizes.iter().position(|&n| n == self.session.config.players).unwrap_or(0);
                 let next = sizes[cycle(cur, sizes.len())];
+                let before = self.session.config.hero_position.clone();
                 if let Err(e) = self.session.set_players(next) {
                     self.flash(e);
+                } else if self.session.config.hero_position != before {
+                    self.flash(match self.session.config.hero_position {
+                        HeroPosition::Seats(_) => "Positions this table doesn't have were unticked.",
+                        _ => "This table has none of your chosen positions, so you rotate.",
+                    });
                 } else if next > 6 && self.session.config.charts_for(next).is_none() {
                     self.flash("9-max uses position-aware preflop rules (there are no 9-max solver charts).");
                 }
@@ -589,9 +600,25 @@ impl App {
                 cfg.seat_change_pct = SEAT_CHANGE_PRESETS[cycle(cur, SEAT_CHANGE_PRESETS.len())].0;
             }
             SetupItem::Position => {
-                let all = [HeroPosition::Alternate, HeroPosition::Random, HeroPosition::Sb, HeroPosition::Bb];
-                let cur = all.iter().position(|&p| p == cfg.hero_position).unwrap_or(0);
-                cfg.hero_position = all[cycle(cur, all.len())];
+                let cur = match cfg.hero_position {
+                    HeroPosition::Alternate => 0,
+                    HeroPosition::Random => 1,
+                    HeroPosition::Seats(_) => 2,
+                };
+                cfg.hero_position = match cycle(cur, 3) {
+                    0 => HeroPosition::Alternate,
+                    1 => HeroPosition::Random,
+                    // Start from the button (the small blind heads-up).
+                    _ => HeroPosition::seats([if cfg.players == 2 { "SB" } else { "BTN" }])
+                        .expect("a table position"),
+                };
+            }
+            SetupItem::Seat(i) => {
+                let name = holdem::game::positions(cfg.players)[i];
+                match cfg.hero_position.toggled(cfg.players, name) {
+                    Ok(p) => cfg.hero_position = p,
+                    Err(e) => self.flash(e),
+                }
             }
             SetupItem::Stack => {
                 cfg.stack_bb = (cfg.stack_bb + 10.0 * dir as f64).clamp(20.0, 300.0);

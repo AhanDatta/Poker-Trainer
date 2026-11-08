@@ -242,9 +242,12 @@ impl Session {
     }
 
     /// Changes the table size (2..=9 players) and reloads the matching charts.
+    /// Chosen hero positions the new table doesn't have are dropped (see
+    /// [`HeroPosition::for_table`]).
     pub fn set_players(&mut self, players: usize) -> Result<(), String> {
         let mut cfg = self.config.clone();
         cfg.players = players;
+        cfg.hero_position = cfg.hero_position.for_table(players);
         cfg.validate()?;
         self.charts = Arc::new(load_charts(&cfg)?);
         self.config = cfg;
@@ -272,7 +275,7 @@ impl Session {
 
     /// Deals a new hand. Every hand starts with fresh `stack_bb` stacks.
     /// The hero sits in seat 0; the button position decides the hero's
-    /// position (rotating, random, or pinned to a blind).
+    /// position (rotating, random, or only the chosen positions).
     pub fn new_hand(&mut self) -> LiveHand {
         // Moving on abandons the solves of earlier hands: they would
         // otherwise keep the CPU (and the solve queue) busy while this hand
@@ -280,24 +283,16 @@ impl Session {
         self.cancel_pending_reviews();
         let n = self.config.players;
         let hero = 0;
-        let button = match self.config.hero_position {
-            // Heads-up the button is the small blind.
-            HeroPosition::Sb => {
-                if n == 2 {
-                    hero
-                } else {
-                    (hero + n - 1) % n
-                }
-            }
-            HeroPosition::Bb => {
-                if n == 2 {
-                    (hero + 1) % n
-                } else {
-                    (hero + n - 2) % n
-                }
-            }
+        let rotate = (self.button + 1) % n;
+        let button = match &self.config.hero_position {
             HeroPosition::Random => self.rng.random_range(0..n),
-            HeroPosition::Alternate => (self.button + 1) % n,
+            HeroPosition::Alternate => rotate,
+            // The button moves on (as in rotation) until the hero is in a
+            // chosen position; with one position it stays put.
+            seats @ HeroPosition::Seats(_) => (1..=n)
+                .map(|k| (self.button + k) % n)
+                .find(|&b| seats.allows(n, (hero + n - b) % n))
+                .unwrap_or(rotate),
         };
         self.button = button;
         // Table changes: now and then a player leaves and a new one (drawn

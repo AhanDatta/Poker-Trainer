@@ -6,6 +6,7 @@
 use holdem::{Action, Street};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use trainer::export;
 use trainer::save::{self, SessionStore};
 use trainer::{LiveHand, Session, StepResult, TrainerConfig, Variant};
 
@@ -126,6 +127,24 @@ fn sessions_save_and_continue() {
     assert_eq!(list[0].id, id);
     assert_eq!(list[0].summary.hands, session.history.len());
     assert_eq!(list[0].summary.score, Some(report.calibration.score()));
+
+    // The CSV export agrees with the session's stats.
+    let out = scratch("continue-export");
+    let ex = export::export(&root, None, &out).unwrap();
+    let st = session.stats();
+    assert_eq!((ex.sessions, ex.hands, ex.skipped_lines), (1, st.hands, 0));
+    assert_eq!(ex.totals.iter().map(|t| t.net_chips).sum::<i64>(), st.net_chips);
+    let saved = SessionStore::open(&root, &id).unwrap().load().unwrap();
+    let rows = export::decision_rows(&saved);
+    assert_eq!(ex.decisions, rows.len());
+    let counted: Vec<_> = rows.iter().filter(|r| r.counted).collect();
+    assert_eq!(counted.len(), st.decisions);
+    assert_eq!(export::hand_rows(&saved).iter().map(|r| r.decisions).sum::<usize>(), st.decisions);
+    let loss: f64 = counted.iter().map(|r| r.d.ev_loss_pct as f64).sum();
+    assert!((loss - st.total_loss_pct).abs() < 1e-6);
+    let csv = std::fs::read_to_string(out.join(export::DECISIONS_FILE)).unwrap();
+    assert!(csv.starts_with(&export::DECISION_COLUMNS.join(",")));
+    std::fs::remove_dir_all(out).unwrap();
 
     // Continue it.
     let loaded = SessionStore::open(&root, &id).unwrap().load().unwrap();

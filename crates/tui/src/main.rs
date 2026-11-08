@@ -2,6 +2,7 @@
 
 mod app;
 mod charts_cmd;
+mod export_cmd;
 mod score_ui;
 mod selfplay;
 mod sizes;
@@ -72,6 +73,17 @@ enum Cmd {
         #[arg(short, long, default_value = "charts.txt")]
         out: String,
     },
+    /// Write saved sessions as CSV, one row per hand (poker-trainer-hands.csv)
+    /// and one per graded decision (poker-trainer-decisions.csv), and print
+    /// bb/100 by format.
+    Export {
+        /// Output directory (the two files in it are replaced).
+        #[arg(short, long, default_value = ".")]
+        out: String,
+        /// Only this saved session (its directory name).
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Headless: play hands with a scripted hero and print the solver review
     /// (useful to check performance on your machine).
     Selfplay {
@@ -112,6 +124,10 @@ fn main() -> Result<()> {
         }
         Some(Cmd::ImportCharts { dir, format, players, allin_bb, out }) => {
             charts_cmd::import(dir, format, *players, *allin_bb, out)
+        }
+        Some(Cmd::Export { out, session }) => {
+            let (cfg, _) = load_config(&cli)?;
+            export_cmd::run(&cfg, out, session.as_deref())
         }
         Some(Cmd::Selfplay { hands, style }) => {
             let (mut cfg, _) = load_config(&cli)?;
@@ -275,6 +291,60 @@ mod tests {
         app.on_key(key('h'));
         let s = render(&app);
         assert!(s.contains("Finished hands"), "{s}");
+    }
+
+    /// The position row and its per-position rows: choose positions, keep
+    /// one ticked, switch table sizes, and get dealt the chosen position.
+    #[test]
+    fn setup_chooses_positions() {
+        use app::SetupItem;
+        use trainer::HeroPosition;
+        let mut cfg = TrainerConfig::default();
+        cfg.seed = Some(5);
+        cfg.players = 6;
+        cfg.solver.enabled = false;
+        let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+        let goto = |app: &mut App, item: SetupItem| {
+            app.setup_cursor = app.setup_items().iter().position(|&i| i == item).expect("row shown");
+        };
+        // Rotate is the default and shows no position rows.
+        assert!(render(&app).contains("Your position             ◂ Rotate ▸"));
+        assert!(!app.setup_items().contains(&SetupItem::Seat(0)));
+        goto(&mut app, SetupItem::Position);
+        app.on_key(right);
+        assert_eq!(app.session.config.hero_position, HeroPosition::Random);
+        app.on_key(right);
+        assert_eq!(app.session.config.hero_position, HeroPosition::seats(["BTN"]).unwrap());
+        let s = render(&app);
+        assert!(s.contains("◂ Only BTN ▸") && s.contains("  BTN ") && s.contains("  UTG "), "{s}");
+        assert_eq!(app.setup_items().iter().filter(|i| matches!(i, SetupItem::Seat(_))).count(), 6);
+        // Tick UTG (the first position row), then untick BTN.
+        goto(&mut app, SetupItem::Seat(0));
+        app.on_key(right);
+        assert_eq!(app.session.config.hero_position, HeroPosition::seats(["UTG", "BTN"]).unwrap());
+        assert!(render(&app).contains("◂ Only UTG, BTN ▸"));
+        goto(&mut app, SetupItem::Seat(3));
+        app.on_key(right);
+        assert_eq!(app.session.config.hero_position, HeroPosition::seats(["UTG"]).unwrap());
+        // The last ticked position stays.
+        goto(&mut app, SetupItem::Seat(0));
+        app.on_key(right);
+        assert_eq!(app.session.config.hero_position, HeroPosition::seats(["UTG"]).unwrap());
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("At least one")));
+        // 9-max keeps UTG; heads-up has none, so it rotates.
+        goto(&mut app, SetupItem::Table);
+        app.on_key(right);
+        assert_eq!(app.session.config.players, 9);
+        assert_eq!(app.session.config.hero_position, HeroPosition::seats(["UTG"]).unwrap());
+        for _ in 0..5 {
+            let h = app.session.new_hand();
+            assert_eq!(h.state.position_name(h.hero), "UTG");
+        }
+        app.on_key(right);
+        assert_eq!(app.session.config.players, 2);
+        assert_eq!(app.session.config.hero_position, HeroPosition::Alternate);
+        assert!(app.message.as_ref().is_some_and(|(m, _)| m.contains("you rotate")));
     }
 
     /// Prints the setup, table and review screens (run with --ignored --nocapture).

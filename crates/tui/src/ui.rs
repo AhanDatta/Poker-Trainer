@@ -191,14 +191,33 @@ fn setup_value(app: &App, item: SetupItem) -> (String, String) {
                 None => (label, String::new()),
             }
         }
-        SetupItem::Position => match (cfg.hero_position, cfg.players) {
+        SetupItem::Position => match (&cfg.hero_position, cfg.players) {
             (HeroPosition::Alternate, 2) => s("Alternate", "Alternate between SB (button) and BB."),
             (HeroPosition::Alternate, _) => s("Rotate", "The button moves every hand."),
             (HeroPosition::Random, _) => s("Random", "A random seat every hand."),
-            (HeroPosition::Sb, 2) => s("Always SB", "Always the small blind (the button heads-up)."),
-            (HeroPosition::Sb, _) => s("Always SB", "Always the small blind."),
-            (HeroPosition::Bb, _) => s("Always BB", "Always the big blind."),
+            (HeroPosition::Seats(seats), _) if seats.len() == 1 => (
+                format!("Only {}", seats[0]),
+                format!(
+                    "You always play the {}; the other players keep their seats. Tick positions below.",
+                    seats[0]
+                ),
+            ),
+            (HeroPosition::Seats(seats), _) => (
+                format!("Only {}", seats.join(", ")),
+                "You play only the ticked positions, in rotation order (the button skips the others).".into(),
+            ),
         },
+        SetupItem::Seat(i) => {
+            let name = holdem::game::positions(cfg.players).get(i).copied().unwrap_or("?");
+            let on = holdem::game::position_offset(cfg.players, name)
+                .is_some_and(|o| cfg.hero_position.allows(cfg.players, o));
+            let what = if cfg.players == 2 && name == "SB" { "SB (the button)" } else { name };
+            if on {
+                ("Yes".into(), format!("You play hands in the {what}."))
+            } else {
+                ("No".into(), format!("You don't play hands in the {what}."))
+            }
+        }
         SetupItem::Stack => (
             format!("{}bb", cfg.stack_bb),
             if (cfg.stack_bb - 100.0).abs() > 1e-9 {
@@ -328,6 +347,9 @@ fn draw_setup(f: &mut Frame, app: &App) {
             }
             SetupItem::SeatChanges => "New players sit down",
             SetupItem::Position => "Your position",
+            SetupItem::Seat(i) => {
+                return format!("  {}", holdem::game::positions(cfg.players).get(i).copied().unwrap_or("?"))
+            }
             SetupItem::Stack => "Stacks",
             SetupItem::Rake => "Rake",
             SetupItem::FlopSolve => "Flop solving",
