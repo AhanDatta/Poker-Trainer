@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/holdem", "crates/solver", "crates/trainer", "crates/tui"]
+members = ["crates/holdem", "crates/solver", "crates/trainer", "crates/preflop", "crates/tui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +12,7 @@ publish = false
 holdem = { path = "crates/holdem" }
 solver = { path = "crates/solver" }
 trainer = { path = "crates/trainer" }
+preflop = { path = "crates/preflop" }
 rand = "0.9"
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }

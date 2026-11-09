@@ -189,21 +189,63 @@ Tried and rejected (2026-11-09):
   benchmarked.
   Numbers: `crates/solver/cuda/README.md`, "Shared runout boards".
 
-## 3. Preflop heuristics (no full preflop solving) `[ ]`
+## 3. Preflop heuristics (no full preflop solving) `[~]`
 
-Fill the gaps in the preflop charts (heads-up 3-bet and deeper lines,
-9-max, other stack depths and rake) with a model rather than a full preflop
-solve:
+Fill the gaps in the preflop charts (9-max, heads-up 3-bet and deeper
+lines, other stack depths and rake) with a model rather than a full preflop
+solve: solve only the preflop betting tree, and value each pot that sees a
+flop as `factor x equity x pot` per player, where the **equity-realization
+factor** depends on the hand class, the player's position after the flop,
+its role (last raiser or caller) and the pot type.
 
-- Solve only the preflop betting tree; value each pot that reaches the flop
-  as equity × an **equity-realization factor** by hand class, position
-  (in/out of position), and line (raiser/caller, pot type), minus rake.
-- Calibrate the realization factors with the postflop solver: solve a sample
-  of flops per preflop line and measure how much equity each hand class
-  realizes.
-- Check the model against the built-in 6-max solver charts before trusting
-  it where no charts exist.
-- Then: preflop decision grading in the trainer.
+Decided (2026-11-09):
+1. **First target:** 9-max 100bb charts (today 9-max only has
+   rule-of-thumb ranges). Heads-up deeper lines and other stacks/rake after.
+2. **Delivery:** an offline `poker-trainer solve-preflop` command writes
+   chart files in the existing text format; the first set ships built in.
+   Every new command is documented in the README for people, not only in
+   code.
+3. **Charts first, grading later:** preflop decision grading in reviews is
+   the round after the model is validated.
+
+Design (`crates/preflop`):
+- **Tree:** built with the trainer's own engine, bet menu and spot keys, so
+  each decision is a chart spot. Rules keep it small: no open limps (or the
+  small blind only), all-in from the second raise on, and a cap on cold
+  callers per raise (the big blind and players who already acted can always
+  call). 6-max with one cold caller: 10k decisions, covering all 506
+  built-in chart spots; 9-max with one: 191k decisions (68M cells, about
+  0.5 GB); with two it is 1.2M decisions, too big.
+- **Solver:** external-sampling Monte Carlo CFR on real deals (hole cards
+  for every seat and a board), so card removal between any number of
+  players is exact; 169 hand classes per decision; the average strategy is
+  the count of sampled actions. About 2.4M deals/s on 4 threads at 6-max.
+- **Checks:** heads-up push-or-fold reaches the known equilibrium; leaf
+  payoffs equal the engine's settlement; a convergence measure (what a
+  player gains by changing one decision, counted only where an action is
+  clearly better on held-out deals) falls from about 1 bb/100 after 4M
+  deals to 0 after 400M at 6-max.
+- **Charts:** hands that practically never reach a spot use the trainer's
+  fallback rules, as imported charts do. A comparison weighs spots by how
+  often the reference reaches them.
+
+Steps:
+1. Tree, solver, charts, comparison, tests (16 planted bugs caught). `[x]`
+   With one flat factor per position and nothing per hand (1.05 in
+   position, 0.8 out of position), the 6-max open-raise frequencies
+   already land within 2 points of the solver charts from UTG to the
+   button (17.5/17.6, 27.9/27.8, 40.1/41.5); the small blind and the
+   blind-versus-blind defense are off, which is what measured factors are
+   for. With factor 1 everywhere the big blind defends 90% and nobody
+   opens enough: the factor is what makes the model work.
+2. Calibrate the factors with the postflop solver: per context, solve a
+   sample of flops with the ranges of the 6-max solver charts and measure
+   what each hand class wins relative to its equity share. `[ ]`
+3. Validate on 6-max against the built-in solver charts (open, defend and
+   3-bet frequencies per spot, and the per-hand distance). `[ ]`
+4. `solve-preflop` command, 9-max 100bb charts built in, README. `[ ]`
+5. Then: heads-up deeper lines, other stacks and rake; preflop decision
+   grading in the trainer. `[ ]`
 
 ## Later
 

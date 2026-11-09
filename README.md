@@ -70,7 +70,7 @@ features, which is fine for a local build.
 RUSTFLAGS="-C target-cpu=native" cargo install --path crates/tui
 ```
 
-Optional, experimental: heads-up solves on an NVIDIA GPU. This needs the CUDA
+Optional, experimental: heads-up and 3-way solves on an NVIDIA GPU. This needs the CUDA
 Toolkit 13.x to build (and on Windows, Visual Studio's C++ compiler); the
 built program needs only the NVIDIA driver. Then pick **Solve on: Auto** (or
 GPU) in the setup screen, or set `backend` in the config. Without a usable
@@ -324,6 +324,7 @@ crates/
   holdem/   cards, 7-card evaluator, ranges, bet menu, N-player engine (side pots, rake)
   solver/   heads-up postflop DCFR solver + approximate 3-player solver (solver::multi)
   trainer/  preflop charts + importers, AI styles, hand controller, review pipeline, config
+  preflop/  preflop model: solves the preflop betting tree, pots that see a flop valued by equity realization
   tui/      the `poker-trainer` binary (ratatui)
 ```
 
@@ -654,7 +655,7 @@ villain_range = "gto"        # gto | actual | both
 target_exploitability_pct = 0.5
 max_memory_gb = 5.0
 threads = 0                  # 0 = all cores
-backend = "cpu"              # cpu | auto | gpu: where heads-up solves run (GPU needs a `--features gpu` build)
+backend = "cpu"              # cpu | auto | gpu: where heads-up and 3-way solves run (GPU needs a `--features gpu` build)
 multiway_turn_samples = 8    # 3-way pots
 multiway_river_samples = 4
 
