@@ -90,9 +90,10 @@ fn push_fold_reaches_the_known_equilibrium() {
     assert!(u.deviation_gain.iter().all(|&g| g > 0.2), "{:?}", u.deviation_gain);
 }
 
-/// A game with a flop: the solve converges (no decision change gains
-/// much), threads don't change the answer much, and rake comes out of
-/// the players' results.
+/// A game with a flop converges on one thread and on several (no decision
+/// change gains much), and rake comes out of the players' results. The
+/// strategies themselves aren't compared: many hands are close to
+/// indifferent between limping and raising, so two solves mix differently.
 #[test]
 fn heads_up_with_flops_converges_on_several_threads() {
     let mut spec = GameSpec::new(2).with_stack(30.0).with_rake(0.05, 3.0);
@@ -101,14 +102,15 @@ fn heads_up_with_flops_converges_on_several_threads() {
     let one = solved(tree.clone(), Realization::neutral(), 2_000_000, Options::default());
     let four = solved(tree, Realization::neutral(), 2_000_000, Options { threads: 4, ..Options::default() });
     assert_eq!((one.deals(), four.deals()), (2_000_000, 2_000_000));
-    for action in [PreAction::Fold, PreAction::Passive, PreAction::Raise] {
-        let (a, b) = (frequency(&one, ">SB", action), frequency(&four, ">SB", action));
-        assert!((a - b).abs() < 0.05, "{action:?}: {a} with one thread, {b} with four");
+    for solver in [&one, &four] {
+        let d = solver.diagnose(400_000, 5);
+        assert!(d.deviation_gain.iter().all(|&g| g < 0.03), "{:?}", d.deviation_gain);
+        let lost = -(d.ev[0] + d.ev[1]);
+        assert!(lost > 0.01 && lost < 0.3, "rake per hand: {lost}");
     }
-    let d = one.diagnose(400_000, 5);
-    assert!(d.deviation_gain.iter().all(|&g| g < 0.03), "{:?}", d.deviation_gain);
-    let lost = -(d.ev[0] + d.ev[1]);
-    assert!(lost > 0.01 && lost < 0.3, "rake per hand: {lost}");
+    // The small blind's result is about the same on any number of threads.
+    let (a, b) = (one.diagnose(400_000, 5).ev[0], four.diagnose(400_000, 5).ev[0]);
+    assert!((a - b).abs() < 0.05, "small blind nets {a} with one thread, {b} with four");
 }
 
 /// Realization factors do what they say: a big blind that realizes less
