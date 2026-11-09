@@ -505,7 +505,7 @@ removal, 40 iterations, runs alternated (ms/iteration):
 
 What limits these kernels (Nsight, Fast): only ~16 of a warp's 32 lanes
 are busy, whatever the packing, because the tree has 1,176 boards (all-in
-runouts sample their own) and so 3,514 showdown segments of ~18 showdowns
+chance node samples its own cards) and so 3,514 showdown segments of ~18 showdowns
 each, and lanes can only share a warp when they share a board's sweep;
 and a lane's state still doesn't fit on chip, so the kernel waits on L2
 (26–51% achieved occupancy, memory throughput 16–45 GB/s, far from either
@@ -520,6 +520,58 @@ ms/iteration, about 7 s for the solve).
 Planted bugs in the fast sweep: 8, all caught but one (the pair mass not
 clamped at 0, which only moves values that are 0 in exact arithmetic,
 inside the tolerance's noise floor).
+
+### Shared runout boards (tried, rejected)
+
+`MultiConfig::share_runouts` (experimental, off by default, not exposed in
+the trainer): every chance node, betting lines and all-in runouts alike,
+deals from one sample drawn from the tree's seed (the turns first, then the
+rivers of each turn in card order) instead of sampling its own cards. The
+betting tree, its cells and the chance factors stay the same; only the
+cards dealt change. The aim was fuller warps in the leaf kernels (above).
+Sharing only the runouts would not have helped: on the chart-range flop the
+betting lines alone reach all 1,176 boards (151 flop-end betting chance
+nodes each sample 8 turns, all 49 turns appear; only 18 flop chance nodes
+are all-in runouts).
+
+Boards (cells unchanged): chart-range flop `Js9s4d`, 8 × 4: 1,176 to 32;
+chart-range turn `Js9s4d2c`, 8 rivers: 48 to 8.
+
+Checks: CPU tree tests (live, distinct cards; chance weights summing to one;
+one deck per tree; the same betting tree; every-card trees unaffected; the
+deck follows the seed; a proptest), trees without the flag fingerprinted
+against the commit before it (unchanged); on the GPU, exact precision bit
+for bit with the CPU with the flag on (all terminal models, split trees,
+random spots) and fast precision within its bounds. 5 planted bugs in the
+deck code, all caught; memcheck, initcheck, synccheck and racecheck clean on
+the GPU tests. No kernel or plan change was needed.
+
+Accuracy, against a solve of the same spot with every card dealt (each to
+the same target): values are the largest difference in a player's root
+value (% pot), range the total-variation distance between range-level
+action frequencies at the root street's decisions up to two actions deep,
+weighted by reach; mean over seeds. The floor is the every-card solve
+against itself solved to half the target.
+
+| Spot (CPU, f32) | Seeds | Values, own samples | Values, shared | Range, own | Range, shared | Floor (values, range) |
+|---|---|---|---|---|---|---|
+| chart turn `Js9s4d2c`, 8 rivers, independent, to 0.2% | 6 | 1.10% | 1.45% | 0.076 | 0.066 | 0.03%, 0.004 |
+| same, exact removal | 6 | 1.05% | 1.44% | 0.077 | 0.066 | 0.03%, 0.006 |
+| chart turn `Kh8d3c7s`, 8 rivers, independent, to 0.2% | 6 | 0.91% | 1.06% | 0.066 | 0.030 | 0.05%, 0.009 |
+| narrow flop `Js9s4d` (38/50/63 combos, the simplified later-street menu on the flop too), 8 × 4, independent, to 0.3% | 12 | 3.34% | 8.70% | 0.121 | 0.146 | 0.02%, 0.006 (4 seeds) |
+| same, exact removal | 12 | 2.97% | 7.99% | 0.127 | 0.142 | not measured |
+
+On the flop, where the turns are shared too, the value error is about 2.5
+times larger, and the shared solves also vary more from seed to seed
+(values 6.1% vs 4.5% apart): every betting line sees the same eight turns,
+so sampling errors no longer average out over the lines. On the turns, where
+only the rivers are shared, it is mixed (range frequencies closer, values
+further). The CPU was no faster per iteration, and the shared trees took
+about 30% more iterations to reach the target on the turns. Not run: the
+speed benchmarks (CPU and GPU, chart-range flop, flag off vs on); the
+accuracy results settled it first. The study driver (a multibench mode
+solving each seed with and without sharing) was not kept; `SHARE=1` in
+`multibench` still builds the shared tree.
 
 ## Running the GPU checks
 

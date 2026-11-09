@@ -58,6 +58,9 @@ plan and validation first, then kernels level by level, then terminals,
 each checked against the CPU solver before any fast path. 4+-way pots stay
 out of scope (rare, approximate, hard to validate).
 
+Status (2026-11-09): complete except the exact-removal speed target, which
+is not met (below); it stays `[~]` for that alone.
+
 What the CPU solver does that the port must mirror (`src/multi/`):
 - A traversal for player `p` carries **two** opponent reach vectors. At an
   opponent's node only that opponent's reach splits (the other passes
@@ -163,21 +166,28 @@ Steps:
    that don't fit, the heads-up segmentation made generic over reach-slot
    spaces (`gpu/segments.rs`), two per traverser with three players, leaf
    groups per segment; bit-identical to whole-tree solves, whole trees no
-   slower. The exact-removal speed target stays deferred (below).
+   slower. The exact-removal speed target is not met (below).
 
 Target: the chart-range 3-way flop (J♠9♠4♦, 8 × 4 sampled, exact removal)
 from 47 s on the CPU to well under 10 s. Status (2026-11-07): met for
-independent removal (Fast ~104 ms/iteration, about 7 s); deferred for exact
+independent removal (Fast ~104 ms/iteration, about 7 s); not met for exact
 removal (Fast ~368 ms/iteration, about 24 s): the one-leaf-per-lane leaves
 are limited by the tree's 1,176 boards (warps ~half full) and by per-lane
 state that doesn't fit on chip, and the alternatives estimated no better
 (`crates/solver/cuda/README.md`, "Faster leaves").
 
-Open ideas (need the user's decision):
-- Share runout boards: all-in runouts reuse the sampled boards of the
-  betting tree (1,176 boards down to ~32), which would fill the warps (and
-  likely speed up the CPU too); it changes the CPU solver's tree and
-  results.
+Tried and rejected (2026-11-09):
+- Share runout boards (`MultiConfig::share_runouts`, kept in the code as an
+  experimental option, off by default, not in the trainer): every chance
+  node deals from one shared sample, betting lines included (they alone
+  reach all 1,176 boards, so sharing only the runouts couldn't help). Boards
+  1,176 to 32 on the chart-range flop. Rejected for accuracy: against
+  every-card solves of a small flop (12 seeds, both removal models) root
+  values ended about 2.5 times further off (8.7% vs 3.3% of the pot,
+  independent removal), since every line then sees the same few turns; on
+  2 turn boards (6 seeds each, 3 runs) it was mixed. Speed was never
+  benchmarked.
+  Numbers: `crates/solver/cuda/README.md`, "Shared runout boards".
 
 ## 3. Preflop heuristics (no full preflop solving) `[ ]`
 

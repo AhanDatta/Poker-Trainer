@@ -119,6 +119,8 @@ impl Tree {
             ChanceMode::Sampled { seed, .. } => seed,
             ChanceMode::Exact => 0,
         };
+        let mut rng = StdRng::seed_from_u64(seed);
+        let deck = if cfg.share_runouts { shared_deck(cfg, &mut rng) } else { None };
         let mut b = Builder {
             cfg,
             hands,
@@ -128,7 +130,8 @@ impl Tree {
             cells: 0,
             max_cells,
             player_nodes: 0,
-            rng: StdRng::seed_from_u64(seed),
+            rng,
+            deck,
         };
         b.player(0, &cfg.root, [0; N], &mut Vec::new())?;
         Ok(Tree { nodes: b.nodes, boards: b.boards, storage_len: b.cells, num_player_nodes: b.player_nodes })
@@ -145,6 +148,40 @@ struct Builder<'a> {
     max_cells: u64,
     player_nodes: u32,
     rng: StdRng,
+    /// `MultiConfig::share_runouts`: the cards every chance node deals.
+    deck: Option<SharedDeck>,
+}
+
+/// The cards dealt by every chance node of a tree with
+/// `MultiConfig::share_runouts` (experimental, rejected), keyed by the cards dealt before it (as a
+/// `CardSet`): betting lines and all-in runouts alike see the same sampled
+/// turns and, after each turn, the same sampled rivers.
+type SharedDeck = std::collections::HashMap<u64, Vec<Card>>;
+
+/// Samples the shared deck of a sampled tree (none for `ChanceMode::Exact`,
+/// which deals every card anyway): the turns first, then the rivers of each
+/// turn in card order, from the tree's seed.
+fn shared_deck(cfg: &MultiConfig, rng: &mut StdRng) -> Option<SharedDeck> {
+    let ChanceMode::Sampled { turn, river, .. } = cfg.chance else { return None };
+    let remaining = |dealt: &[Card]| -> Vec<Card> {
+        let used = CardSet(CardSet::from_cards(&cfg.board).0 | CardSet::from_cards(dealt).0);
+        Card::all().filter(|c| !used.contains(*c)).collect()
+    };
+    let mut deck = SharedDeck::new();
+    match cfg.root.street {
+        Street::Flop => {
+            let turns = sample_cards(&remaining(&[]), turn.max(1), rng);
+            for &t in &turns {
+                deck.insert(CardSet::from_cards(&[t]).0, sample_cards(&remaining(&[t]), river.max(1), rng));
+            }
+            deck.insert(CardSet::default().0, turns);
+        }
+        Street::Turn => {
+            deck.insert(CardSet::default().0, sample_cards(&remaining(&[]), river.max(1), rng));
+        }
+        _ => {}
+    }
+    Some(deck)
 }
 
 impl Builder<'_> {
@@ -252,8 +289,16 @@ impl Builder<'_> {
             (ChanceMode::Sampled { river, .. }, _) => river.max(1),
             _ => available.len(),
         };
-        let cards =
-            if k < available.len() { sample_cards(&available, k, &mut self.rng) } else { available.clone() };
+        let cards = match &self.deck {
+            // Shared: the deck's cards after what was dealt so far (among
+            // the available ones: every card dealt came from the deck).
+            Some(deck) => deck
+                .get(&CardSet::from_cards(dealt).0)
+                .cloned()
+                .expect("the shared deck covers every street of the tree"),
+            None if k < available.len() => sample_cards(&available, k, &mut self.rng),
+            None => available.clone(),
+        };
         let compatible = (52 - board.len() - 2 * N) as f32;
         let factor = 1.0 / (cards.len() as f32 * compatible / available.len() as f32);
         self.nodes[id] = Node::new(Kind::Chance, st.street, invest, st.folded, edge);
@@ -289,3 +334,6 @@ impl Builder<'_> {
         i
     }
 }
+
+#[cfg(test)]
+mod tests;

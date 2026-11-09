@@ -191,6 +191,17 @@ pub struct MultiConfig {
     /// Exact card removal between the two opponents; off, their hands are
     /// treated as independent.
     pub exact_removal: bool,
+    /// Experimental, measured and rejected; not exposed in the trainer
+    /// (which always passes `false`). Sampled trees only: every chance
+    /// node, betting lines and all-in runouts alike, deals from one shared
+    /// sample (the same turns, and after each turn the same rivers), so the
+    /// tree has far fewer distinct boards (32 instead of 1,176 on an 8 × 4
+    /// flop). Rejected for accuracy: every line sees the same few turns, so
+    /// sampling errors stop averaging out, and on a small flop root values
+    /// ended about 2.5 times further from an every-card solve
+    /// (`cuda/README.md`, "Shared runout boards"). Off (the default), each
+    /// chance node samples its own cards.
+    pub share_runouts: bool,
     /// 16-bit compressed regrets and strategies (`Auto`: above 1 GB).
     pub storage: StorageMode,
     pub dcfr: DcfrParams,
@@ -776,6 +787,13 @@ impl MultiSolver {
         self.tree.nodes.len()
     }
 
+    /// Number of distinct boards (showdown strength tables) in the tree
+    /// (diagnostics).
+    #[doc(hidden)]
+    pub fn num_boards(&self) -> usize {
+        self.tree.boards.len()
+    }
+
     /// Showdown terminals reached by betting vs. by an all-in runout
     /// (diagnostics).
     #[doc(hidden)]
@@ -830,6 +848,7 @@ pub(crate) mod tests {
             rake_rate: 0.0,
             rake_cap: 0.0,
             exact_removal: false,
+            share_runouts: false,
             storage: StorageMode::F32,
             dcfr: multiway_dcfr(),
             backend: crate::Backend::Cpu,
@@ -1145,6 +1164,7 @@ mod size_tests {
                 rake_rate: 0.0,
                 rake_cap: 0.0,
                 exact_removal: false,
+                share_runouts: false,
                 storage: StorageMode::Auto,
                 dcfr: multiway_dcfr(),
                 backend: crate::Backend::Cpu,

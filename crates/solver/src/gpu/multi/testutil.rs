@@ -93,6 +93,7 @@ pub(crate) fn arb_multi_config() -> impl Strategy<Value = (MultiConfig, bool)> {
                 rake_rate: if raked { 0.05 } else { 0.0 },
                 rake_cap: if raked { 300.0 } else { 0.0 },
                 exact_removal: exact,
+                share_runouts: false,
                 storage: StorageMode::F32,
                 dcfr: multiway_dcfr(),
                 backend: crate::Backend::Cpu,

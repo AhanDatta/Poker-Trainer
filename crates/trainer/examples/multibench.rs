@@ -7,7 +7,8 @@
 //! in the exact game), RANGES="r0|r1|r2" (instead of the chart ranges),
 //! GPU=1 (solve on the GPU; needs `--features gpu` and f32 storage, which it
 //! implies; FAST=1 for double-single leaf sums), F32=1 (f32 storage on the
-//! CPU too, to compare like with like).
+//! CPU too, to compare like with like), SHARE=1 (the experimental, rejected
+//! `share_runouts`: one shared deck for every chance node).
 
 use holdem::card::parse_cards;
 use solver::multi::{MultiConfig, MultiSolver, MultiState};
@@ -95,6 +96,7 @@ fn main() {
         rake_rate: 0.0,
         rake_cap: 0.0,
         exact_removal: std::env::var("EXACT_REMOVAL").is_ok(),
+        share_runouts: std::env::var("SHARE").is_ok(),
         storage: if std::env::var("GPU").is_ok() || std::env::var("F32").is_ok() {
             solver::StorageMode::F32
         } else {
@@ -126,6 +128,7 @@ fn main() {
     }
     let (by_bet, runout) = solver.showdown_counts();
     println!("showdowns: {by_bet} after betting, {runout} in all-in runouts");
+    println!("boards: {}", solver.num_boards());
     if std::env::var("GPU").is_ok() {
         use_gpu(&mut solver);
     }
