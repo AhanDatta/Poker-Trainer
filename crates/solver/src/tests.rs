@@ -407,3 +407,24 @@ fn gpu_backend_without_gpu_support_solves_on_the_cpu() {
     }
 }
 
+
+/// Per-hand values add up to the root values: `root_values[p]` is the sum of
+/// each hand's weight times its value above half the pot, times its
+/// compatible opponent mass.
+#[test]
+fn hand_values_add_up_to_root_values() {
+    let cfg = config("Kc8d5h3s2c", "AA, JTs, J9s:0.5, 22+", "KQ, 55+, A5s", 1000, 5000, menu_one(&["100%"], &[]));
+    let (solver, _) = solve(cfg, 200, 0.5);
+    let root = solver.root_values();
+    let hands = solver.hands();
+    let half_pot = solver.root_pot() as f64 / 2.0;
+    for p in 0..2 {
+        let values = solver.hand_values(p);
+        let compat = hands.compatible_reach(p, &hands.weights[p ^ 1]);
+        let total: f64 = (0..hands.len(p))
+            .map(|h| hands.weights[p][h] as f64 * (values[h] as f64 - half_pot) * compat[h] / hands.num_combinations)
+            .sum();
+        assert!((total - root[p]).abs() < 1e-3 * (1.0 + root[p].abs()), "player {p}: {total} vs {}", root[p]);
+        assert!(values.iter().all(|v| v.is_finite()));
+    }
+}

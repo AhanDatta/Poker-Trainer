@@ -486,6 +486,31 @@ impl Solver {
         cfr::root_values(&self.ctx(), Mode::Average)
     }
 
+    /// Value of each of player `p`'s hands (in `hands().combos[p]` order)
+    /// under the average strategies, in chips: what the hand gets back from
+    /// the pot minus what it puts in after the root, against the opponent's
+    /// root range with card removal. A hand that folds at once is worth 0;
+    /// one that no opponent hand is compatible with is worth 0.
+    pub fn hand_values(&self, p: usize) -> Vec<f32> {
+        assert!(p < 2, "heads-up: player 0 or 1");
+        let ctx = self.ctx();
+        let opp = &self.hands.weights[p ^ 1];
+        let compat = self.hands.compatible_reach(p, opp);
+        let mut v = vec![0f32; self.hands.len(p)];
+        cfr::traverse(&ctx, 0, p, opp, Mode::Average, &mut v);
+        v.iter()
+            .zip(&compat)
+            .map(|(&x, &c)| {
+                let denom = c * ctx.norm;
+                if denom > 0.0 {
+                    (x as f64 / denom + ctx.half_pot) as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
     /// Runs DCFR iterations until the target exploitability or iteration cap
     /// is reached. `on_progress` is called after every exploitability check;
     /// returning `false` cancels the solve.
