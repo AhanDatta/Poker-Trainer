@@ -10,6 +10,7 @@
 //! * [`deal`] and [`rng`] sample hole cards and boards.
 //! * [`solver`] finds the strategies (Monte Carlo CFR).
 //! * [`charts`] turns a solve into the trainer's charts and compares charts.
+//! * [`generate`] solves a game and writes its charts (`solve-preflop`).
 //! * [`calibrate`] measures the realization factors with the postflop
 //!   solver.
 
@@ -19,6 +20,7 @@
 pub mod calibrate;
 pub mod charts;
 pub mod deal;
+pub mod generate;
 pub mod realize;
 pub mod rng;
 pub mod solver;
