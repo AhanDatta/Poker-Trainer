@@ -6,9 +6,17 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Calibration solves on an NVIDIA GPU (see crates/solver/cuda/README.md).
+gpu = ["solver/gpu", "trainer/gpu"]
+
 [dependencies]
 holdem.workspace = true
+solver.workspace = true
 trainer.workspace = true
+serde.workspace = true
+# Exact float round trips, so a checkpoint reads back as it was written.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -10,10 +10,13 @@
 //! * [`deal`] and [`rng`] sample hole cards and boards.
 //! * [`solver`] finds the strategies (Monte Carlo CFR).
 //! * [`charts`] turns a solve into the trainer's charts and compares charts.
+//! * [`calibrate`] measures the realization factors with the postflop
+//!   solver.
 
 // Index loops are clearer than iterator chains in the numeric code here.
 #![allow(clippy::needless_range_loop)]
 
+pub mod calibrate;
 pub mod charts;
 pub mod deal;
 pub mod realize;
