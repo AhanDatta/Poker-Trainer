@@ -88,13 +88,19 @@ fn spots_are_heads_up_flops_with_their_contexts() {
         assert_eq!(s.contexts.iter().filter(|c| c.role == Role::Aggressor).count(), 1, "{}", s.line);
         assert_eq!(s.pot, leaf.pot);
         assert_eq!(s.behind, spec().stack() - leaf.commit[s.seats[1]]);
-        assert!(s.kind().is_some());
+        let raiser = s.contexts.iter().find(|c| c.role == Role::Aggressor).unwrap();
+        let kind =
+            SpotType { pot: raiser.pot, aggressor_in_position: raiser.position == Position::InPosition };
+        assert_eq!(s.kind(), Some(kind));
     }
     let first = &spots[0];
     assert_eq!(first.line, "BTN:R BB:C");
     // The button is seat 0 and in position; the big blind is seat 2.
     assert_eq!(first.seats, [2, 0]);
     assert_eq!(first.contexts[1].role, Role::Aggressor);
+    assert_eq!(first.kind(), Some(SpotType { pot: PotKind::Raised, aggressor_in_position: true }));
+    let sb = spots.iter().find(|s| s.line == "SB:R BB:C").unwrap();
+    assert_eq!(sb.kind(), Some(SpotType { pot: PotKind::Raised, aggressor_in_position: false }));
     let lines: std::collections::HashSet<&str> = spots.iter().map(|s| s.line.as_str()).collect();
     assert_eq!(lines.len(), spots.len(), "lines identify spots");
 }
@@ -196,6 +202,13 @@ fn solve_ranges_floor_every_class_and_drop_board_cards() {
                 }
             }
         }
+        // The floor is relative to the range's largest weight.
+        let mut half = s.clone();
+        half.classes = s.classes.map(|r| r.map(|w| w / 2.0));
+        let scaled = solve_ranges(&half, &board, 0.01);
+        for c in 0..NUM_COMBOS {
+            assert!((scaled[1][c] - ranges[1][c] / 2.0).abs() < 1e-9, "{c}");
+        }
         // Without a floor, classes the charts never play stay out.
         let bare = solve_ranges(&s, &board, 0.0);
         let c72 = HandClass::from_grid_index(class("72o")).combos()[0];
@@ -223,9 +236,10 @@ fn check_down_values_are_equity_times_the_raked_pot() {
         behind: 9750,
     };
     let board = cards("Kh7c2d");
-    let mut setup = PostflopSetup::review(&spec());
+    // The real sizes: the check-down solve inside must bet nothing.
+    let mut setup = quick_setup();
     setup.floor = 0.0;
-    let (sums, _) = measure(&spot, &board, &setup.check_down()).unwrap();
+    let (sums, _) = measure(&spot, &board, &setup).unwrap();
     let ranges = solve_ranges(&spot, &board, 0.0);
     let prize = 550.0 - (550.0f64 * 0.05).min(300.0);
     let ranges = &ranges;
@@ -313,6 +327,21 @@ fn measured_sums_are_consistent() {
 }
 
 #[test]
+fn solves_start_with_the_spots_pot_and_stacks() {
+    let (_, spots) = six_max();
+    for s in pick(spots, 1) {
+        let cfg = measure::config(&s, &cards("Qs8h3c"), &PostflopSetup::review(&spec()));
+        assert_eq!(cfg.root.pot, s.pot);
+        assert_eq!(cfg.root.stack, [s.behind; 2]);
+        assert_eq!(cfg.root.street, holdem::Street::Flop);
+        assert_eq!((cfg.rake_rate, cfg.rake_cap, cfg.prune), (0.05, 300.0, 0.0));
+        // Every chip is accounted for: the pot is what the stacks put in.
+        let Node::Leaf(leaf) = &six_max().0.nodes[s.leaf as usize] else { panic!("a leaf") };
+        assert_eq!(leaf.commit[s.seats[0]] + s.behind, spec().stack());
+    }
+}
+
+#[test]
 fn bad_flops_are_errors() {
     let (_, spots) = six_max();
     let spot = &spots[0];
@@ -349,11 +378,11 @@ proptest! {
 
 #[test]
 fn flops_are_reproducible_and_extend() {
-    let a = flops(7, "BTN:R BB:C", 30);
-    assert_eq!(a, flops(7, "BTN:R BB:C", 30));
+    let a = flops(7, "BTN:R BB:C", 300);
+    assert_eq!(a, flops(7, "BTN:R BB:C", 300));
     assert_eq!(a[..10], flops(7, "BTN:R BB:C", 10)[..]);
-    assert_ne!(a, flops(8, "BTN:R BB:C", 30));
-    assert_ne!(a, flops(7, "CO:R BB:C", 30));
+    assert_ne!(a, flops(8, "BTN:R BB:C", 300));
+    assert_ne!(a, flops(7, "CO:R BB:C", 300));
     for f in &a {
         assert_eq!(holdem::CardSet::from_cards(f).len(), 3);
     }
@@ -490,6 +519,12 @@ fn aggregation_is_a_weighted_ratio_of_sums() {
         // The class without check-down values has none.
         assert_eq!(s, if c == 7 { 0.0 } else { 0.5 }, "class {c}");
     }
+    // Three solves: leaving one out gives 3/4, 5/4 and 1, so the standard
+    // error is sqrt(2/3 * (1/16 + 1/16)).
+    let three: Vec<Record> = [3.0, 1.0, 2.0].iter().map(|&v| sample_record([oop, ip], v, 2.0)).collect();
+    let cal3 = aggregate(&three).unwrap();
+    let expected = (2.0f64 / 3.0 * 0.125).sqrt() as f32;
+    assert!(cal3.stderr[ip.index()].iter().all(|&s| (s - expected).abs() < 1e-6));
     // A single solve has no standard error.
     let one = aggregate(&[a]).unwrap();
     assert!(one.stderr[oop.index()].iter().all(|&s| s == 0.0));
