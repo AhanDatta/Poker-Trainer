@@ -240,9 +240,50 @@ Steps:
    opens enough: the factor is what makes the model work.
 2. Calibrate the factors with the postflop solver: per context, solve a
    sample of flops with the ranges of the 6-max solver charts and measure
-   what each hand class wins relative to its equity share. `[ ]`
+   what each hand class wins relative to its equity share. `[x]`
+   (`crates/preflop/src/calibrate`, `examples/calibrate.rs`.) The 4
+   most-reached heads-up flop spots of each kind (raised, 3-bet and 4-bet
+   pot; raiser in or out of position), 48 flops each: 1152 GPU solves in
+   fast mode (49 turns x 10 rivers), about 3.5 hours with a resumable
+   checkpoint. Factor = what the hand wins with the real postflop menu over
+   what it wins checking down, both summed over flops and combos. Results
+   in `crates/preflop/data/realization_6max_100bb.txt`:
+   - Mean factor over the 169 classes: raiser in position 1.13 / 1.16 /
+     1.20 (raised / 3-bet / 4-bet pot), raiser out of position 0.90 / 0.85
+     / 0.82, caller in position 0.95 / 0.95 / 0.86, caller out of position
+     0.75 / 0.76 / 0.71. Strong hands realize far more than their equity
+     (AA 1.5 to 2.3), weak offsuit hands out of position far less (72o
+     about 0.6 as caller).
+   - Jackknife standard error over the solves: median 0.03 to 0.06 per
+     context, at most 0.18 (small pairs and connectors, whose value depends
+     most on the flop). Kept raw, without smoothing.
+   - **Not measured, copied** (heads-up flop solves can't measure them):
+     multiway contexts use the heads-up factors of the same position; the
+     middle position averages in and out of position; limped pots use the
+     raised pot's caller with the same position.
 3. Validate on 6-max against the built-in solver charts (open, defend and
-   3-bet frequencies per spot, and the per-hand distance). `[ ]`
+   3-bet frequencies per spot, and the per-hand distance). `[x]`
+   200M deals (about 100 s on 4 threads), same rake and tree as the charts:
+
+   | | Measured factors | Flat 1.05 / 0.8 | Built-in charts |
+   |---|---|---|---|
+   | Mean distance to the charts | **0.084** | 0.121 | — |
+   | Open: UTG / HJ / CO / BTN | 17.0 / 20.9 / 29.1 / 44.3 | 18.1 / 22.3 / 28.8 / 39.5 | 17.6 / 21.5 / 27.8 / 41.5 |
+   | Open: SB (raise) | 38.1 | 32.3 | 42.7 |
+   | BB defends vs UTG / HJ / CO / BTN | 22 / 26 / 32 / 42 | 28 / 34 / 40 / 50 | 27 / 30 / 34 / 44 |
+   | BB defends vs SB (call + 3-bet) | 76 (59 + 17) | 84 (72 + 12) | 59 (40 + 19) |
+   | SB folds to a BB 3-bet | 64 | 65 | 49 |
+   | Largest gain from changing one decision | 0.03 bb/100 | 0.04 bb/100 | — |
+
+   Matching now: first-in ranges from UTG to the cutoff (within 1.3
+   points), 3-bets against single opens (within 2 points everywhere), and
+   the big blind's defense against the cutoff and button (within 2). Still
+   off: **blind versus blind** (the big blind defends too much against the
+   small blind, and the small blind folds too much to its 3-bet); the big
+   blind defends 4 to 5 points too little against UTG and HJ (the flat
+   factors overdefended there instead); the button opens 3 points too wide
+   and the small blind 5 too tight. Blind-versus-blind contexts of their
+   own would be the next refinement.
 4. `solve-preflop` command, 9-max 100bb charts built in, README. `[ ]`
 5. Then: heads-up deeper lines, other stacks and rake; preflop decision
    grading in the trainer. `[ ]`
