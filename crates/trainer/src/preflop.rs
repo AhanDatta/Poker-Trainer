@@ -192,7 +192,9 @@ impl ChartSet {
                         if f[idx] > 0.9999 {
                             class.to_string()
                         } else {
-                            format!("{class}:{:.4}", f[idx])
+                            // 4 decimals, without trailing zeros ("0.33", not "0.3300").
+                            let f = format!("{:.4}", f[idx]);
+                            format!("{class}:{}", f.trim_end_matches('0'))
                         }
                     })
                     .collect();
@@ -494,6 +496,31 @@ mod tests {
 
     fn class(s: &str) -> usize {
         s.parse::<HandClass>().unwrap().grid_index()
+    }
+
+    #[test]
+    fn chart_text_drops_trailing_zeros_and_round_trips() {
+        let mut freqs = vec![[1.0, 0.0, 0.0, 0.0]; NUM_CLASSES];
+        freqs[class("AA")] = [0.0, 0.0, 0.67, 0.33];
+        freqs[class("KK")] = [0.1, 0.0, 0.9, 0.0];
+        freqs[class("QQ")] = [0.5, 0.2345, 0.26545, 0.00005];
+        freqs[class("JJ")] = [0.0, 0.00015, 0.99985, 0.0];
+        let cs = ChartSet { charts: HashMap::from([(">UTG".to_string(), Chart { freqs })]), players: 6 };
+        let text = cs.to_text("h");
+        for needle in
+            ["allin: AA:0.33", "raise: AA:0.67, KK:0.9, QQ:0.2655, JJ", "call: QQ:0.2345, JJ:0.0002"]
+        {
+            assert!(text.contains(needle), "{needle:?} not in\n{text}");
+        }
+        assert!(!text.contains("0.3300") && !text.contains("0.9000"), "{text}");
+        let back = ChartSet::parse(&text, 6).unwrap();
+        let chart = back.get(">UTG").unwrap();
+        for c in 0..NUM_CLASSES {
+            for a in 0..4 {
+                let (x, y) = (cs.charts[">UTG"].freqs[c][a], chart.class_freqs(c)[a]);
+                assert!((x - y).abs() < 2e-4, "{c} {a}: {x} vs {y}");
+            }
+        }
     }
 
     #[test]

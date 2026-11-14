@@ -16,14 +16,16 @@ fn small_job(deals: u64) -> Job {
 }
 
 #[test]
-fn solving_writes_charts_for_every_decision_with_a_header() {
+fn solving_writes_the_solved_spots_with_a_header() {
     let job = small_job(100_000);
     let mut epochs = Vec::new();
     let out = solve(&job, |p| epochs.push(*p)).unwrap();
     assert_eq!(epochs.len(), EPOCHS as usize);
     assert!(epochs.windows(2).all(|w| w[0].deals < w[1].deals && w[0].seconds <= w[1].seconds));
     assert_eq!(epochs.last().unwrap().deals, job.deals);
-    assert_eq!(out.charts.charts.len(), out.decisions);
+    // Only solved spots are written; the first decision always is.
+    assert!(out.charts.charts.len() <= out.decisions);
+    assert!(out.charts.get(">BTN").is_some());
     assert_eq!(out.charts.players, 3);
     let header = header(&job, &out);
     for needle in [
@@ -39,9 +41,16 @@ fn solving_writes_charts_for_every_decision_with_a_header() {
     ] {
         assert!(header.contains(needle), "{needle:?} not in\n{header}");
     }
+    // Whole percents, as the file writes them.
+    for chart in out.charts.charts.values() {
+        for f in &chart.freqs {
+            assert!(f.iter().all(|x| (x * 100.0 - (x * 100.0).round()).abs() < 1e-4), "{f:?}");
+        }
+    }
+    assert!(header.contains("whole percents"));
     // The file reads back as charts.
     let parsed = ChartSet::parse(&out.charts.to_text(&header), 3).unwrap();
-    assert_eq!(parsed.charts.len(), out.decisions);
+    assert_eq!(parsed.charts.len(), out.charts.charts.len());
 }
 
 #[test]
@@ -64,7 +73,8 @@ fn bad_games_are_errors() {
     let mut job = small_job(1000);
     job.spec.rules.max_nodes = 10;
     assert!(solve(&job, |_| ()).unwrap_err().contains("nodes"));
-    // No deals: every spot uses the fallback rules, but it still works.
+    // No deals: every spot uses the fallback rules, so no spot is written.
     let out = solve(&small_job(0), |_| ()).unwrap();
-    assert_eq!(out.charts.charts.len(), out.decisions);
+    assert!(out.charts.charts.is_empty());
+    assert!(out.decisions > 0);
 }

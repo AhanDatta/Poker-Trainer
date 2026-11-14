@@ -29,6 +29,62 @@ pub fn to_charts(solver: &Solver, min_samples: u64) -> ChartSet {
     ChartSet { charts, players }
 }
 
+/// [`to_charts`] without the spots where every hand class uses the fallback
+/// rules. The trainer applies the same rules to spots a chart file doesn't
+/// have, so it plays the same, and a 9-max file shrinks from 191k spots to
+/// the few tens of thousands the solve actually reaches.
+pub fn solved_charts(solver: &Solver, min_samples: u64) -> ChartSet {
+    let mut charts = to_charts(solver, min_samples);
+    for d in solver.tree().decisions() {
+        if (0..NUM_CLASSES).all(|class| solver.average(d, class).1 < min_samples.max(1)) {
+            charts.charts.remove(&d.key);
+        }
+    }
+    charts
+}
+
+/// Mixes below this are sampling noise in a written chart (see [`round_freqs`]).
+pub const MIN_MIX: f32 = 0.02;
+
+/// Rounds one hand's strategy for a chart file: actions below `min_mix`
+/// are dropped, the rest scaled back to 1 and rounded to whole percents
+/// that still add up to 100 (largest remainders). Actions at 0 stay at 0.
+/// Not a distribution (negative, not finite or summing to 0): unchanged.
+pub fn round_freqs(f: Freqs, min_mix: f32) -> Freqs {
+    if f.iter().any(|x| !x.is_finite() || *x < 0.0) {
+        return f;
+    }
+    let mut kept = f.map(|x| if x >= min_mix { x } else { 0.0 });
+    if kept.iter().all(|&x| x == 0.0) {
+        // Only possible with min_mix above a quarter: keep the largest.
+        let top = (0..4).max_by(|&a, &b| f[a].total_cmp(&f[b])).expect("4 actions");
+        if f[top] <= 0.0 {
+            return f;
+        }
+        kept = [0.0; 4];
+        kept[top] = 1.0;
+    }
+    let sum: f32 = kept.iter().sum();
+    let scaled = kept.map(|x| x / sum * 100.0);
+    let mut units = scaled.map(|x| x.floor() as u32);
+    let mut order = [0, 1, 2, 3];
+    order.sort_by(|&a, &b| (scaled[b] - scaled[b].floor()).total_cmp(&(scaled[a] - scaled[a].floor())));
+    let short = 100u32.saturating_sub(units.iter().sum());
+    for &a in order.iter().filter(|&&a| kept[a] > 0.0).cycle().take(short as usize) {
+        units[a] += 1;
+    }
+    units.map(|u| u as f32 / 100.0)
+}
+
+/// [`round_freqs`] on every hand of every spot.
+pub fn round_charts(charts: &mut ChartSet, min_mix: f32) {
+    for chart in charts.charts.values_mut() {
+        for f in chart.freqs.iter_mut() {
+            *f = round_freqs(*f, min_mix);
+        }
+    }
+}
+
 /// How a model's chart differs from a reference chart at one spot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SpotDiff {

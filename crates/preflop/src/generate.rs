@@ -1,7 +1,7 @@
 //! Making a chart file from scratch: solve a game with the model and write
 //! its strategies as the trainer's charts (the `solve-preflop` command).
 
-use crate::charts::to_charts;
+use crate::charts::{round_charts, solved_charts, MIN_MIX};
 use crate::realize::Realization;
 use crate::solver::{Diagnosis, Options, Solver};
 use crate::spec::GameSpec;
@@ -42,6 +42,9 @@ pub struct Progress {
 /// A finished solve.
 #[derive(Debug)]
 pub struct Output {
+    /// Only the spots where some hand class was solved (the trainer's
+    /// fallback rules cover the rest), in whole percents without mixes
+    /// below [`MIN_MIX`].
     pub charts: ChartSet,
     pub diagnosis: Diagnosis,
     pub decisions: usize,
@@ -64,12 +67,9 @@ pub fn solve(job: &Job, mut progress: impl FnMut(&Progress)) -> Result<Output, S
         progress(&Progress { epoch, deals: solver.deals(), seconds: start.elapsed().as_secs_f64() });
     }
     let diagnosis = solver.diagnose(DIAGNOSIS_DEALS, job.seed ^ 0x5eed);
-    Ok(Output {
-        charts: to_charts(&solver, MIN_SAMPLES),
-        diagnosis,
-        decisions,
-        seconds: start.elapsed().as_secs_f64(),
-    })
+    let mut charts = solved_charts(&solver, MIN_SAMPLES);
+    round_charts(&mut charts, MIN_MIX);
+    Ok(Output { charts, diagnosis, decisions, seconds: start.elapsed().as_secs_f64() })
 }
 
 /// The header of a generated chart file: the settings, factors and seed,
@@ -88,8 +88,9 @@ pub fn header(job: &Job, out: &Output) -> String {
             if s.rules.max_cold_callers == usize::MAX { "any".to_string() } else { s.rules.max_cold_callers.to_string() }
         ),
         format!("Realization factors: {}.", job.factors_name),
+        format!("Frequencies in whole percents; mixes below {:.0}% are dropped as sampling noise.", MIN_MIX * 100.0),
         format!(
-            "{:.0} million deals, seed {}, {:.0} s. Spots a hand reaches fewer than {MIN_SAMPLES} times use the fallback rules.",
+            "{:.0} million deals, seed {}, {:.0} s. Hands that reach a spot fewer than {MIN_SAMPLES} times, and spots not in the file, use the fallback rules.",
             job.deals as f64 / 1e6,
             job.seed,
             out.seconds
