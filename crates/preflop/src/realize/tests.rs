@@ -166,6 +166,41 @@ fn bad_factor_files_are_errors() {
     assert!(Realization::parse("").is_err());
 }
 
+/// The shipped factors parse, keep the copying rules of the calibration, and
+/// look like poker: aces beat 72o, and position helps.
+#[test]
+fn builtin_factors_parse_and_follow_the_fill_rules() {
+    let r = Realization::builtin();
+    assert!(!r.includes_rake, "measured against equity times the raked pot");
+    let class = |name: &str| name.parse::<holdem::HandClass>().unwrap().grid_index();
+    let (aces, trash) = (class("AA"), class("72o"));
+    // The file rounds to 4 decimals, so the average is off by at most 1e-4.
+    let near = |a: f32, b: f32| (a - b).abs() <= 1.5e-4;
+    for ctx in Context::all() {
+        let f = r.factors(ctx);
+        assert!(f.iter().all(|&x| x.is_finite() && (0.2..4.0).contains(&x)), "{}", ctx.name());
+        assert!(f[aces] > f[trash], "{}", ctx.name());
+        if ctx.multiway {
+            assert_eq!(f, r.factors(Context { multiway: false, ..ctx }), "{}", ctx.name());
+        }
+        if ctx.pot == PotKind::Limped {
+            let raised = Context { pot: PotKind::Raised, role: Role::Caller, ..ctx };
+            assert_eq!(f, r.factors(raised), "{}", ctx.name());
+        }
+        if ctx.position == Position::Middle {
+            let ip = r.factors(Context { position: Position::InPosition, ..ctx });
+            let oop = r.factors(Context { position: Position::OutOfPosition, ..ctx });
+            assert!((0..NUM_CLASSES).all(|c| near(f[c], (ip[c] + oop[c]) / 2.0)), "{}", ctx.name());
+        }
+        if ctx.position == Position::InPosition {
+            let oop = r.factors(Context { position: Position::OutOfPosition, ..ctx });
+            let mean = |f: &[f32; NUM_CLASSES]| f.iter().sum::<f32>() / NUM_CLASSES as f32;
+            assert!(mean(f) > mean(oop) + 0.05, "{}", ctx.name());
+        }
+    }
+    assert!(Realization::BUILTIN_NAME.contains("6-max"));
+}
+
 proptest::proptest! {
     /// Arbitrary text never panics the parser.
     #[test]

@@ -232,6 +232,28 @@ fn aggregate_file(args: &Args) -> Result<(), String> {
                 ctx.name(),
                 ["AA", "KK", "AKs", "T9s", "72o"].map(show).join("  ")
             );
+            let errors = &calibration.stderr[ctx.index()];
+            let mut sorted: Vec<usize> = (0..169).collect();
+            sorted.sort_by(|&a, &b| errors[a].total_cmp(&errors[b]));
+            let worst: Vec<String> = sorted[166..]
+                .iter()
+                .rev()
+                .map(|&c| {
+                    format!(
+                        "{} {:.3}±{:.3}",
+                        holdem::HandClass::from_grid_index(c),
+                        r.factor(ctx.index(), c),
+                        errors[c]
+                    )
+                })
+                .collect();
+            println!(
+                "      standard error: median {:.3}, 90% {:.3}, max {:.3}; noisiest {}",
+                errors[sorted[84]],
+                errors[sorted[152]],
+                errors[sorted[168]],
+                worst.join(", ")
+            );
         }
     }
     let header = format!(

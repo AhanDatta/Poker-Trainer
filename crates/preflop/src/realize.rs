@@ -112,7 +112,22 @@ pub struct Realization {
     pub includes_rake: bool,
 }
 
+/// The measured factors shipped with the crate (see [`Realization::builtin`]).
+const BUILTIN_TEXT: &str = include_str!("../data/realization_6max_100bb.txt");
+
 impl Realization {
+    /// Where [`Realization::builtin`] comes from, for chart headers.
+    pub const BUILTIN_NAME: &'static str =
+        "built-in, measured from heads-up postflop solves of 6-max 100bb (crates/preflop/data)";
+
+    /// The factors measured by `examples/calibrate.rs` from heads-up postflop
+    /// solves of the built-in 6-max 100bb charts. Multiway contexts copy the
+    /// heads-up ones, the middle position averages in and out of position,
+    /// and limped pots copy the raised pot's caller.
+    pub fn builtin() -> Realization {
+        Realization::parse(BUILTIN_TEXT).expect("the built-in factors file parses (tested)")
+    }
+
     /// Every hand realizes exactly its equity.
     pub fn neutral() -> Realization {
         Realization { factors: vec![[1.0; NUM_CLASSES]; Context::COUNT], includes_rake: false }
