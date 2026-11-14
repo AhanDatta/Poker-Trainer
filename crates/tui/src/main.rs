@@ -6,6 +6,7 @@ mod export_cmd;
 mod score_ui;
 mod selfplay;
 mod sizes;
+mod solve_preflop_cmd;
 mod study_app;
 mod study_ui;
 mod ui;
@@ -84,6 +85,40 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Solve the preflop game with the preflop model (equity realization
+    /// instead of postflop solving) and write a chart file (set it as
+    /// charts_hu / charts_6max / charts_9max in the config to use it).
+    SolvePreflop {
+        /// Table size, 2 to 9.
+        #[arg(long, default_value_t = 9)]
+        players: usize,
+        /// Every player's stack, in big blinds.
+        #[arg(long, default_value_t = 100.0)]
+        stack: f64,
+        /// Rake, in percent of pots that see a flop.
+        #[arg(long, default_value_t = 5.0)]
+        rake: f64,
+        /// Most rake per hand, in big blinds.
+        #[arg(long, default_value_t = 3.0)]
+        rake_cap: f64,
+        /// Millions of deals to solve with (more is closer to the equilibrium).
+        #[arg(long, default_value_t = 400.0)]
+        deals: f64,
+        /// Worker threads (0 = every core).
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+        /// Most players who may cold-call one raise (the big blind, and
+        /// players who already acted, always may). More makes the tree much
+        /// bigger: 9-max with 2 is about 1.2 million decisions.
+        #[arg(long, default_value_t = 1)]
+        cold_callers: usize,
+        /// Realization factors file (default: the built-in measured factors).
+        #[arg(long)]
+        factors: Option<String>,
+        /// Output chart file (default: charts_<players>max.txt).
+        #[arg(short, long)]
+        out: Option<String>,
+    },
     /// Headless: play hands with a scripted hero and print the solver review
     /// (useful to check performance on your machine).
     Selfplay {
@@ -128,6 +163,31 @@ fn main() -> Result<()> {
         Some(Cmd::Export { out, session }) => {
             let (cfg, _) = load_config(&cli)?;
             export_cmd::run(&cfg, out, session.as_deref())
+        }
+        Some(Cmd::SolvePreflop {
+            players,
+            stack,
+            rake,
+            rake_cap,
+            deals,
+            threads,
+            cold_callers,
+            factors,
+            out,
+        }) => {
+            let out = out.clone().unwrap_or_else(|| format!("charts_{players}max.txt"));
+            solve_preflop_cmd::run(&solve_preflop_cmd::Settings {
+                players: *players,
+                stack_bb: *stack,
+                rake_pct: *rake,
+                rake_cap_bb: *rake_cap,
+                million_deals: *deals,
+                threads: *threads,
+                seed: cli.seed.unwrap_or(1),
+                cold_callers: *cold_callers,
+                factors: factors.as_deref(),
+                out: &out,
+            })
         }
         Some(Cmd::Selfplay { hands, style }) => {
             let (mut cfg, _) = load_config(&cli)?;

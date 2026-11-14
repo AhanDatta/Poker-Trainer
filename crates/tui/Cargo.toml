@@ -16,6 +16,7 @@ gpu = ["trainer/gpu"]
 
 [dependencies]
 holdem.workspace = true
+preflop.workspace = true
 solver.workspace = true
 trainer.workspace = true
 anyhow.workspace = true
