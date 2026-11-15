@@ -309,6 +309,10 @@ fn export_writes_both_files() {
     let decisions = parse_csv(&fs::read_to_string(out.join(DECISIONS_FILE)).unwrap());
     assert_eq!(decisions.len(), 7);
     assert!(decisions.iter().all(|r| r.len() == DECISION_COLUMNS.len()));
+    // The fixture's hands have no preflop decisions: just the header.
+    let preflop = parse_csv(&fs::read_to_string(out.join(PREFLOP_FILE)).unwrap());
+    assert_eq!((preflop.len(), report.preflop_decisions), (1, 0));
+    assert_eq!(preflop[0], PREFLOP_COLUMNS);
     assert!(!out.join(format!("{HANDS_FILE}.tmp")).exists());
 
     // One session; the files are replaced.
@@ -343,6 +347,49 @@ fn summary_table_lists_formats_and_total() {
 
 /// Plays `hands` hands (the table size changes halfway) with a hero that
 /// picks actions from `seed`; reviews are off so hands finish at once.
+/// Every hero preflop decision is a row, with its grade; saves from before
+/// preflop grading are graded with the session's charts and give the same rows.
+#[test]
+fn preflop_rows_list_every_hero_preflop_decision() {
+    let session = play_session(7, [6, 9], 40);
+    let hands: Vec<SavedHand> = session.history.iter().map(|h| h.to_saved()).collect();
+    let loaded = LoadedSession { meta: session.meta(), hands, skipped: 0 };
+    let rows = preflop_rows(&loaded);
+    let expected: usize = session.history.iter().map(|h| h.preflop_grades().len()).sum();
+    assert!(expected > 40, "{expected}");
+    assert_eq!(rows.len(), expected);
+    let mut graded = 0;
+    for r in &rows {
+        let f = r.fields();
+        assert_eq!(f.len(), PREFLOP_COLUMNS.len());
+        assert_eq!(f[3], r.decision.position);
+        assert!(f[4].ends_with(&format!(">{}", r.decision.position)), "{}", f[4]);
+        match r.grade.verdict {
+            Some(v) => {
+                graded += 1;
+                assert_eq!(f[13], v.label());
+                let pct: f64 = [8, 9, 10, 11].iter().map(|&i| f[i].parse::<f64>().unwrap()).sum();
+                assert!((pct - 100.0).abs() < 0.5, "{f:?}");
+                assert_eq!(f[12], f[8 + r.grade.chosen.index()], "chosen_pct is the chosen action's column");
+                assert!(!f[14].is_empty());
+            }
+            None => {
+                assert_eq!(f[13], "not graded");
+                assert!(f[8..13].iter().all(|x| x.is_empty()) && f[14].is_empty(), "{f:?}");
+            }
+        }
+    }
+    assert!(graded > 20);
+    // Hands numbered in order, decisions numbered within each hand.
+    assert!(rows.windows(2).all(|w| (w[0].hand, w[0].index) < (w[1].hand, w[1].index)));
+    let mut old = loaded.clone();
+    for h in &mut old.hands {
+        h.preflop_grades = None;
+    }
+    let regraded: Vec<Vec<String>> = preflop_rows(&old).iter().map(|r| r.fields()).collect();
+    assert_eq!(regraded, rows.iter().map(|r| r.fields()).collect::<Vec<_>>());
+}
+
 fn play_session(seed: u64, players: [usize; 2], hands: usize) -> Session {
     let mut cfg = TrainerConfig { seed: Some(seed), players: players[0], ..TrainerConfig::default() };
     cfg.solver.enabled = false;

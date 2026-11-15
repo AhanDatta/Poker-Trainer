@@ -149,3 +149,35 @@ fn grades_are_saved_and_old_saves_are_graded_on_load() {
     // The hero's actions are recorded as abstract preflop actions.
     assert!(session.history.iter().flat_map(|h| h.preflop_grades()).any(|g| g.chosen == PreAction::Fold));
 }
+
+/// An old save of a session whose table size changed: continuing it grades
+/// each hand with the charts of its own table size.
+#[test]
+fn old_saves_are_graded_with_their_own_table_size() {
+    let root = scratch("sizes");
+    let mut session = Session::new(config(13)).unwrap();
+    session.start_saving(root.clone());
+    for i in 0..30 {
+        if i == 15 {
+            session.set_players(9).unwrap();
+        }
+        let hand = play(&mut session);
+        session.finish_hand(hand);
+        session.refresh();
+    }
+    session.flush(std::time::Duration::from_secs(1));
+    let id = session.save_id().unwrap().to_string();
+    let mut loaded = SessionStore::open(&root, &id).unwrap().load().unwrap();
+    let sizes: std::collections::BTreeSet<usize> =
+        loaded.hands.iter().map(|h| h.state.num_players()).collect();
+    assert_eq!(sizes.len(), 2, "both table sizes are in the save");
+    for h in &mut loaded.hands {
+        h.preflop_grades = None;
+    }
+    let resumed = Session::resume(loaded, root.clone(), &config(13)).unwrap();
+    assert_eq!(resumed.history.len(), session.history.len());
+    for (a, b) in resumed.history.iter().zip(&session.history) {
+        assert_eq!(a.preflop_grades(), b.preflop_grades(), "hand {}", a.id);
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

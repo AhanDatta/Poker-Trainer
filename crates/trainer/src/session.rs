@@ -140,7 +140,6 @@ impl Stats {
     }
 }
 
-/// Charts for the configured table size (file or built-in).
 /// Built-in charts for the table size, overlaid with the configured chart
 /// file (whose spots take precedence) if there is one.
 fn load_charts(config: &TrainerConfig) -> Result<ChartSet, String> {
@@ -152,6 +151,13 @@ fn load_charts(config: &TrainerConfig) -> Result<ChartSet, String> {
         }
         None => builtin,
     })
+}
+
+/// The charts a session with `config` plays by at a table of `players`;
+/// the built-in ones alone if its chart file can't be read (any more).
+pub(crate) fn charts_for(config: &TrainerConfig, players: usize) -> ChartSet {
+    let config = TrainerConfig { players, ..config.clone() };
+    load_charts(&config).unwrap_or_else(|_| ChartSet::builtin(players))
 }
 
 impl Session {
@@ -543,10 +549,25 @@ impl Session {
         s.next_id = meta.next_id.max(1);
         s.created = meta.created;
         let (menu, charts) = (s.config.menu.clone(), Arc::clone(&s.charts));
+        // Hands from other table sizes (the size changed during the session)
+        // get their size's charts: saves from before preflop grading are
+        // graded with them.
+        let mut other_sizes: BTreeMap<usize, Arc<ChartSet>> = BTreeMap::new();
         s.history = loaded
             .hands
             .into_iter()
-            .map(|h| LiveHand::from_saved(h, menu.clone(), Arc::clone(&charts)))
+            .map(|h| {
+                let players = h.state.num_players();
+                let charts = if players == n {
+                    Arc::clone(&charts)
+                } else {
+                    let c = other_sizes
+                        .entry(players)
+                        .or_insert_with(|| Arc::new(charts_for(&s.config, players)));
+                    Arc::clone(c)
+                };
+                LiveHand::from_saved(h, menu.clone(), charts)
+            })
             .collect();
         s.saved = s.history.len();
         s.store = Some(SessionStore::open(&root, &meta.id).map_err(|e| e.to_string())?);

@@ -1,11 +1,13 @@
 //! CSV export of saved sessions: one row per hand (results, for bb/100 by
-//! format) and one row per graded decision (for leak analysis). The two
-//! files join on `session` + `hand`.
+//! format), one row per solver-graded decision and one row per hero preflop
+//! decision (for leak analysis). The files join on `session` + `hand`.
 //!
 //! Everything is derived from the saved hands; the save format itself is
 //! unchanged. Net results come from settling each hand, exactly as the
 //! session's own stats do.
 
+use crate::preflop::{PreAction, PreDecision};
+use crate::preflop_grade::{self, PreflopGrade};
 use crate::review::{DecisionReview, Variant, Verdict};
 use crate::save::{self, LoadedSession, SavedHand, SessionMeta, SessionStore};
 use holdem::{Card, Chips};
@@ -19,6 +21,7 @@ use std::path::Path;
 /// File names written by [`export`].
 pub const HANDS_FILE: &str = "poker-trainer-hands.csv";
 pub const DECISIONS_FILE: &str = "poker-trainer-decisions.csv";
+pub const PREFLOP_FILE: &str = "poker-trainer-preflop.csv";
 
 pub const HAND_COLUMNS: [&str; 18] = [
     "session",
@@ -61,6 +64,24 @@ pub const DECISION_COLUMNS: [&str; 19] = [
     "exploitability_pct",
     "solver",
     "notes",
+];
+
+pub const PREFLOP_COLUMNS: [&str; 15] = [
+    "session",
+    "hand",
+    "decision",
+    "position",
+    "spot",
+    "hero_cards",
+    "class",
+    "chosen",
+    "chart_fold",
+    "chart_call",
+    "chart_raise",
+    "chart_allin",
+    "chosen_pct",
+    "verdict",
+    "chart_action",
 ];
 
 // ---------------------------------------------------------------- CSV ---
@@ -315,6 +336,86 @@ pub fn decision_rows(s: &LoadedSession) -> Vec<DecisionRow<'_>> {
     rows
 }
 
+/// One hero preflop decision and its grade against the charts.
+#[derive(Clone, Debug)]
+pub struct PreflopRow<'a> {
+    pub session: &'a str,
+    pub hand: u64,
+    /// 1-based, among the hero's preflop decisions of the hand.
+    pub index: usize,
+    pub hero_cards: String,
+    pub decision: &'a PreDecision,
+    pub grade: PreflopGrade,
+}
+
+impl PreflopRow<'_> {
+    /// The CSV record, in [`PREFLOP_COLUMNS`] order. Spots without a chart
+    /// have empty chart columns and verdict `not graded`.
+    pub fn fields(&self) -> Vec<String> {
+        let g = &self.grade;
+        let pct = |f: Option<f32>| f.map_or(String::new(), |f| num(100.0 * f as f64, 1));
+        let chart = |a: PreAction| pct(g.chart.map(|f| f[a.index()]));
+        let action = |a: PreAction| match a {
+            PreAction::Fold => "fold",
+            PreAction::Passive => "call",
+            PreAction::Raise => "raise",
+            PreAction::AllIn => "allin",
+        };
+        vec![
+            self.session.to_string(),
+            self.hand.to_string(),
+            self.index.to_string(),
+            self.decision.position.clone(),
+            self.decision.key.clone(),
+            self.hero_cards.clone(),
+            holdem::HandClass::from_grid_index(g.class).to_string(),
+            action(g.chosen).to_string(),
+            chart(PreAction::Fold),
+            chart(PreAction::Passive),
+            chart(PreAction::Raise),
+            chart(PreAction::AllIn),
+            pct(g.chosen_freq()),
+            g.verdict.map_or("not graded", |v| v.label()).to_string(),
+            g.chart_action().map_or("", action).to_string(),
+        ]
+    }
+}
+
+/// The hero's preflop decisions of the session, in hand order. Hands saved
+/// before preflop grading are graded with the session's charts for their
+/// table size.
+pub fn preflop_rows(s: &LoadedSession) -> Vec<PreflopRow<'_>> {
+    let mut hands: Vec<&SavedHand> = s.hands.iter().collect();
+    hands.sort_by_key(|h| h.id);
+    let mut charts: BTreeMap<usize, crate::preflop::ChartSet> = BTreeMap::new();
+    let mut rows = Vec::new();
+    for h in hands {
+        let Some(hole) = h.state.hole.get(h.hero).copied() else { continue };
+        let grades = match &h.preflop_grades {
+            Some(g) => g.clone(),
+            None => {
+                let players = h.state.num_players();
+                let charts = charts
+                    .entry(players)
+                    .or_insert_with(|| crate::session::charts_for(&s.meta.config, players));
+                preflop_grade::grade(charts, &h.preflop, h.hero, hole)
+            }
+        };
+        for (i, g) in grades.into_iter().enumerate() {
+            let Some(decision) = h.preflop.get(g.decision) else { continue };
+            rows.push(PreflopRow {
+                session: &s.meta.id,
+                hand: h.id,
+                index: i + 1,
+                hero_cards: cards(&hole, ""),
+                decision,
+                grade: g,
+            });
+        }
+    }
+    rows
+}
+
 // ------------------------------------------------------------ bb/100 ---
 
 /// Results in one format.
@@ -393,6 +494,8 @@ pub struct ExportReport {
     pub sessions: usize,
     pub hands: usize,
     pub decisions: usize,
+    /// Hero preflop decisions (graded or not).
+    pub preflop_decisions: usize,
     /// Lines of `hands.jsonl` files that couldn't be read.
     pub skipped_lines: usize,
     /// Sessions that couldn't be read, with the reason.
@@ -400,12 +503,14 @@ pub struct ExportReport {
     pub totals: Vec<FormatTotals>,
 }
 
-/// Writes both CSV files for `sessions` (in that order) into `out_dir`.
+/// Writes the CSV files for `sessions` (in that order) into `out_dir`.
 pub fn write_csvs(sessions: &[LoadedSession], out_dir: &Path) -> io::Result<ExportReport> {
     let mut hands_csv = Vec::new();
     let mut decisions_csv = Vec::new();
+    let mut preflop_csv = Vec::new();
     write_record(&mut hands_csv, &HAND_COLUMNS)?;
     write_record(&mut decisions_csv, &DECISION_COLUMNS)?;
+    write_record(&mut preflop_csv, &PREFLOP_COLUMNS)?;
     let mut all = Vec::new();
     let mut report = ExportReport { sessions: sessions.len(), ..Default::default() };
     for s in sessions {
@@ -418,12 +523,17 @@ pub fn write_csvs(sessions: &[LoadedSession], out_dir: &Path) -> io::Result<Expo
             write_record(&mut decisions_csv, &r.fields())?;
             report.decisions += 1;
         }
+        for r in preflop_rows(s) {
+            write_record(&mut preflop_csv, &r.fields())?;
+            report.preflop_decisions += 1;
+        }
     }
     report.hands = all.len();
     report.totals = totals_by_format(&all);
     fs::create_dir_all(out_dir)?;
     replace_file(&out_dir.join(HANDS_FILE), &hands_csv)?;
     replace_file(&out_dir.join(DECISIONS_FILE), &decisions_csv)?;
+    replace_file(&out_dir.join(PREFLOP_FILE), &preflop_csv)?;
     Ok(report)
 }
 
