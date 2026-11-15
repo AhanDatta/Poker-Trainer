@@ -72,6 +72,13 @@ pub(crate) fn title_bar(app: &App, extra: &str) -> Paragraph<'static> {
         format!("{}{}", if net >= 0 { "+" } else { "" }, bb(net)),
         Style::default().fg(if net >= 0 { Color::Green } else { Color::Red }),
     ));
+    if st.preflop_decisions > 0 {
+        spans.push(Span::raw(format!(
+            " · Preflop {} · {:.0}% in chart",
+            st.preflop_decisions,
+            100.0 * st.preflop_accuracy()
+        )));
+    }
     if st.decisions > 0 {
         spans.push(Span::raw(format!(
             " · Graded {} · Accuracy {:.0}% · Avg loss {:.1}% pot",
@@ -398,11 +405,12 @@ fn draw_setup(f: &mut Frame, app: &App) {
             Line::from(
                 "Play NLHE hands (heads-up, 6-max or 9-max) from preflop to the river against AI \
                  opponents with different styles. After each hand, press R to see what the solver \
-                 would have done in every postflop spot you played, with the EV of each option.",
+                 would have done in every postflop spot you played, with the EV of each option, and \
+                 how often the preflop charts play what you did preflop.",
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "Preflop decisions are not graded yet; the charts set the AIs' play and the starting ranges. \
+                "Preflop grades come from the charts (how often they play your action with your hand), not EVs. \
                  Text too small? Zoom your terminal (Ctrl/Cmd +): every screen adapts down to about 100×30.",
                 Style::default().fg(Color::DarkGray),
             )),
@@ -679,10 +687,12 @@ fn draw_table(f: &mut Frame, app: &App) {
     // Solver status.
     let status = match hand.review() {
         None => Line::from(Span::styled(
-            if hand.is_finished() {
-                "No postflop decisions to review in this hand."
+            if hand.is_finished() && !hand.preflop_grades().is_empty() {
+                "Preflop graded against the charts — press R for the review."
+            } else if hand.is_finished() {
+                "No decisions to review in this hand."
             } else if hand.hero_folded() {
-                "You folded: nothing to review."
+                "You folded: your preflop decisions are graded when the hand ends."
             } else {
                 "Solver review starts when the flop is dealt."
             },
@@ -774,7 +784,9 @@ fn draw_review(f: &mut Frame, app: &App) {
         head.push(Span::raw(" "));
     }
     let mut second = String::new();
-    if !status.finished {
+    if hand.review().is_none() {
+        // Preflop grades only: nothing is solving.
+    } else if !status.finished {
         second = format!("Solving… {}", status.stage);
         if let Some(p) = status.progress {
             second.push_str(&format!(" (iteration {}, {:.2}% pot)", p.iteration, p.exploitability_pct));
@@ -788,12 +800,31 @@ fn draw_review(f: &mut Frame, app: &App) {
     let header = vec![Line::from(head), Line::from(Span::styled(second, Style::default().fg(Color::Yellow)))];
     f.render_widget(Paragraph::new(header).block(Block::default().borders(Borders::BOTTOM)), rows[1]);
 
+    let preflop = app.preflop_items();
     let decisions = app.visible_decisions();
-    let selected = app.review_selected.min(decisions.len().saturating_sub(1));
-    let empty_msg = if decisions.is_empty() && status.finished {
-        " No postflop decisions to grade "
-    } else {
-        " Your decisions "
+    let total = preflop.len() + decisions.len();
+    let selected = app.review_selected.min(total.saturating_sub(1));
+    let empty_msg =
+        if total == 0 && status.finished { " No decisions to grade " } else { " Your decisions " };
+    // Preflop rows first, then the solver's postflop ones.
+    let rows_of = |i: usize| -> (String, String, Option<Verdict>) {
+        match preflop.get(i) {
+            Some(p) => {
+                let (label, v) = crate::preflop_ui::row(p);
+                ("Pre".to_string(), label, v)
+            }
+            None => {
+                let d = &decisions[i - preflop.len()];
+                (d.street.name().to_string(), d.labels[d.chosen].clone(), Some(d.verdict))
+            }
+        }
+    };
+    let verdict_span = |v: Option<Verdict>, long: bool| match v {
+        Some(v) => Span::styled(
+            if long { format!("{:>3} {}", v.symbol(), v.label()) } else { v.symbol().to_string() },
+            Style::default().fg(verdict_color(v)).add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled(if long { " — no chart" } else { "—" }, Style::default().fg(Color::DarkGray)),
     };
     // Wide windows list the decisions on the left; narrower ones show them
     // as a strip above the details, leaving the full width to the grid.
@@ -802,20 +833,17 @@ fn draw_review(f: &mut Frame, app: &App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(38), Constraint::Min(40)])
             .split(rows[2]);
-        let items: Vec<ListItem> = decisions
-            .iter()
-            .map(|d| {
+        let items: Vec<ListItem> = (0..total)
+            .map(|i| {
+                let (street, label, v) = rows_of(i);
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:<6}", d.street.name()), Style::default().fg(Color::Yellow)),
-                    Span::raw(format!("{:<17}", truncate(&d.labels[d.chosen], 16))),
-                    Span::styled(
-                        format!("{:>3} {}", d.verdict.symbol(), d.verdict.label()),
-                        Style::default().fg(verdict_color(d.verdict)).add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(format!("{street:<6}"), Style::default().fg(Color::Yellow)),
+                    Span::raw(format!("{:<17}", truncate(&label, 16))),
+                    verdict_span(v, true),
                 ]))
             })
             .collect();
-        let mut state = ListState::default().with_selected((!decisions.is_empty()).then_some(selected));
+        let mut state = ListState::default().with_selected((total > 0).then_some(selected));
         f.render_stateful_widget(
             List::new(items)
                 .block(Block::default().borders(Borders::ALL).title(empty_msg))
@@ -824,7 +852,7 @@ fn draw_review(f: &mut Frame, app: &App) {
             cols[0],
             &mut state,
         );
-        for i in 0..decisions.len().min(cols[0].height.saturating_sub(2) as usize) {
+        for i in 0..total.min(cols[0].height.saturating_sub(2) as usize) {
             app.hits.add(
                 Rect { x: cols[0].x, y: cols[0].y + 1 + i as u16, width: cols[0].width, height: 1 },
                 Hit::Decision(i),
@@ -836,15 +864,18 @@ fn draw_review(f: &mut Frame, app: &App) {
             vec![vec![Span::styled(format!("{}: ", empty_msg.trim()), Style::default().fg(Color::DarkGray))]];
         let mut x = lines[0][0].content.chars().count() as u16;
         let mut boxes = Vec::new();
-        for (i, d) in decisions.iter().enumerate() {
-            let text =
-                format!(" {} {} {} ", d.street.name(), truncate(&d.labels[d.chosen], 14), d.verdict.symbol());
+        for i in 0..total {
+            let (street, label, v) = rows_of(i);
+            let text = format!(" {street} {} {} ", truncate(&label, 14), verdict_span(v, false).content);
             let w = text.chars().count() as u16;
             if x + w + 1 > area.width && x > 0 {
                 lines.push(Vec::new());
                 x = 0;
             }
-            let mut st = Style::default().fg(verdict_color(d.verdict)).add_modifier(Modifier::BOLD);
+            let mut st = match v {
+                Some(v) => Style::default().fg(verdict_color(v)).add_modifier(Modifier::BOLD),
+                None => Style::default().fg(Color::DarkGray),
+            };
             if i == selected {
                 st = st.bg(Color::Indexed(238)).add_modifier(Modifier::UNDERLINED);
             }
@@ -870,7 +901,9 @@ fn draw_review(f: &mut Frame, app: &App) {
         );
         parts[1]
     };
-    if let Some(d) = decisions.get(app.review_selected.min(decisions.len().saturating_sub(1))) {
+    if let Some(p) = preflop.get(selected) {
+        crate::preflop_ui::draw_preflop_decision(f, detail_area, p, verdict_color);
+    } else if let Some(d) = decisions.get(selected.saturating_sub(preflop.len())).filter(|_| total > 0) {
         let roll = (app.session.config.show_rng && d.spot.categories.len() == d.actions.len())
             .then(|| hand.roll(d.spot.history_index));
         draw_decision(f, detail_area, d, &status.notes, roll);
@@ -1085,6 +1118,17 @@ fn draw_history(f: &mut Frame, app: &App) {
                 format!("{:>9}  ", format!("{}{}", if net >= 0 { "+" } else { "" }, bb(net))),
                 Style::default().fg(if net >= 0 { Color::Green } else { Color::Red }),
             ));
+            let graded: Vec<Verdict> = h.preflop_grades().iter().filter_map(|g| g.verdict).collect();
+            if !graded.is_empty() {
+                spans.push(Span::styled("pre ", Style::default().fg(Color::DarkGray)));
+                for v in graded {
+                    spans.push(Span::styled(
+                        format!("{} ", v.symbol()),
+                        Style::default().fg(verdict_color(v)),
+                    ));
+                }
+                spans.push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+            }
             match h.review() {
                 None => spans.push(Span::styled("no postflop", Style::default().fg(Color::DarkGray))),
                 Some(r) => r.with_status(|st| {

@@ -6,6 +6,7 @@ mod export_cmd;
 mod score_ui;
 mod selfplay;
 mod sizes;
+mod preflop_ui;
 mod solve_preflop_cmd;
 mod study_app;
 mod study_ui;
@@ -334,6 +335,18 @@ mod tests {
                     app.on_key(key('r'));
                     let s = render(&app);
                     assert!(s.contains("Review"), "{s}");
+                    // The preflop decisions come first, graded against the charts.
+                    let preflop = app.preflop_items().len();
+                    assert!(preflop > 0, "the hero acts preflop in every hand that reaches a flop");
+                    assert!(s.contains("Pre ") && s.contains("Preflop — against the charts"), "{s}");
+                    // Down past the end stops at the last decision.
+                    let total = preflop + app.visible_decisions().len();
+                    for _ in 0..total + 5 {
+                        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                    }
+                    assert_eq!(app.review_selected, total - 1);
+                    app.review_selected = preflop;
+                    let s = render(&app);
                     if !app.visible_decisions().is_empty() {
                         assert!(s.contains("Solver, your hand"), "{s}");
                         assert!(s.contains("Whole range"), "{s}");
@@ -670,6 +683,48 @@ mod tests {
         panic!("not enough reviewed hands");
     }
 
+    /// A hand the hero folds preflop has no solver review, but its preflop
+    /// decision is graded: R opens the review there, and the title bar and
+    /// the history show the grade.
+    #[test]
+    fn hands_folded_preflop_are_reviewed_against_the_charts() {
+        let mut cfg = TrainerConfig::default();
+        cfg.seed = Some(9);
+        cfg.ai_delay_ms = 0;
+        cfg.players = 6;
+        cfg.solver.enabled = false;
+        let mut app = App::new(Session::new(cfg).unwrap(), "/nonexistent/x.toml".into());
+        press(&mut app, KeyCode::Enter);
+        for _ in 0..20_000 {
+            app.tick();
+            let Some(hand) = app.current() else { panic!("no hand") };
+            if hand.hero_to_act() {
+                let fold = app.action_keys().iter().find(|(_, a)| *a == holdem::Action::Fold).map(|(k, _)| *k);
+                app.on_key(key(fold.unwrap_or('c')));
+            } else if hand.is_finished() {
+                if hand.review().is_none() && hand.preflop_grades().iter().any(|g| g.verdict.is_some()) {
+                    let s = render(&app);
+                    assert!(s.contains("Preflop graded against the charts"), "{s}");
+                    app.on_key(key('r'));
+                    let s = render(&app);
+                    assert!(s.contains("Review") && s.contains("Preflop — against the charts"), "{s}");
+                    assert!(!s.contains("Solving"), "no solver review runs for this hand: {s}");
+                    assert!(s.contains("Pre ") && s.contains("Chart, your hand"), "{s}");
+                    assert!(s.contains("Preflop 1 ·"), "the title bar counts preflop grades: {s}");
+                    let small = render_at(&app, 100, 30);
+                    assert!(small.contains("Preflop — against the charts"), "{small}");
+                    press(&mut app, KeyCode::Esc);
+                    app.on_key(key('h'));
+                    let s = render(&app);
+                    assert!(s.contains("pre ") && s.contains("no postflop"), "{s}");
+                    return;
+                }
+                app.on_key(key('n'));
+            }
+        }
+        panic!("no hand folded preflop");
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("poker-trainer-tui-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -689,8 +744,12 @@ mod tests {
         let first = app.session.save_id().expect("saved after the first hand").to_string();
         let hands = app.session.history.len();
 
-        // Review: the RNG line maps the number to the solver's mix.
+        // Review: the RNG line maps the number to the solver's mix (on the
+        // first postflop decision, after the preflop ones).
         app.on_key(key('r'));
+        for _ in 0..app.preflop_items().len() {
+            press(&mut app, KeyCode::Down);
+        }
         let s = render(&app);
         assert!(s.contains("the solver's mix plays"), "{s}");
         assert!(s.contains("Solved on CPU · exploitability"), "the review names its solver: {s}");

@@ -713,15 +713,15 @@ impl App {
         match key.code {
             KeyCode::Char('n') | KeyCode::Enter if finished => self.start_hand(),
             KeyCode::Char('r') if finished => {
-                if self.current().is_some_and(|h| h.review().is_some()) {
+                if self.current().is_some_and(has_review) {
                     self.review_target = None;
                     self.review_selected = 0;
                     self.goto(Screen::Review);
                 } else {
-                    self.flash("Nothing to review: the hand ended before the flop.");
+                    self.flash("Nothing to review: you made no decisions in this hand.");
                 }
             }
-            KeyCode::Char('r') => self.flash("Finish the hand first, then press R for the solver review."),
+            KeyCode::Char('r') => self.flash("Finish the hand first, then press R for the review."),
             KeyCode::Char('h') => {
                 if self.session.history.is_empty() {
                     self.flash("No finished hands yet.");
@@ -745,7 +745,7 @@ impl App {
     }
 
     fn review_key(&mut self, key: KeyEvent) {
-        let count = self.visible_decisions().len();
+        let count = self.preflop_items().len() + self.visible_decisions().len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.review_selected = self.review_selected.saturating_sub(1);
@@ -790,12 +790,12 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('r') => {
-                if n > 0 && self.session.history[self.history_selected].review().is_some() {
+                if n > 0 && has_review(&self.session.history[self.history_selected]) {
                     self.review_target = Some(self.history_selected);
                     self.review_selected = 0;
                     self.goto(Screen::Review);
                 } else {
-                    self.flash("That hand has no solver review (it ended preflop).");
+                    self.flash("Nothing to review in that hand: you made no decisions.");
                 }
             }
             KeyCode::Char('g') => self.open_score(),
@@ -885,6 +885,13 @@ impl App {
     }
 
     /// Decisions of the selected variant for the review screen.
+    /// The hero's preflop decisions of the reviewed hand, graded against
+    /// the charts (listed before the postflop decisions).
+    pub fn preflop_items(&self) -> Vec<crate::preflop_ui::PreflopItem> {
+        let Some(hand) = self.review_hand() else { return Vec::new() };
+        crate::preflop_ui::preflop_items(hand, self.session.charts())
+    }
+
     pub fn visible_decisions(&self) -> Vec<trainer::DecisionReview> {
         let Some(hand) = self.review_hand() else { return Vec::new() };
         let Some(r) = hand.review() else { return Vec::new() };
@@ -892,4 +899,10 @@ impl App {
         let has_variant = st.decisions.iter().any(|d| d.variant == self.review_variant);
         st.decisions.into_iter().filter(|d| !has_variant || d.variant == self.review_variant).collect()
     }
+}
+
+/// Whether a finished hand has anything to review: graded preflop
+/// decisions or a solver review.
+pub fn has_review(hand: &LiveHand) -> bool {
+    hand.review().is_some() || !hand.preflop_grades().is_empty()
 }

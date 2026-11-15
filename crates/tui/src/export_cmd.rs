@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use std::path::Path;
-use trainer::export::{self, DECISIONS_FILE, HANDS_FILE};
+use trainer::export::{self, DECISIONS_FILE, HANDS_FILE, PREFLOP_FILE};
 use trainer::TrainerConfig;
 
 /// Writes the saved sessions as CSV and prints bb/100 by format.
@@ -25,6 +25,11 @@ pub fn run(cfg: &TrainerConfig, out: &str, session: Option<&str>) -> Result<()> 
         dir.join(HANDS_FILE).display()
     );
     println!("Wrote {} graded decisions to {}", report.decisions, dir.join(DECISIONS_FILE).display());
+    println!(
+        "Wrote {} preflop decisions (graded against the charts) to {}",
+        report.preflop_decisions,
+        dir.join(PREFLOP_FILE).display()
+    );
     if report.hands > 0 {
         println!("\n{}", export::summary_table(&report.totals));
     }
