@@ -141,6 +141,8 @@ pub struct ChartSet {
 const HU_100BB: &str = include_str!("../charts/hu_100bb.txt");
 const HU_100BB_SOLVER: &str = include_str!("../charts/hu_100bb_solver.txt");
 const SIX_MAX_100BB_SOLVER: &str = include_str!("../charts/6max_100bb_solver.txt");
+/// Made by `poker-trainer solve-preflop --players 9` (the preflop model).
+const NINE_MAX_100BB_MODEL: &str = include_str!("../charts/9max_100bb_model.txt");
 
 impl ChartSet {
     /// The hand-written heads-up 100bb charts.
@@ -152,7 +154,8 @@ impl ChartSet {
     /// * heads-up: solver charts for the first decisions (SB open, BB vs
     ///   limp, BB vs open), hand-written charts for 3-bets and beyond;
     /// * 3-6 players: solver-generated 6-max 100bb charts;
-    /// * larger tables: none (position-aware fallback rules).
+    /// * 7-9 players: 9-max 100bb charts from the preflop model
+    ///   (`crates/preflop`), only the spots its solve trained well.
     ///
     /// Spots without a chart always use the fallback rules.
     pub fn builtin(players: usize) -> ChartSet {
@@ -160,7 +163,7 @@ impl ChartSet {
             0..=2 => ChartSet::hu_100bb()
                 .overlay(ChartSet::parse(HU_100BB_SOLVER, 2).expect("built-in charts parse")),
             3..=6 => ChartSet::parse(SIX_MAX_100BB_SOLVER, players).expect("built-in charts parse"),
-            _ => ChartSet { charts: HashMap::new(), players },
+            _ => ChartSet::parse(NINE_MAX_100BB_MODEL, players).expect("built-in charts parse"),
         }
     }
 
@@ -565,9 +568,26 @@ mod tests {
         // 6-max: complete solver charts.
         let six = ChartSet::builtin(6);
         assert_eq!(six.charts.len(), 506);
-        assert!(ChartSet::builtin(9).charts.is_empty());
+        // 9-max (also 7 and 8 players): the preflop model's charts.
+        let nine = ChartSet::builtin(9);
+        assert!(nine.charts.len() > 500, "{}", nine.charts.len());
+        assert_eq!(ChartSet::builtin(7).players, 7);
+        assert_eq!(ChartSet::builtin(8).charts.len(), nine.charts.len());
+        for key in [">UTG", ">UTG+1", ">LJ", ">BTN", ">SB", "UTG:R>BB", "SB:R>BB", "BTN:R BB:R>BTN"] {
+            assert!(nine.get(key).is_some(), "{key}");
+        }
+        // Opens widen from UTG to the button, and UTG opens about 12%.
+        let open = |key: &str| {
+            HandClass::all()
+                .map(|c| nine.get(key).unwrap().class_freqs(c.grid_index())[2] * c.num_combos() as f32)
+                .sum::<f32>()
+                / 1326.0
+        };
+        let opens = ["UTG", "UTG+1", "UTG+2", "LJ", "HJ", "CO", "BTN"].map(|p| open(&format!(">{p}")));
+        assert!(opens.windows(2).all(|w| w[0] < w[1]), "{opens:?}");
+        assert!((0.08..0.16).contains(&opens[0]) && (0.35..0.5).contains(&opens[6]), "{opens:?}");
         // Every built-in spot is a distribution, and aces never fold.
-        for cs in [&hu, &six] {
+        for cs in [&hu, &six, &nine] {
             for (key, chart) in &cs.charts {
                 for (g, f) in chart.freqs.iter().enumerate() {
                     assert!(
