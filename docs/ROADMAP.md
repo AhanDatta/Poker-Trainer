@@ -263,28 +263,54 @@ Steps:
      raised pot's caller with the same position.
 3. Validate on 6-max against the built-in solver charts (open, defend and
    3-bet frequencies per spot, and the per-hand distance). `[x]`
-   200M deals (about 100 s on 4 threads), same rake and tree as the charts:
+   200M deals (about 100 s on 4 threads), same rake and tree as the charts,
+   charts made with the rule of step 4 (a hand needs 200 samples and 1000
+   regret updates at a spot):
 
    | | Measured factors | Flat 1.05 / 0.8 | Built-in charts |
    |---|---|---|---|
-   | Mean distance to the charts | **0.084** | 0.121 | — |
-   | Open: UTG / HJ / CO / BTN | 17.0 / 20.9 / 29.1 / 44.3 | 18.1 / 22.3 / 28.8 / 39.5 | 17.6 / 21.5 / 27.8 / 41.5 |
-   | Open: SB (raise) | 38.1 | 32.3 | 42.7 |
-   | BB defends vs UTG / HJ / CO / BTN | 22 / 26 / 32 / 42 | 28 / 34 / 40 / 50 | 27 / 30 / 34 / 44 |
-   | BB defends vs SB (call + 3-bet) | 76 (59 + 17) | 84 (72 + 12) | 59 (40 + 19) |
+   | Mean distance to the charts | **0.085** | 0.120 | — |
+   | Open: UTG / HJ / CO / BTN | 17.2 / 21.2 / 28.7 / 45.7 | 18.0 / 22.6 / 28.6 / 39.9 | 17.6 / 21.5 / 27.8 / 41.5 |
+   | Open: SB (raise) | 39.3 | 32.8 | 42.7 |
+   | BB defends vs UTG / HJ / CO / BTN | 23 / 26 / 33 / 42 | 28 / 34 / 39 / 50 | 27 / 30 / 34 / 44 |
+   | BB defends vs SB (call + 3-bet) | 75 (57 + 17) | 83 (71 + 12) | 59 (40 + 19) |
    | SB folds to a BB 3-bet | 64 | 65 | 49 |
-   | Largest gain from changing one decision | 0.03 bb/100 | 0.04 bb/100 | — |
+   | Largest gain from changing one decision | 0.08 bb/100 | 0.05 bb/100 | — |
 
-   Matching now: first-in ranges from UTG to the cutoff (within 1.3
-   points), 3-bets against single opens (within 2 points everywhere), and
-   the big blind's defense against the cutoff and button (within 2). Still
-   off: **blind versus blind** (the big blind defends too much against the
+   Matching now: first-in ranges from UTG to the cutoff (within 1 point),
+   3-bets against single opens (within 2 points everywhere), and the big
+   blind's defense against the cutoff and button (within 2). Still off:
+   **blind versus blind** (the big blind defends too much against the
    small blind, and the small blind folds too much to its 3-bet); the big
-   blind defends 4 to 5 points too little against UTG and HJ (the flat
-   factors overdefended there instead); the button opens 3 points too wide
-   and the small blind 5 too tight. Blind-versus-blind contexts of their
-   own would be the next refinement.
-4. `solve-preflop` command, 9-max 100bb charts built in, README. `[ ]`
+   blind defends 4 points too little against UTG and HJ (the flat factors
+   overdefended there instead); the button opens 4 points too wide and the
+   small blind 3 too tight. Blind-versus-blind contexts of their own would
+   be the next refinement. (Multithreaded solves differ by a few tenths of
+   a point from run to run.)
+4. `solve-preflop` command, 9-max 100bb charts built in, README. `[x]`
+   - `poker-trainer solve-preflop` solves a table size, stack and rake
+     with the measured factors (or a factors file) and writes a chart file
+     with a header: settings, factors, seed, and the gain per position
+     from changing one decision. 9-max with the default 400M deals: about
+     7 minutes on 4 threads, 0.7 GB; the gain is at most 0.04 bb/100.
+   - **Which hands go into a chart.** MCCFR's average strategy is a count
+     of samples, but samples also come from the other seats trying every
+     action, so a hand could have tens of thousands of samples at a spot
+     whose strategy was hardly trained; with 200 samples as the only rule,
+     aces folded in thousands of rare 9-max spots. The solver now also
+     counts regret updates per decision and hand, and a hand goes into a
+     chart only with at least 200 samples and 1000 updates (no spot then
+     folds aces or kings). Spots with no such hand are left out; the
+     trainer's fallback rules cover them and the untrusted hands, exactly
+     as before. Frequencies are rounded to whole percents and mixes below
+     2% dropped as sampling noise.
+   - `crates/trainer/charts/9max_100bb_model.txt`: 715 spots, 177 KB,
+     loaded for 7 to 9 players. It extends 6-max sensibly: first-in raises
+     widen from 11% (UTG) through 13 / 14 / 16% (UTG+1, UTG+2, LJ) to the
+     6-max ranges at HJ, CO and BTN (20 / 28 / 43% against the charts' 21
+     / 28 / 42); the small blind opens 39%. It inherits the 6-max misses:
+     the big blind defends 72% against the small blind and somewhat too
+     little against early opens (18% against UTG).
 5. Then: heads-up deeper lines, other stacks and rake; preflop decision
    grading in the trainer. `[ ]`
 

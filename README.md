@@ -35,6 +35,7 @@ preflop charts and the solver's strategy in any spot, GTO Wizard style.
 | Villain range in review: GTO charts / villain's actual style range / both | ✅ |
 | Rake (no flop, no drop, capped) | ✅ |
 | Solver-based preflop charts (heads-up, 6-max), built in | ✅ |
+| 9-max preflop charts from the preflop model, built in; `solve-preflop` makes charts for other games | ✅ approximate |
 | Solver study mode: browse charts and solutions, any line, both ranges, typed spots | ✅ (heads-up exact, 3-way approximate) |
 | Layouts that fit zoomed terminals (~100×30) and grow on big windows; mouse clicks | ✅ |
 | Session frequency score: how your action frequencies match the solver's mixes, spot by spot | ✅ (heads-up pots) |
@@ -100,6 +101,7 @@ cargo run --release -- --seed 42              # reproducible hands
 cargo run --release -- selfplay --hands 3     # headless: scripted hero + printed reviews (speed check)
 cargo run --release -- import-charts DIR --format lines --players 6 -o charts.txt   # convert your own ranges
 cargo run --release -- export -o DIR          # saved hands as CSV + bb/100 by format (see below)
+cargo run --release -- solve-preflop --players 9 -o charts_9max.txt   # preflop charts from the model (see below)
 cargo test --workspace                        # unit, property and end-to-end tests
 cargo run --release -p solver --example bench -- flop-exact-lean Ks7s2d   # solver benchmarks
 cargo run --release -p solver --example compare -- Ks7s2d                 # fast vs exact accuracy
@@ -511,13 +513,69 @@ line and the deciding position, e.g. `[UTG:R BTN:C>BB]`, each with `allin:`,
   * Hands that never reach a spot under the solver's strategy (e.g. aces
     after flatting) use position-aware rules there, so an AI that
     slow-played them doesn't fold them later.
-* **9-max** uses position-aware fallback rules (open percentages by
-  position, defense vs. opens, 3-/4-bets, all-ins), which also cover any
-  spot no chart has.
+* **9-max 100bb** (`9max_100bb_model.txt`, also used at 7 and 8 players)
+  comes from the preflop model (see "Making preflop charts" below): the
+  715 spots its solve trained well (opens, defenses, 3-bets and the common
+  4-bet lines). It is an approximation, not a full solver result.
+* **Fallback rules:** position-aware rules (open percentages by position,
+  defense vs. opens, 3-/4-bets, all-ins) cover any spot no chart has, and
+  hands a chart's solve practically never brought to a spot.
 * **Your own charts:** `import-charts` converts range collections in either
   supported layout (per-decision line files, or leaf range trees). Point
   `charts_hu` / `charts_6max` / `charts_9max` at the result; its spots
   replace the built-in ones.
+
+### Making preflop charts (`solve-preflop`)
+
+`solve-preflop` makes a chart file for a game no chart covers: another
+table size, stack depth or rake. It solves only the preflop betting, and
+values a pot that sees a flop as each player's equity times the pot times
+a **realization factor**: how much of its equity a hand actually wins
+after the flop. The factor depends on the hand, on position after the flop,
+on who raised last and on the pot (single-raised, 3-bet, 4-bet). The
+built-in factors were measured with the postflop solver on 6-max 100bb
+spots (1152 flop solves; `crates/preflop/data/realization_6max_100bb.txt`).
+
+```bash
+cargo run --release -- solve-preflop --players 9 -o charts_9max.txt
+cargo run --release -- solve-preflop --players 6 --stack 50 --rake 0 -o charts_6max_50bb.txt
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--players` | 9 | table size, 2 to 9 |
+| `--stack` | 100 | every player's stack, in big blinds (2 to 1000) |
+| `--rake` / `--rake-cap` | 5 / 3 | rake in percent of pots that see a flop, and its cap in big blinds |
+| `--deals` | 400 | millions of random deals to solve with; more is closer to the equilibrium |
+| `--threads` | 0 | worker threads (0 = every core) |
+| `--cold-callers` | 1 | most players who may cold-call one raise (the big blind, and players who already acted, always may); 2 makes 9-max about six times bigger |
+| `--factors` | built-in | a realization factors file in the same format as the built-in one |
+| `-o`, `--out` | `charts_<players>max.txt` | output file |
+| `--seed` | 1 | (global option) with `--threads 1` the same seed gives the same charts; several threads vary slightly from run to run |
+
+**What it writes:** a chart file in the usual format, with a header that
+records the settings, the factors, the seed and how converged the solve
+is: for each position, its result and how much it could gain by changing
+one decision (near 0 means converged). A hand goes into a spot's chart only
+if its strategy there was trained well (at least 200 samples and 1000
+regret updates); other hands, and spots with no such hand, use the
+fallback rules, as they do for any chart file. Frequencies are whole
+percents; mixes below 2% are dropped as sampling noise. To play with it, point `charts_hu`, `charts_6max` or
+`charts_9max` in `poker-trainer.toml` at it (by table size: 2, 3 to 6, 7
+to 9 players).
+
+**How long it takes:** on a 4-core laptop, 9-max with the default 400
+million deals takes about 7 minutes and 0.7 GB of memory; 6-max about 3
+minutes. The default is well past convergence (the gain from changing one
+decision is at most 0.04 bb/100 per position at 9-max).
+
+**How good it is:** on 6-max 100bb the model lands close to the built-in
+solver charts (mean per-hand distance 0.085; open-raise frequencies from
+UTG to the cutoff within 1 point, 3-bets against an open within 2) but
+misses blind versus blind (the big blind defends 75% against the small
+blind's open, the solver 59%). The factors were measured at 100bb with
+rake; other stacks reuse them, which is rougher the further you go from
+100bb.
 
 ## Performance
 
@@ -700,7 +758,11 @@ the presets in `crates/trainer/src/profiles.rs`.
 * **Study mode** uses the sizes from the bet-size editor for every spot (no
   per-spot sizes). Its 3-way solves have the same limits as the 3-way
   review.
-* **9-max charts** use fallback rules; no public solver set was found.
+* **9-max charts** come from the preflop model, not a full solver (no
+  public 9-max solver set was found). Checked on 6-max against the
+  built-in solver charts, its open and defend frequencies are mostly within
+  a few points, but blind versus blind is off: the big blind defends too
+  much against the small blind (75% vs. 59%).
 * **Exact flop solves still take minutes** on a 4-core machine. Wider SIMD,
   single-pass sweeps and predictive CFR variants were tried and didn't help
   (see the solver sections); the remaining levers are smaller trees (e.g.
