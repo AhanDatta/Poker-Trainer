@@ -312,7 +312,43 @@ Steps:
      the big blind defends 72% against the small blind and somewhat too
      little against early opens (18% against UTG).
 5. Then: heads-up deeper lines, other stacks and rake; preflop decision
-   grading in the trainer. `[ ]`
+   grading in the trainer. `[~]`
+   - **Heads-up deeper lines: tried, stopped** (2026-11-15). The idea was
+     to replace the hand-written heads-up 3-bet-and-beyond charts with
+     model charts. The model fits heads-up far worse than 6-max, so the
+     hand-written charts stay. Compared with the heads-up solver spots (SB
+     first in, BB vs. open, BB vs. limp), no rake, small-blind limps
+     allowed, 200M deals:
+
+     | Factors | Mean distance | SB fold / limp / raise | BB vs. open fold / call / raise |
+     |---|---|---|---|
+     | 6-max factors | 0.36 | 6 / 16 / 78 | 34 / 40 / 27 |
+     | Heads-up factors | 0.50 | 0 / 64 / 36 | 25 / 60 / 15 |
+     | Heads-up factors, zero-sum pots | 0.41 | 5 / 26 / 69 | 23 / 55 / 22 |
+     | Solver charts | — | 10 / 36 / 54 | 31 / 50 / 19 |
+
+     - The heads-up factors were measured like the 6-max ones (288 fast
+       GPU solves: the 6 heads-up flop spots of the built-in heads-up
+       charts, limp-check pots included, 48 flops each; median standard
+       error 0.06 to 0.11). They are in
+       `crates/preflop/data/realization_hu_100bb.txt`, unused. Limped pots
+       realize far more than the raised-pot caller factors they used to
+       copy (in position 1.29 vs 0.95, out of position 1.14 vs 0.75).
+     - With them the model **creates value**: in a game without rake the
+       small blind wins +34.5 and the big blind +10.5 bb/100. A hand's
+       factor is measured against the calibration opponent's range; when
+       the model plays other ranges (here it limps every hand), the
+       opponent's factors don't adjust and the pot realizes more than it
+       holds. At 6-max the model's ranges stay near the charts and this
+       stays small.
+     - **Zero-sum pots** (the realization beyond the pot taken back
+       equally from every player in it, so each flop pot pays out exactly
+       the pot) helped heads-up (0.50 to 0.41) but made 6-max worse
+       (0.085 to 0.099; the big blind then defends 65% against the
+       button and 98% against the small blind), so it was dropped.
+     - What might work: factors that depend on the opponent's range (for
+       example recalibrating on the model's own ranges until they settle),
+       or solving heads-up preflop with postflop solves directly.
 
 ## Later
 
