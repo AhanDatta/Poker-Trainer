@@ -664,7 +664,7 @@ fn draw_table(f: &mut Frame, app: &App) {
                     .fg(if net >= 0 { Color::Green } else { Color::Red })
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("   [N] next hand   [R] solver review   [H] history   [G] score   [S] settings"),
+            Span::raw("   [N] next hand   [R] review   [H] history   [G] score   [S] settings"),
         ]));
     } else {
         lines.push(Line::from(Span::styled("Villain is thinking…", Style::default().fg(Color::DarkGray))));
@@ -1167,7 +1167,7 @@ fn draw_help(f: &mut Frame) {
         Line::from(""),
         Line::from("At the table"),
         Line::from("  F fold · C or X check/call · 1-9 bet/raise sizes from the menu · A largest raise"),
-        Line::from("  N next hand · R solver review (after the hand) · H history · G frequency score · S settings · Q quit"),
+        Line::from("  N next hand · R review (after the hand) · H history · G frequency score · S settings · Q quit"),
         Line::from("  RNG nn: a random number 0-99 for mixing (low numbers: the most aggressive option)"),
         Line::from(""),
         Line::from("Review"),

@@ -4,7 +4,7 @@ A No-Limit Hold'em trainer for the terminal, written in Rust. Think chess
 puzzles, but for NLHE. You're dealt into a hand at a heads-up, 6-max or 9-max
 table, play it from preflop to the river against AI opponents with
 recognizable styles, and afterwards check every postflop decision you made
-against a solver. A separate **solver study** mode lets you browse the
+against a solver, and every preflop decision against the charts. A separate **solver study** mode lets you browse the
 preflop charts and the solver's strategy in any spot, GTO Wizard style.
 
 ```
@@ -42,7 +42,7 @@ preflop charts and the solver's strategy in any spot, GTO Wizard style.
 | Random number (0–99) at each decision, for playing mixed strategies | ✅ |
 | Saved sessions: continue, start new, delete | ✅ |
 | CSV export of saved hands and graded decisions, bb/100 by format | ✅ |
-| Preflop grading | ❌ not yet (charts drive the AIs and the starting ranges) |
+| Preflop grading: each preflop decision against the charts (how often they play your action) | ✅ (frequencies, not EV) |
 
 ## Quick start
 
@@ -112,8 +112,8 @@ cargo run --release -p solver --example compare -- Ks7s2d                 # fast
 | Where | Keys |
 |---|---|
 | Setup | ↑/↓ select · ←/→ change (mode, table size, styles, position, stacks, rake, solver) · Enter play/study (on "Bet sizes": open the size editor) · **O** sessions · **G** frequency score · W save settings · Q Q quit |
-| Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** solver review · **H** history · **G** frequency score · **S** settings |
-| Review | ↑/↓ choose decision · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · **G** frequency score · Esc back |
+| Table | **F** fold · **C**/**X** check/call · **1–9** bet/raise sizes · **A** largest raise · **N** next hand · **R** review (preflop and solver) · **H** history · **G** frequency score · **S** settings |
+| Review | ↑/↓ choose decision (preflop ones first) · **Tab** switch GTO / villain's-actual-range solve · **N** next hand · **G** frequency score · Esc back |
 | Sessions | ↑/↓ select · Enter continue (or start a new session) · **D** delete (then **Y**) · Esc back |
 | Study | **F**/**C**/**1–9** take an action · arrows (or click) pick a hand · **Tab** strategy / each player's range · **Backspace** back · **G**/Home start · **N** new random board · **E** type a spot · **P** back to preflop · Esc menu |
 
@@ -168,7 +168,7 @@ A continued session uses its own saved settings.
 
 ### Exporting hands (CSV)
 
-`poker-trainer export` writes every saved session (oldest first) as two CSV
+`poker-trainer export` writes every saved session (oldest first) as three CSV
 files in the current directory, or in `-o DIR`. Any earlier export there is
 replaced. `--session ID` exports just one session (its directory name). It then
 prints bb/100 by format:
@@ -200,6 +200,16 @@ All                 2000      +32.70      +1.6
   When a review solved both the GTO and the villain's-actual ranges, both rows
   are there. `counted = true` marks the one the in-app stats use. Join to the
   hands file on `session` + `hand`.
+* `poker-trainer-preflop.csv` has one row per preflop decision of yours:
+  * your position, the chart spot (e.g. `HJ:R BTN:C>SB`), your cards and hand
+    class, and your action (`fold`, `call`, `raise`, `allin`);
+  * the chart's mix for your hand there (`chart_fold`, `chart_call`,
+    `chart_raise`, `chart_allin`, in %), how often it plays your action
+    (`chosen_pct`), the verdict, and the chart's main action. Spots no chart
+    covers have empty chart columns and verdict `not graded`.
+
+  Sessions saved before preflop grading existed are graded with the
+  session's charts as they are now.
 
 Net results come from settling each saved hand, just as the in-app stats do,
 so the totals match the session list. The table size and stacks are read from
@@ -318,6 +328,26 @@ hand, as a percentage of the pot at the decision:
 EV is measured from the decision onwards, so folding is always worth 0. When
 the solver mixes between actions, those actions have (nearly) the same EV, and
 either choice grades as Best.
+
+**Preflop decisions** are graded against the charts the table plays by (the
+built-in ones, or yours from `charts_hu` / `charts_6max` / `charts_9max`).
+Charts say how often each action is played, not what it's worth, so a
+preflop grade is how often the chart plays the action you chose with your
+hand class:
+
+| ✓ Best | ✓ Good | ?! Inaccuracy | ? Mistake | ?? Blunder |
+|---|---|---|---|---|
+| the chart's main action, or ≥ 50% | ≥ 15% | ≥ 5% | ≥ 1% | < 1% |
+
+They show first in the review (press R after the hand, also when it ended
+preflop), with the chart's mix for your hand and your range at the spot.
+They're counted apart from the solver's grades: the title bar shows
+`Preflop N · X% in chart` (the share graded Best or Good), and accuracy,
+average loss and the frequency score stay postflop only. Spots no chart
+covers (only the fallback rules apply there) say so and aren't graded. A
+hand the chart plays one way but that is close to indifferent still grades
+harshly when you do the other thing, since there is no EV to tell a small
+difference from a big one.
 
 ## How it works
 
@@ -746,9 +776,11 @@ the presets in `crates/trainer/src/profiles.rs`.
 * **4+-way pots** aren't analyzed.
 * **3-way solves are approximate:** sampled runouts (including all-in
   runouts) and simplified later streets, and no equilibrium guarantee.
-* **Preflop grading** isn't implemented, and the frequency score covers only
-  postflop decisions in heads-up pots (3-way solves are too noisy to score
-  frequencies against).
+* **Preflop grades are chart frequencies, not EV:** they say how often the
+  chart plays your action, so near-indifferent hands can grade harshly, and
+  they are only as good as the charts (the 9-max ones are a model's). The
+  frequency score covers only postflop decisions in heads-up pots (3-way
+  solves are too noisy to score frequencies against).
 * **Frequency score blind spots:** a spot type pools all your hands, so
   swapping hands (bluffing one the solver checks while checking one it
   bluffs) keeps the totals right. The mixing measure and the EV grades

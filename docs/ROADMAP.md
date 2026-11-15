@@ -349,6 +349,27 @@ Steps:
      - What might work: factors that depend on the opponent's range (for
        example recalibrating on the model's own ranges until they settle),
        or solving heads-up preflop with postflop solves directly.
+   - **Preflop grading: done** (2026-11-15). Decided with the user: grade by
+     the chart frequency of the chosen action (charts have no EVs), counted
+     apart from the solver's postflop grades, and only at spots a chart
+     covers.
+     - `trainer::preflop_grade`: Best for the chart's main action or one
+       played at least half the time, Good 15%+, Inaccuracy 5%+, Mistake
+       1%+, Blunder below. Every hero preflop decision is graded when the
+       hand ends (also all-in runouts, which end on a dealt card), saved with
+       the hand (`SavedHand.preflop_grades`, optional: older saves are graded
+       when loaded, with the charts of each hand's own table size), and
+       counted in `Stats::preflop_decisions` / `preflop_accuracy`.
+     - The review lists preflop decisions first (also for hands that ended
+       preflop): the line, the hand, the grade, the chart's mix for the hand
+       and the hero's range at the spot colored by the chart. The title bar
+       shows `Preflop N · X% in chart`; the history marks the grades;
+       `export` writes `poker-trainer-preflop.csv`.
+     - Limit: no EV, so a near-indifferent hand the chart plays purely
+       grades harshly the other way. Model EVs for model-made charts would
+       fix that for those charts.
+   - Still open in step 5: other stacks and rake (chart sets picked by
+     `stack_bb` and rake), multiway calibration with the 3-way solver.
 
 ## Later
 
