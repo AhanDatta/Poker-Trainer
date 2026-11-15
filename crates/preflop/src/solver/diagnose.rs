@@ -87,7 +87,7 @@ impl Solver {
                         }
                         break;
                     }
-                    &Flat::Decision { seat, num_actions, has_fold, fold_value, kids, cells } => {
+                    &Flat::Decision { seat, num_actions, has_fold, fold_value, kids, cells, .. } => {
                         let n = num_actions as usize;
                         let base = cells + deal.class[seat as usize] as usize * n;
                         let mut sigma = [0f32; 4];

@@ -133,10 +133,12 @@ fn warm_up_discounts_regrets_and_counts() {
     *solver.regret[0].get_mut() = 8.0f32.to_bits();
     *solver.regret[1].get_mut() = (-4.0f32).to_bits();
     *solver.visits[0].get_mut() = 9;
+    *solver.updates[3].get_mut() = 7;
     solver.discount(0.5);
     assert_eq!(f32::from_bits(*solver.regret[0].get_mut()), 4.0);
     assert_eq!(f32::from_bits(*solver.regret[1].get_mut()), -2.0);
     assert_eq!(*solver.visits[0].get_mut(), 5);
+    assert_eq!(*solver.updates[3].get_mut(), 4);
     // Regrets never drop below the floor.
     let floor = Options { regret_floor: -1.0, ..Options::default() };
     let solver = solved(push_fold(10.0), Realization::neutral(), 50_000, floor);
@@ -229,4 +231,28 @@ fn leaf_payoffs_match_the_engine_settlement() {
         }
         assert!(kinds.iter().all(|&k| k > 50), "every kind of leaf was reached: {kinds:?}");
     }
+}
+
+/// Each deal brings every seat to its first decision once as the learning
+/// seat, so the root's updates add up to the deals; deeper decisions get
+/// fewer, and never more than the decision before them on the line.
+#[test]
+fn regret_updates_count_the_seat_reaching_the_decision() {
+    let spec = GameSpec::new(3).with_stack(30.0);
+    let tree = Tree::build(&spec).unwrap();
+    let options = Options { warmup_epochs: 0, ..Options::default() };
+    let solver = solved(tree, Realization::neutral(), 30_000, options);
+    let total = |key: &str| {
+        let d = solver.tree().find(key).unwrap();
+        (0..NUM_CLASSES).map(|c| solver.updates(d, c)).sum::<u64>()
+    };
+    assert_eq!(total(">BTN"), 30_000);
+    // The small blind gets to act only if the button doesn't raise or limp
+    // the hand, so in fewer deals; it learns there in every one of them.
+    let sb = total(">SB");
+    assert!(sb > 0 && sb < 30_000, "{sb}");
+    // Hand classes come in proportion to their combos.
+    let root = solver.tree().find(">BTN").unwrap();
+    let (aa, aks) = (solver.updates(root, class("AA")) as f64, solver.updates(root, class("AKs")) as f64);
+    assert!((aa / 30_000.0 - 6.0 / 1326.0).abs() < 0.002 && (aks / 30_000.0 - 4.0 / 1326.0).abs() < 0.002);
 }

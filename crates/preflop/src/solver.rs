@@ -50,6 +50,8 @@ enum Flat {
         kids: [u32; 4],
         /// First cell of the decision: `cells + class * num_actions + action`.
         cells: usize,
+        /// [`Decision::slot`].
+        slot: u32,
     },
     Leaf {
         live: u16,
@@ -74,6 +76,9 @@ pub struct Solver {
     regret: Vec<AtomicU32>,
     /// How often each action was sampled: the average strategy.
     visits: Vec<AtomicU32>,
+    /// Regret updates per decision and class (`slot * NUM_CLASSES + class`):
+    /// how often the seat itself got to the decision with the class.
+    updates: Vec<AtomicU32>,
     deals: u64,
     epochs: u32,
 }
@@ -103,6 +108,7 @@ impl Solver {
                         fold_value: -(d.commit as f32) / bb,
                         kids,
                         cells: first,
+                        slot: d.slot,
                     }
                 }
                 Node::Leaf(l) => {
@@ -126,6 +132,7 @@ impl Solver {
             })
             .collect();
         let zeros = |n: usize| (0..n).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+        let tree_decisions = tree.num_decisions;
         Solver {
             tree,
             model,
@@ -134,6 +141,7 @@ impl Solver {
             cells,
             regret: zeros(total),
             visits: zeros(total),
+            updates: zeros(tree_decisions * NUM_CLASSES),
             deals: 0,
             epochs: 0,
         }
@@ -190,7 +198,7 @@ impl Solver {
         for cell in &mut self.regret {
             *cell.get_mut() = (f32::from_bits(*cell.get_mut()) * factor).to_bits();
         }
-        for cell in &mut self.visits {
+        for cell in self.visits.iter_mut().chain(self.updates.iter_mut()) {
             *cell.get_mut() = (*cell.get_mut() as f32 * factor).round() as u32;
         }
     }
@@ -201,7 +209,7 @@ impl Solver {
             Flat::Leaf { live, prize, commit, context } => {
                 self.payoff(*live, *prize, commit[traverser], context[traverser], traverser, deal)
             }
-            &Flat::Decision { seat, num_actions, has_fold, fold_value, kids, cells } => {
+            &Flat::Decision { seat, num_actions, has_fold, fold_value, kids, cells, slot } => {
                 let n = num_actions as usize;
                 let base = cells + deal.class[seat as usize] as usize * n;
                 let mut sigma = [0f32; 4];
@@ -212,6 +220,8 @@ impl Solver {
                     count.store(count.load(Relaxed).saturating_add(1), Relaxed);
                     return self.walk(kids[action], traverser, deal, rng);
                 }
+                let updates = &self.updates[slot as usize * NUM_CLASSES + deal.class[seat as usize] as usize];
+                updates.store(updates.load(Relaxed).saturating_add(1), Relaxed);
                 let mut value = [0f32; 4];
                 let mut expected = 0.0;
                 for a in 0..n {
@@ -260,6 +270,15 @@ impl Solver {
             freqs[action.index()] = if total > 0 { counts[i] as f32 / total as f32 } else { 1.0 / n as f32 };
         }
         (freqs, total)
+    }
+
+    /// How many regret updates the strategy of `class` at `decision` rests
+    /// on: how often the seat reached it with the class while the others
+    /// played their strategies. Unlike the samples of [`Solver::average`],
+    /// which also come from the other seats trying every action, this says
+    /// how well trained the strategy is.
+    pub fn updates(&self, decision: &Decision, class: usize) -> u64 {
+        self.updates[decision.slot as usize * NUM_CLASSES + class].load(Relaxed) as u64
     }
 }
 

@@ -15,10 +15,15 @@ fn class(s: &str) -> usize {
     s.parse::<HandClass>().unwrap().grid_index()
 }
 
+/// Trusts any hand with `samples` samples, however few updates.
+fn samples(samples: u64) -> Trust {
+    Trust { samples, updates: 0 }
+}
+
 #[test]
 fn charts_cover_every_decision_with_distributions() {
     let solver = small_solve(200_000);
-    let charts = to_charts(&solver, 50);
+    let charts = to_charts(&solver, samples(50));
     assert_eq!(charts.players, 3);
     assert_eq!(charts.charts.len(), solver.tree().num_decisions);
     for d in solver.tree().decisions() {
@@ -39,7 +44,7 @@ fn charts_cover_every_decision_with_distributions() {
 #[test]
 fn hands_without_samples_use_the_fallback_rules() {
     let solver = small_solve(1000);
-    let charts = to_charts(&solver, u64::MAX);
+    let charts = to_charts(&solver, samples(u64::MAX));
     for d in solver.tree().decisions() {
         for c in [class("AA"), class("72o"), class("T9s")] {
             let expected = d.avail.remap(fallback_freqs(&d.key, c, 3));
@@ -49,19 +54,20 @@ fn hands_without_samples_use_the_fallback_rules() {
 }
 
 /// Dropping the spots that are all fallback changes nothing the trainer
-/// plays, and keeps every spot with a solved hand.
+/// plays, and keeps every spot with a trusted hand.
 #[test]
 fn solved_charts_drop_only_fallback_spots() {
-    let solver = small_solve(20_000);
-    let min = 50;
-    let full = to_charts(&solver, min);
-    let solved = solved_charts(&solver, min);
-    assert!(solved.charts.len() < full.charts.len(), "some spots are never solved after 20k deals");
+    let solver = small_solve(50_000);
+    let trust = Trust { samples: 50, updates: 100 };
+    let full = to_charts(&solver, trust);
+    let solved = solved_charts(&solver, trust);
+    assert!(solved.charts.len() < full.charts.len(), "some spots are never trusted after 50k deals");
     assert!(!solved.charts.is_empty());
     assert_eq!(solved.players, 3);
     for d in solver.tree().decisions() {
-        let any_solved = (0..NUM_CLASSES).any(|c| solver.average(d, c).1 >= min);
-        assert_eq!(solved.get(&d.key).is_some(), any_solved, "{}", d.key);
+        let any = (0..NUM_CLASSES)
+            .any(|c| solver.average(d, c).1 >= trust.samples && solver.updates(d, c) >= trust.updates);
+        assert_eq!(solved.get(&d.key).is_some(), any, "{}", d.key);
         if let Some(chart) = solved.get(&d.key) {
             assert_eq!(chart.freqs, full.get(&d.key).unwrap().freqs);
         }
@@ -74,21 +80,57 @@ fn solved_charts_drop_only_fallback_spots() {
             );
         }
     }
-    // A spot whose best-sampled class has exactly `min` samples is solved.
+    // A spot whose best class has exactly the minimum of either count is kept.
     let d = solver.tree().decisions().nth(5).unwrap();
-    let most = (0..NUM_CLASSES).map(|c| solver.average(d, c).1).max().unwrap();
-    assert!(most > 0);
-    assert!(solved_charts(&solver, most).get(&d.key).is_some());
-    assert!(solved_charts(&solver, most + 1).get(&d.key).is_none());
-    // Nothing solved: no spots; everything solved: every spot.
-    assert!(solved_charts(&solver, u64::MAX).charts.is_empty());
-    assert_eq!(solved_charts(&small_solve(200_000), 1).charts.len(), solver.tree().num_decisions);
+    let most_samples = (0..NUM_CLASSES).map(|c| solver.average(d, c).1).max().unwrap();
+    let most_updates = (0..NUM_CLASSES).map(|c| solver.updates(d, c)).max().unwrap();
+    assert!(most_samples > 0 && most_updates > 0);
+    assert!(solved_charts(&solver, samples(most_samples)).get(&d.key).is_some());
+    assert!(solved_charts(&solver, samples(most_samples + 1)).get(&d.key).is_none());
+    let updates = |updates| Trust { samples: 1, updates };
+    assert!(solved_charts(&solver, updates(most_updates)).get(&d.key).is_some());
+    assert!(solved_charts(&solver, updates(most_updates + 1)).get(&d.key).is_none());
+    // Nothing trusted: no spots; everything trusted: every spot.
+    assert!(solved_charts(&solver, samples(u64::MAX)).charts.is_empty());
+    assert!(solved_charts(&solver, updates(u64::MAX)).charts.is_empty());
+    assert_eq!(solved_charts(&small_solve(200_000), samples(1)).charts.len(), solver.tree().num_decisions);
+}
+
+/// A hand with many samples but few regret updates is not trusted, and
+/// the other way round; charts use exactly the trusted hands.
+#[test]
+fn trust_needs_both_samples_and_updates() {
+    let solver = small_solve(100_000);
+    let players = solver.tree().spec.players;
+    let trust = Trust { samples: 50, updates: 100 };
+    let charts = to_charts(&solver, trust);
+    let mut seen = [false; 2];
+    for d in solver.tree().decisions() {
+        for c in 0..NUM_CLASSES {
+            let (avg, n) = solver.average(d, c);
+            let u = solver.updates(d, c);
+            // No samples is never trusted (there is no average to write).
+            assert_eq!(Trust { samples: n, updates: u }.trusts(&solver, d, c), n > 0);
+            assert!(!Trust { samples: n + 1, updates: u }.trusts(&solver, d, c));
+            assert!(!Trust { samples: n.max(1), updates: u + 1 }.trusts(&solver, d, c));
+            let expected = if n >= trust.samples && u >= trust.updates {
+                avg
+            } else {
+                d.avail.remap(fallback_freqs(&d.key, c, players))
+            };
+            assert_eq!(charts.get(&d.key).unwrap().class_freqs(c), expected, "{} {c}", d.key);
+            seen[0] |= n >= 100 && u * 10 < n;
+            seen[1] |= u >= 50 && n * 10 < u;
+        }
+    }
+    // Both kinds of disagreement (one count ten times the other) happen in a real solve.
+    assert_eq!(seen, [true, true]);
 }
 
 /// Charts survive the trainer's text format (4 decimals per frequency).
 #[test]
 fn charts_round_trip_through_the_text_format() {
-    let charts = to_charts(&small_solve(200_000), 50);
+    let charts = to_charts(&small_solve(200_000), samples(50));
     let parsed = ChartSet::parse(&charts.to_text("test"), 3).unwrap();
     assert_eq!(parsed.charts.len(), charts.charts.len());
     for (key, chart) in &charts.charts {
@@ -235,7 +277,7 @@ fn rounding_drops_noise_and_keeps_whole_percents() {
 
 #[test]
 fn rounding_charts_rounds_every_hand() {
-    let mut charts = to_charts(&small_solve(20_000), 50);
+    let mut charts = to_charts(&small_solve(20_000), samples(50));
     round_charts(&mut charts, MIN_MIX);
     for (key, chart) in &charts.charts {
         for f in &chart.freqs {

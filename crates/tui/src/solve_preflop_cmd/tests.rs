@@ -81,7 +81,8 @@ fn bad_settings_are_errors() {
 #[test]
 fn running_writes_a_chart_file_the_trainer_reads() {
     let out = temp_path("charts_3max.txt");
-    run(&settings(&out)).unwrap();
+    // Enough deals for the first decisions to be trusted, so the file has spots.
+    run(&Settings { million_deals: 0.6, ..settings(&out) }).unwrap();
     let text = std::fs::read_to_string(&out).unwrap();
     assert!(text.starts_with('#'));
     for needle in ["solve-preflop", "3 players", "30bb", "seed 7", "built-in"] {

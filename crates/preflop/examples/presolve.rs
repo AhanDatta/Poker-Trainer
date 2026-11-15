@@ -7,7 +7,7 @@
 //! `ip` and `oop` are flat realization factors by position (default 1 and
 //! 1); or give a factors file.
 
-use preflop::charts::{compare, first_in_frequencies, mean_distance, to_charts};
+use preflop::charts::{compare, first_in_frequencies, mean_distance, to_charts, Trust};
 use preflop::{GameSpec, Options, Realization, Solver, Tree};
 use std::time::Instant;
 use trainer::preflop::ChartSet;
@@ -46,7 +46,7 @@ fn main() {
     for epoch in 1..=epochs {
         solver.run(per_epoch);
         if epoch % 5 == 0 {
-            let charts = to_charts(&solver, 200);
+            let charts = to_charts(&solver, Trust::CHARTS);
             let diffs = compare(solver.tree(), &charts, &reference);
             println!(
                 "{:>6.1}M deals, {:>5.1} s: mean distance to the built-in charts {:.3} over {} spots",
@@ -70,7 +70,7 @@ fn main() {
             100.0 * diagnosis.deviation_gain[seat]
         );
     }
-    let charts = to_charts(&solver, 200);
+    let charts = to_charts(&solver, Trust::CHARTS);
     let ours = first_in_frequencies(solver.tree(), &charts);
     let theirs = first_in_frequencies(solver.tree(), &reference);
     let mut keys: Vec<&String> = ours.keys().collect();

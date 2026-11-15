@@ -17,7 +17,8 @@ fn small_job(deals: u64) -> Job {
 
 #[test]
 fn solving_writes_the_solved_spots_with_a_header() {
-    let job = small_job(100_000);
+    // Enough deals for the first decisions to pass the 1000-update minimum.
+    let job = small_job(600_000);
     let mut epochs = Vec::new();
     let out = solve(&job, |p| epochs.push(*p)).unwrap();
     assert_eq!(epochs.len(), EPOCHS as usize);
@@ -35,6 +36,7 @@ fn solving_writes_the_solved_spots_with_a_header() {
         "rake 5% capped at 3bb",
         "flat test factors",
         "seed 3",
+        "1000 regret updates",
         "BTN",
         "SB",
         "BB",
@@ -77,4 +79,27 @@ fn bad_games_are_errors() {
     let out = solve(&small_job(0), |_| ()).unwrap();
     assert!(out.charts.charts.is_empty());
     assert!(out.decisions > 0);
+}
+
+/// The file holds exactly the hands [`Trust::CHARTS`] trusts, rounded: the
+/// same solve done by hand (one thread is reproducible) gives the same text.
+#[test]
+fn charts_are_the_trusted_hands_rounded() {
+    use crate::charts::{round_charts, solved_charts, Trust, MIN_MIX};
+    use crate::solver::{Options, Solver};
+    use crate::tree::Tree;
+    let job = small_job(600_000);
+    let out = solve(&job, |_| ()).unwrap();
+    let options = Options { threads: 1, seed: job.seed, ..Options::default() };
+    let mut solver = Solver::new(Tree::build(&job.spec).unwrap(), job.factors.clone(), options);
+    for epoch in 1..=EPOCHS as u64 {
+        solver.run(job.deals * epoch / EPOCHS as u64 - job.deals * (epoch - 1) / EPOCHS as u64);
+    }
+    let mut expected = solved_charts(&solver, Trust::CHARTS);
+    round_charts(&mut expected, MIN_MIX);
+    assert_eq!(out.charts.to_text(""), expected.to_text(""));
+    // A looser rule would write more spots.
+    assert!(
+        solved_charts(&solver, Trust { updates: 0, ..Trust::CHARTS }).charts.len() > expected.charts.len()
+    );
 }

@@ -7,20 +7,48 @@ use holdem::{HandClass, NUM_CLASSES};
 use std::collections::HashMap;
 use trainer::preflop::{fallback_freqs, Chart, ChartSet, Freqs, PreAction};
 
-/// The solve's average strategy as charts. A hand class with fewer than
-/// `min_samples` samples at a spot (it practically never gets there) uses
-/// the trainer's position-aware rules instead of noise, as imported charts
-/// do.
-pub fn to_charts(solver: &Solver, min_samples: u64) -> ChartSet {
+/// When a hand class's strategy at a spot is trusted enough to go into a
+/// chart. Both counts must reach their minimum: the samples of the average
+/// strategy ([`Solver::average`]) come partly from the other seats trying
+/// every action, so a spot can have many samples while the hand's own
+/// strategy was hardly trained; and a well-trained hand that never takes
+/// the line has a well-trained strategy but almost no samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Trust {
+    /// Samples of the average strategy.
+    pub samples: u64,
+    /// Regret updates ([`Solver::updates`]).
+    pub updates: u64,
+}
+
+impl Trust {
+    /// What chart files use: with fewer updates, 9-max model charts had
+    /// aces folding in rarely reached spots.
+    pub const CHARTS: Trust = Trust { samples: 200, updates: 1000 };
+
+    /// Whether `class` at `d` has enough of both.
+    pub fn trusts(self, solver: &Solver, d: &Decision, class: usize) -> bool {
+        solver.average(d, class).1 >= self.samples.max(1) && solver.updates(d, class) >= self.updates
+    }
+}
+
+/// The solve's average strategy as charts. A hand class whose strategy at
+/// a spot isn't trusted (it practically never gets there, or was hardly
+/// trained there) uses the trainer's position-aware rules instead of noise,
+/// as imported charts do.
+pub fn to_charts(solver: &Solver, trust: Trust) -> ChartSet {
     let players = solver.tree().spec.players;
     let charts = solver
         .tree()
         .decisions()
         .map(|d| {
             let freqs = (0..NUM_CLASSES)
-                .map(|class| match solver.average(d, class) {
-                    (freqs, samples) if samples >= min_samples.max(1) => freqs,
-                    _ => d.avail.remap(fallback_freqs(&d.key, class, players)),
+                .map(|class| {
+                    if trust.trusts(solver, d, class) {
+                        solver.average(d, class).0
+                    } else {
+                        d.avail.remap(fallback_freqs(&d.key, class, players))
+                    }
                 })
                 .collect();
             (d.key.clone(), Chart { freqs })
@@ -32,11 +60,11 @@ pub fn to_charts(solver: &Solver, min_samples: u64) -> ChartSet {
 /// [`to_charts`] without the spots where every hand class uses the fallback
 /// rules. The trainer applies the same rules to spots a chart file doesn't
 /// have, so it plays the same, and a 9-max file shrinks from 191k spots to
-/// the few tens of thousands the solve actually reaches.
-pub fn solved_charts(solver: &Solver, min_samples: u64) -> ChartSet {
-    let mut charts = to_charts(solver, min_samples);
+/// the few hundred the solve trained well.
+pub fn solved_charts(solver: &Solver, trust: Trust) -> ChartSet {
+    let mut charts = to_charts(solver, trust);
     for d in solver.tree().decisions() {
-        if (0..NUM_CLASSES).all(|class| solver.average(d, class).1 < min_samples.max(1)) {
+        if !(0..NUM_CLASSES).any(|class| trust.trusts(solver, d, class)) {
             charts.charts.remove(&d.key);
         }
     }

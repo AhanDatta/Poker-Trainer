@@ -1,17 +1,13 @@
 //! Making a chart file from scratch: solve a game with the model and write
 //! its strategies as the trainer's charts (the `solve-preflop` command).
 
-use crate::charts::{round_charts, solved_charts, MIN_MIX};
+use crate::charts::{round_charts, solved_charts, Trust, MIN_MIX};
 use crate::realize::Realization;
 use crate::solver::{Diagnosis, Options, Solver};
 use crate::spec::GameSpec;
 use crate::tree::Tree;
 use std::time::Instant;
 use trainer::preflop::ChartSet;
-
-/// Hand classes that reach a spot fewer times than this use the trainer's
-/// fallback rules there.
-pub const MIN_SAMPLES: u64 = 200;
 
 /// Calls of [`Solver::run`] per solve (progress is reported after each).
 pub const EPOCHS: u32 = 20;
@@ -67,7 +63,7 @@ pub fn solve(job: &Job, mut progress: impl FnMut(&Progress)) -> Result<Output, S
         progress(&Progress { epoch, deals: solver.deals(), seconds: start.elapsed().as_secs_f64() });
     }
     let diagnosis = solver.diagnose(DIAGNOSIS_DEALS, job.seed ^ 0x5eed);
-    let mut charts = solved_charts(&solver, MIN_SAMPLES);
+    let mut charts = solved_charts(&solver, Trust::CHARTS);
     round_charts(&mut charts, MIN_MIX);
     Ok(Output { charts, diagnosis, decisions, seconds: start.elapsed().as_secs_f64() })
 }
@@ -90,10 +86,15 @@ pub fn header(job: &Job, out: &Output) -> String {
         format!("Realization factors: {}.", job.factors_name),
         format!("Frequencies in whole percents; mixes below {:.0}% are dropped as sampling noise.", MIN_MIX * 100.0),
         format!(
-            "{:.0} million deals, seed {}, {:.0} s. Hands that reach a spot fewer than {MIN_SAMPLES} times, and spots not in the file, use the fallback rules.",
+            "{:.0} million deals, seed {}, {:.0} s.",
             job.deals as f64 / 1e6,
             job.seed,
             out.seconds
+        ),
+        format!(
+            "A hand is in a spot's chart if its strategy there rests on at least {} samples and {} regret updates; other hands, and spots not in the file, use the fallback rules.",
+            Trust::CHARTS.samples,
+            Trust::CHARTS.updates
         ),
         format!("Per position: result, then the gain from changing one decision (bb/100, on {:.0}M fresh deals):", out.diagnosis.deals as f64 / 1e6),
     ];
