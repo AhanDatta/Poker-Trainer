@@ -32,7 +32,8 @@ pub struct Spot {
 }
 
 /// What a spot measures: the pot type and where the last raiser sits. Each
-/// type gives two contexts, the raiser's and the caller's.
+/// type gives two contexts, the raiser's and the caller's; a limped pot has
+/// no raiser (`aggressor_in_position` is false) and gives the two callers'.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SpotType {
     pub pot: PotKind,
@@ -40,8 +41,9 @@ pub struct SpotType {
 }
 
 impl SpotType {
-    /// The six types of heads-up raised pots.
-    pub fn all() -> [SpotType; 6] {
+    /// The six types of heads-up raised pots, then the limped pot (which
+    /// only the heads-up game, with open limps, has).
+    pub fn all() -> [SpotType; 7] {
         let t = |pot, aggressor_in_position| SpotType { pot, aggressor_in_position };
         [
             t(PotKind::Raised, true),
@@ -50,6 +52,7 @@ impl SpotType {
             t(PotKind::ThreeBet, false),
             t(PotKind::FourBet, true),
             t(PotKind::FourBet, false),
+            t(PotKind::Limped, false),
         ]
     }
 
@@ -60,14 +63,20 @@ impl SpotType {
             PotKind::ThreeBet => "3-bet",
             PotKind::FourBet => "4-bet",
         };
+        if self.pot == PotKind::Limped {
+            return pot.to_string();
+        }
         format!("{pot}, raiser {}", if self.aggressor_in_position { "IP" } else { "OOP" })
     }
 }
 
 impl Spot {
-    /// The spot's type, or `None` for a pot nobody raised.
+    /// The spot's type (`None` only if the contexts are inconsistent).
     pub fn kind(&self) -> Option<SpotType> {
-        let raiser = self.contexts.iter().find(|c| c.role == Role::Aggressor)?;
+        let Some(raiser) = self.contexts.iter().find(|c| c.role == Role::Aggressor) else {
+            let limped = self.contexts.iter().all(|c| c.pot == PotKind::Limped);
+            return limped.then_some(SpotType { pot: PotKind::Limped, aggressor_in_position: false });
+        };
         Some(SpotType { pot: raiser.pot, aggressor_in_position: raiser.position == Position::InPosition })
     }
 }

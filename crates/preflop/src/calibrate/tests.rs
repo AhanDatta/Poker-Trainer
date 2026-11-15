@@ -164,7 +164,9 @@ fn picking_keeps_the_most_reached_spots_of_each_type() {
     let (_, spots) = six_max();
     let picked = pick(spots, 4);
     assert_eq!(picked.len(), 24);
-    for (i, t) in SpotType::all().into_iter().enumerate() {
+    // 6-max has no open limps, so no limped spots: 4 of each raised type.
+    assert!(spots.iter().all(|s| s.kind().is_some_and(|k| k.pot != PotKind::Limped)));
+    for (i, t) in SpotType::all().into_iter().take(6).enumerate() {
         let of_type: Vec<&Spot> = spots.iter().filter(|s| s.kind() == Some(t)).collect();
         let chosen = &picked[4 * i..4 * i + 4];
         assert!(chosen.iter().all(|s| s.kind() == Some(t)));
@@ -176,7 +178,38 @@ fn picking_keeps_the_most_reached_spots_of_each_type() {
     assert!(pick(spots, 0).is_empty());
     assert_eq!(pick(spots, 1000).len(), spots.len());
     let names: std::collections::HashSet<String> = SpotType::all().iter().map(|t| t.name()).collect();
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 7);
+}
+
+/// Heads-up with small-blind limps: the limp-check pot is a spot of its
+/// own, with both players callers, the small blind (the button) in
+/// position.
+#[test]
+fn heads_up_spots_include_the_limped_pot() {
+    let mut spec = GameSpec::new(2);
+    spec.rules.limp = crate::spec::Limp::SmallBlind;
+    let tree = Tree::build(&spec).unwrap();
+    let spots = heads_up_flops(&tree, &ChartSet::builtin(2));
+    let limped = spots.iter().find(|s| s.line == "SB:C BB:C").expect("a limp-check pot");
+    let limped_type = SpotType { pot: PotKind::Limped, aggressor_in_position: false };
+    assert_eq!(limped.kind(), Some(limped_type));
+    assert_eq!(limped_type.name(), "limped");
+    assert_eq!(limped.seats, [1, 0], "the big blind acts first after the flop");
+    assert_eq!(
+        limped.contexts,
+        [
+            hu(PotKind::Limped, Role::Caller, Position::OutOfPosition),
+            hu(PotKind::Limped, Role::Caller, Position::InPosition)
+        ]
+    );
+    assert_eq!((limped.pot, limped.behind), (2 * crate::spec::BB, 99 * crate::spec::BB));
+    // The open-call pot: the small blind raised and is in position.
+    let open = spots.iter().find(|s| s.line == "SB:R BB:C").unwrap();
+    assert_eq!(open.kind(), Some(SpotType { pot: PotKind::Raised, aggressor_in_position: true }));
+    // Picking keeps the limped pot, after the raised types.
+    let picked = pick(&spots, 1);
+    assert_eq!(picked.last().map(|s| s.line.as_str()), Some("SB:C BB:C"));
+    assert!(spots.iter().all(|s| s.kind().is_some()));
 }
 
 // ---- ranges and solves ----
@@ -560,9 +593,47 @@ fn unmeasured_contexts_are_filled_from_measured_ones() {
         assert_eq!(cal.source[ctx.index()], Source::Limped(from));
     }
     // Nothing measured in 4-bet pots: factor 1.
+    let four_ip = hu(PotKind::FourBet, Role::Aggressor, Position::InPosition);
+    assert_eq!(cal.source[four_ip.index()], Source::Neutral);
     let four = hu(PotKind::FourBet, Role::Caller, Position::InPosition);
     assert_eq!((f(four), cal.source[four.index()]), (1.0, Source::Neutral));
     assert!(cal.source.iter().all(|s| s.to_string().len() > 3));
     // No records: everything neutral.
     assert_eq!(aggregate(&[]).unwrap().realization, crate::Realization::neutral());
+}
+
+/// When limped pots are measured (heads-up), the limped caller's middle and
+/// multiway contexts come from them, and the "aggressor" contexts of a
+/// limped pot (which nobody raised) copy the caller.
+#[test]
+fn measured_limped_pots_fill_the_other_limped_contexts() {
+    let ip = hu(PotKind::Limped, Role::Caller, Position::InPosition);
+    let oop = hu(PotKind::Limped, Role::Caller, Position::OutOfPosition);
+    let raised = [
+        hu(PotKind::Raised, Role::Caller, Position::OutOfPosition),
+        hu(PotKind::Raised, Role::Aggressor, Position::InPosition),
+    ];
+    let mut a = sample_record([oop, ip], 3.0, 2.0);
+    a.value[0] = vec![1.0; NUM_CLASSES];
+    let records = [a, sample_record(raised, 1.0, 2.0)];
+    let cal = aggregate(&records).unwrap();
+    let r = &cal.realization;
+    let f = |ctx: Context| r.factors(ctx)[0];
+    assert_eq!((f(ip), f(oop)), (1.5, 0.5));
+    assert_eq!(cal.source[ip.index()], Source::Measured(1));
+    let middle = Context { position: Position::Middle, ..ip };
+    assert_eq!((f(middle), cal.source[middle.index()]), (1.0, Source::MiddleOf(ip, oop)));
+    for ctx in [ip, oop, middle] {
+        let multi = Context { multiway: true, ..ctx };
+        assert_eq!((f(multi), cal.source[multi.index()]), (f(ctx), Source::HeadsUp(ctx)));
+    }
+    for ctx in Context::all().filter(|c| c.pot == PotKind::Limped && c.role == Role::Aggressor) {
+        let from = Context { role: Role::Caller, ..ctx };
+        assert_eq!((f(ctx), cal.source[ctx.index()]), (f(from), Source::Limped(from)), "{}", ctx.name());
+    }
+    // Only one limped position measured: everything limped copies the raised caller, as in 6-max.
+    let cal =
+        aggregate(&[sample_record([oop, raised[1]], 3.0, 2.0), sample_record(raised, 1.0, 2.0)]).unwrap();
+    let from = Context { pot: PotKind::Raised, ..ip };
+    assert_eq!(cal.source[ip.index()], Source::Limped(from));
 }

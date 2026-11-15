@@ -5,20 +5,35 @@
 //! `cargo run --release -p preflop --example presolve -- [players] [million deals] [threads] <factors.txt>`
 //!
 //! `ip` and `oop` are flat realization factors by position (default 1 and
-//! 1); or give a factors file.
+//! 1); or give a factors file. Options anywhere: `--rake <percent>` (default
+//! 5, capped at 3bb), `--limp sb` (the small blind may open-limp).
 
 use preflop::charts::{compare, first_in_frequencies, mean_distance, to_charts, Trust};
+use preflop::spec::Limp;
 use preflop::{GameSpec, Options, Realization, Solver, Tree};
 use std::time::Instant;
 use trainer::preflop::ChartSet;
 
 fn main() {
-    let arg =
-        |i: usize, default: f64| std::env::args().nth(i).and_then(|a| a.parse().ok()).unwrap_or(default);
+    // `--name value` options, then the positional arguments.
+    let mut args: Vec<String> = std::env::args().collect();
+    let mut option = |name: &str| {
+        let i = args.iter().position(|a| a == name)?;
+        let value = args.get(i + 1).cloned();
+        args.drain(i..(i + 2).min(args.len()));
+        value
+    };
+    let rake_pct: f64 = option("--rake").map_or(5.0, |r| r.parse().expect("--rake <percent>"));
+    let limp = match option("--limp").as_deref() {
+        None | Some("never") => Limp::Never,
+        Some("sb") => Limp::SmallBlind,
+        Some(other) => panic!("--limp never|sb, not {other}"),
+    };
+    let arg = |i: usize, default: f64| args.get(i).and_then(|a| a.parse().ok()).unwrap_or(default);
     let players = arg(1, 6.0) as usize;
     let millions = arg(2, 20.0);
     let threads = arg(3, 4.0) as usize;
-    let factors_file = std::env::args().nth(4).filter(|a| a.parse::<f64>().is_err());
+    let factors_file = args.get(4).filter(|a| a.parse::<f64>().is_err()).cloned();
     let model = match &factors_file {
         Some(path) => {
             let text = std::fs::read_to_string(path).expect("a readable factors file");
@@ -32,8 +47,10 @@ fn main() {
         }
     };
 
-    let mut spec = GameSpec::new(players).with_rake(0.05, 3.0);
+    let mut spec = GameSpec::new(players).with_rake(rake_pct / 100.0, 3.0);
     spec.rules.max_cold_callers = 1;
+    spec.rules.limp = limp;
+    println!("rake {rake_pct}% capped at 3bb, open limps: {limp:?}");
     let tree = Tree::build(&spec).expect("valid spec");
     println!("{players}-max: {} decisions, {} leaves", tree.num_decisions, tree.num_leaves());
     let mut solver = Solver::new(tree, model, Options { threads, ..Options::default() });

@@ -17,14 +17,19 @@
 //!   --target PCT     exploitability target, % of the pot (default 0.5)
 //!   --iterations N   iteration cap (default 400)
 //!   --limit N        stop after N solves (default: all)
+//!
+//! options (all modes):
+//!   --players N      table size, played by its built-in charts (default 6)
+//!   --rake PCT       rake in percent, capped at 3bb (default 5)
+//!   --limp never|sb  open limps in the tree (default: sb heads-up, never otherwise)
 //! ```
 //!
-//! The game is 6-max 100bb with 5% rake capped at 3bb, one cold caller per
-//! raise, played by the built-in 6-max charts.
+//! The game is 100bb with one cold caller per raise. Use the same table
+//! options for `run` and `aggregate` as the checkpoint was made with.
 
 use preflop::calibrate::{self, aggregate, parse_checkpoint, Chance, PostflopSetup, SpotType};
 use preflop::realize::Context;
-use preflop::{GameSpec, Tree};
+use preflop::{GameSpec, Limp, Tree};
 use solver::Backend;
 use std::io::Write;
 use std::time::Instant;
@@ -41,6 +46,9 @@ struct Args {
     target: f64,
     iterations: u32,
     limit: usize,
+    players: usize,
+    rake_pct: f64,
+    limp: Option<Limp>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -55,6 +63,9 @@ fn parse_args() -> Result<Args, String> {
         target: 0.5,
         iterations: 400,
         limit: usize::MAX,
+        players: 6,
+        rake_pct: 5.0,
+        limp: None,
     };
     let mut it = std::env::args().skip(1);
     args.mode = it.next().ok_or("missing mode: spots, run or aggregate")?;
@@ -68,6 +79,15 @@ fn parse_args() -> Result<Args, String> {
             "--target" => args.target = number(value()?)?,
             "--iterations" => args.iterations = number(value()?)? as u32,
             "--limit" => args.limit = number(value()?)? as usize,
+            "--players" => args.players = number(value()?)? as usize,
+            "--rake" => args.rake_pct = number(value()?)?,
+            "--limp" => {
+                args.limp = Some(match value()?.as_str() {
+                    "never" => Limp::Never,
+                    "sb" => Limp::SmallBlind,
+                    other => return Err(format!("--limp {other}: never or sb")),
+                })
+            }
             "--chance" => {
                 args.chance = match value()?.as_str() {
                     "exact" => Chance::Exact,
@@ -89,10 +109,20 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
-fn spec() -> GameSpec {
-    let mut spec = GameSpec::new(6).with_rake(0.05, 3.0);
-    spec.rules.max_cold_callers = 1;
-    spec
+impl Args {
+    fn spec(&self) -> Result<GameSpec, String> {
+        let mut spec = GameSpec::new(self.players).with_rake(self.rake_pct / 100.0, 3.0);
+        spec.rules.max_cold_callers = 1;
+        spec.rules.limp = self.limp.unwrap_or(if self.players == 2 { Limp::SmallBlind } else { Limp::Never });
+        spec.validate().map_err(|e| e.to_string())?;
+        Ok(spec)
+    }
+
+    /// The game in words, for the factors file's header.
+    fn game(&self) -> String {
+        let table = if self.players == 2 { "heads-up".to_string() } else { format!("{}-max", self.players) };
+        format!("{table} 100bb, {}% rake capped at 3bb", self.rake_pct)
+    }
 }
 
 fn main() {
@@ -108,14 +138,14 @@ fn main() {
 }
 
 fn chosen_spots(args: &Args) -> Result<Vec<calibrate::Spot>, String> {
-    let tree = Tree::build(&spec()).map_err(|e| e.to_string())?;
-    let all = calibrate::heads_up_flops(&tree, &ChartSet::builtin(6));
+    let tree = Tree::build(&args.spec()?).map_err(|e| e.to_string())?;
+    let all = calibrate::heads_up_flops(&tree, &ChartSet::builtin(args.players));
     Ok(calibrate::pick(&all, args.spots))
 }
 
 fn list_spots(args: &Args) -> Result<(), String> {
-    let tree = Tree::build(&spec()).map_err(|e| e.to_string())?;
-    let all = calibrate::heads_up_flops(&tree, &ChartSet::builtin(6));
+    let tree = Tree::build(&args.spec()?).map_err(|e| e.to_string())?;
+    let all = calibrate::heads_up_flops(&tree, &ChartSet::builtin(args.players));
     for t in SpotType::all() {
         let of_type: Vec<_> = all.iter().filter(|s| s.kind() == Some(t)).collect();
         let total: f64 = of_type.iter().map(|s| s.reach).sum();
@@ -134,14 +164,14 @@ fn list_spots(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn setup(args: &Args) -> PostflopSetup {
-    PostflopSetup {
+fn setup(args: &Args) -> Result<PostflopSetup, String> {
+    Ok(PostflopSetup {
         chance: args.chance,
         backend: args.backend,
         target_exploitability_pct: args.target,
         max_iterations: args.iterations,
-        ..PostflopSetup::review(&spec())
-    }
+        ..PostflopSetup::review(&args.spec()?)
+    })
 }
 
 fn run(args: &Args) -> Result<(), String> {
@@ -175,7 +205,7 @@ fn run(args: &Args) -> Result<(), String> {
         done.len(),
         jobs.len()
     );
-    let setup = setup(args);
+    let setup = setup(args)?;
     let start = Instant::now();
     let mut count = 0;
     let saved = calibrate::run(
@@ -257,12 +287,13 @@ fn aggregate_file(args: &Args) -> Result<(), String> {
         }
     }
     let header = format!(
-        "Realization factors for 6-max 100bb, 5% rake capped at 3bb, measured with\n\
-         heads-up postflop solves of the built-in 6-max chart ranges\n\
+        "Realization factors for {}, measured with\n\
+         heads-up postflop solves of the built-in chart ranges for that table\n\
          ({} solves; generated by `cargo run -p preflop --example calibrate`).\n\
          Each factor is what a hand class wins with betting over what it wins checking\n\
          down, so 1 is its equity share of the pot after the preflop pot's rake.\n\
          Sources per context:\n{}",
+        args.game(),
         records.len(),
         Context::all()
             .map(|c| format!("  [{}] {}", c.name(), calibration.source[c.index()]))

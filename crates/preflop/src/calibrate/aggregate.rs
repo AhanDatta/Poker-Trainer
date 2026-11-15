@@ -18,8 +18,10 @@ pub enum Source {
     /// The average of the in-position and out-of-position contexts with the
     /// same pot and role.
     MiddleOf(Context, Context),
-    /// Copied from the single-raised pot's caller with the same position
-    /// (limped pots don't occur in the measured game).
+    /// A limped-pot context copied from another: the single-raised pot's
+    /// caller with the same position when limped pots don't occur in the
+    /// measured game, or the limped pot's caller (nobody raised a limped
+    /// pot, so its "aggressor" contexts never occur).
     Limped(Context),
     /// Not measured and nothing to copy from: factor 1.
     Neutral,
@@ -119,30 +121,43 @@ fn jackknife(solves: &[SolveSums], c: usize, a: f64, b: f64) -> f64 {
 /// caller. Measured contexts are kept.
 fn fill_unmeasured(r: &mut Realization, source: &mut [Source]) {
     let unmeasured = |source: &[Source], ctx: Context| !matches!(source[ctx.index()], Source::Measured(_));
-    let raised = [PotKind::Raised, PotKind::ThreeBet, PotKind::FourBet];
-    for pot in raised {
-        for role in [Role::Aggressor, Role::Caller] {
-            let at = |position, multiway| Context { pot, role, position, multiway };
-            let (ip, oop) = (at(Position::InPosition, false), at(Position::OutOfPosition, false));
-            let middle = at(Position::Middle, false);
-            if unmeasured(source, middle) {
-                let (a, b) = (r.factors(ip), r.factors(oop));
-                let avg: [f32; NUM_CLASSES] = std::array::from_fn(|c| (a[c] + b[c]) / 2.0);
-                r.set(middle, avg);
-                source[middle.index()] = Source::MiddleOf(ip, oop);
-            }
-            for position in [Position::InPosition, Position::OutOfPosition, Position::Middle] {
-                let multi = at(position, true);
-                if unmeasured(source, multi) {
-                    r.set(multi, *r.factors(at(position, false)));
-                    source[multi.index()] = Source::HeadsUp(at(position, false));
-                }
+    let hu = |pot, role, position| Context { pot, role, position, multiway: false };
+    // Limped pots measured (heads-up with open limps): the limped caller's
+    // middle and multiway contexts come from them like the raised pots'.
+    let limped_measured = [Position::InPosition, Position::OutOfPosition]
+        .iter()
+        .all(|&p| !unmeasured(source, hu(PotKind::Limped, Role::Caller, p)));
+    let mut filled = vec![(PotKind::Raised, Role::Aggressor), (PotKind::Raised, Role::Caller)];
+    filled.extend(
+        [PotKind::ThreeBet, PotKind::FourBet]
+            .into_iter()
+            .flat_map(|p| [(p, Role::Aggressor), (p, Role::Caller)]),
+    );
+    if limped_measured {
+        filled.push((PotKind::Limped, Role::Caller));
+    }
+    for (pot, role) in filled {
+        let at = |position, multiway| Context { pot, role, position, multiway };
+        let (ip, oop) = (at(Position::InPosition, false), at(Position::OutOfPosition, false));
+        let middle = at(Position::Middle, false);
+        if unmeasured(source, middle) {
+            let (a, b) = (r.factors(ip), r.factors(oop));
+            let avg: [f32; NUM_CLASSES] = std::array::from_fn(|c| (a[c] + b[c]) / 2.0);
+            r.set(middle, avg);
+            source[middle.index()] = Source::MiddleOf(ip, oop);
+        }
+        for position in [Position::InPosition, Position::OutOfPosition, Position::Middle] {
+            let multi = at(position, true);
+            if unmeasured(source, multi) {
+                r.set(multi, *r.factors(at(position, false)));
+                source[multi.index()] = Source::HeadsUp(at(position, false));
             }
         }
     }
     for ctx in Context::all().filter(|c| c.pot == PotKind::Limped) {
-        if unmeasured(source, ctx) {
-            let from = Context { pot: PotKind::Raised, role: Role::Caller, ..ctx };
+        if unmeasured(source, ctx) && !(limped_measured && ctx.role == Role::Caller) {
+            let pot = if limped_measured { PotKind::Limped } else { PotKind::Raised };
+            let from = Context { pot, role: Role::Caller, ..ctx };
             r.set(ctx, *r.factors(from));
             source[ctx.index()] = Source::Limped(from);
         }
