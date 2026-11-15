@@ -2,7 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use preflop::generate::{self, Job};
-use preflop::{GameSpec, Realization};
+use preflop::{GameSpec, Limp, Realization};
 
 /// Most deals `--deals` accepts, in millions.
 pub const MAX_MILLION_DEALS: f64 = 100_000.0;
@@ -20,6 +20,8 @@ pub struct Settings<'a> {
     pub threads: usize,
     pub seed: u64,
     pub cold_callers: usize,
+    /// `"sb"` or `"never"`; `None`: sb heads-up, never otherwise.
+    pub limp: Option<&'a str>,
     /// A factors file, or the built-in measured factors.
     pub factors: Option<&'a str>,
     pub out: &'a str,
@@ -34,6 +36,12 @@ pub fn job(s: &Settings) -> Result<Job> {
     let mut spec =
         GameSpec::new(s.players).with_stack(s.stack_bb).with_rake(s.rake_pct / 100.0, s.rake_cap_bb);
     spec.rules.max_cold_callers = s.cold_callers;
+    spec.rules.limp = match s.limp {
+        None if s.players == 2 => Limp::SmallBlind,
+        None | Some("never") => Limp::Never,
+        Some("sb") => Limp::SmallBlind,
+        Some(other) => return Err(anyhow!("--limp {other}: sb or never")),
+    };
     spec.validate().map_err(|e| anyhow!(e))?;
     let (factors, factors_name) = match s.factors {
         Some(path) => {

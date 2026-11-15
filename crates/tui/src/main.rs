@@ -112,6 +112,10 @@ enum Cmd {
         /// bigger: 9-max with 2 is about 1.2 million decisions.
         #[arg(long, default_value_t = 1)]
         cold_callers: usize,
+        /// Open limps: "sb" (the small blind may limp when everyone folded to
+        /// it) or "never". Default: sb heads-up, never at larger tables.
+        #[arg(long)]
+        limp: Option<String>,
         /// Realization factors file (default: the built-in measured factors).
         #[arg(long)]
         factors: Option<String>,
@@ -172,6 +176,7 @@ fn main() -> Result<()> {
             deals,
             threads,
             cold_callers,
+            limp,
             factors,
             out,
         }) => {
@@ -185,6 +190,7 @@ fn main() -> Result<()> {
                 threads: *threads,
                 seed: cli.seed.unwrap_or(1),
                 cold_callers: *cold_callers,
+                limp: limp.as_deref(),
                 factors: factors.as_deref(),
                 out: &out,
             })

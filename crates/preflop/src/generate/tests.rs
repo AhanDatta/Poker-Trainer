@@ -34,6 +34,7 @@ fn solving_writes_the_solved_spots_with_a_header() {
         "3 players",
         "30bb",
         "rake 5% capped at 3bb",
+        "open limps: none",
         "flat test factors",
         "seed 3",
         "1000 regret updates",

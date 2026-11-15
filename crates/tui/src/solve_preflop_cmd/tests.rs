@@ -11,6 +11,7 @@ fn settings(out: &str) -> Settings<'_> {
         threads: 1,
         seed: 7,
         cold_callers: 1,
+        limp: None,
         factors: None,
         out,
     }
@@ -34,6 +35,7 @@ fn defaults_use_the_built_in_factors() {
     assert_eq!(job.seed, 7);
     assert_eq!(job.spec.players, 3);
     assert_eq!(job.spec.rules.max_cold_callers, 1);
+    assert_eq!(job.spec.rules.limp, preflop::Limp::Never);
     assert!((job.spec.rake_rate - 0.05).abs() < 1e-12);
     assert!((job.spec.rake_cap_bb - 3.0).abs() < 1e-12);
     assert!((job.spec.stack_bb - 30.0).abs() < 1e-12);
@@ -94,4 +96,15 @@ fn running_writes_a_chart_file_the_trainer_reads() {
     // A folder that doesn't exist is an error, not a panic.
     let bad = temp_path("no-such-dir/charts.txt");
     assert!(run(&settings(&bad)).is_err());
+}
+
+#[test]
+fn heads_up_lets_the_small_blind_limp_by_default() {
+    use preflop::Limp;
+    let limp = |players, limp| job(&Settings { players, limp, ..settings("x") }).map(|j| j.spec.rules.limp);
+    assert_eq!(limp(2, None).unwrap(), Limp::SmallBlind);
+    assert_eq!(limp(6, None).unwrap(), Limp::Never);
+    assert_eq!(limp(2, Some("never")).unwrap(), Limp::Never);
+    assert_eq!(limp(9, Some("sb")).unwrap(), Limp::SmallBlind);
+    assert!(limp(6, Some("always")).unwrap_err().to_string().contains("--limp"));
 }
