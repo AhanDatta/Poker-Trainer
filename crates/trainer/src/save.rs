@@ -9,6 +9,7 @@
 use crate::config::TrainerConfig;
 use crate::hand::LogEntry;
 use crate::preflop::PreDecision;
+use crate::preflop_grade::PreflopGrade;
 use crate::profiles::Profile;
 use crate::review::{DecisionReview, ReviewStatus};
 use holdem::{Chips, HandState};
@@ -96,6 +97,10 @@ pub struct SavedHand {
     pub log: Vec<LogEntry>,
     pub roll_seed: u64,
     pub review: Option<SavedReview>,
+    /// The hero's preflop grades when the hand was played (`None` in saves
+    /// from before preflop grading: graded again when loaded).
+    #[serde(default)]
+    pub preflop_grades: Option<Vec<PreflopGrade>>,
 }
 
 /// A session read back from disk.

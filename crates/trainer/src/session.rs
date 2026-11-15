@@ -60,6 +60,10 @@ pub struct Stats {
     /// Sum of EV losses in % of pot.
     pub total_loss_pct: f64,
     pub reviews_pending: usize,
+    /// Preflop decisions graded against the charts (counted apart: their
+    /// grades are chart frequencies, not EV lost).
+    pub preflop_decisions: usize,
+    pub preflop_verdicts: BTreeMap<Verdict, usize>,
 }
 
 impl Stats {
@@ -67,6 +71,10 @@ impl Stats {
     fn add_hand(&mut self, h: &LiveHand) {
         self.hands += 1;
         self.net_chips += h.hero_net().unwrap_or(0);
+        for v in h.preflop_grades().iter().filter_map(|g| g.verdict) {
+            self.preflop_decisions += 1;
+            *self.preflop_verdicts.entry(v).or_default() += 1;
+        }
         if let Some(r) = h.review() {
             r.with_status(|st| self.add_review(st));
         }
@@ -97,6 +105,10 @@ impl Stats {
         }
         self.total_loss_pct += o.total_loss_pct;
         self.reviews_pending += o.reviews_pending;
+        self.preflop_decisions += o.preflop_decisions;
+        for (v, n) in &o.preflop_verdicts {
+            *self.preflop_verdicts.entry(*v).or_default() += n;
+        }
     }
 
     pub fn avg_loss_pct(&self) -> f64 {
@@ -115,6 +127,16 @@ impl Stats {
         let good = self.verdicts.get(&Verdict::Best).copied().unwrap_or(0)
             + self.verdicts.get(&Verdict::Good).copied().unwrap_or(0);
         good as f64 / self.decisions as f64
+    }
+
+    /// Share of preflop decisions graded Best or Good.
+    pub fn preflop_accuracy(&self) -> f64 {
+        if self.preflop_decisions == 0 {
+            return 0.0;
+        }
+        let good = self.preflop_verdicts.get(&Verdict::Best).copied().unwrap_or(0)
+            + self.preflop_verdicts.get(&Verdict::Good).copied().unwrap_or(0);
+        good as f64 / self.preflop_decisions as f64
     }
 }
 

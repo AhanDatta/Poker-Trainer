@@ -149,6 +149,7 @@ fn saved(id: u64, state: HandState, decisions: Vec<DecisionReview>) -> SavedHand
             cancelled: false,
             error: None,
         }),
+        preflop_grades: Some(Vec::new()),
     }
 }
 

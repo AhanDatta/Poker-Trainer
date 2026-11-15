@@ -3,6 +3,7 @@
 use crate::ai::{concrete_preflop, AiPlayer};
 use crate::fmt::{action_verb, bb, ActionContext};
 use crate::preflop::{availability, chart_policy, line_range, spot_key, ChartSet, PreDecision};
+use crate::preflop_grade::{self, PreflopGrade};
 use crate::profiles::Profile;
 use crate::review::{Review, ReviewSetup, Snapshot};
 use crate::save::{SavedHand, SavedReview};
@@ -61,6 +62,9 @@ pub struct LiveHand {
     charts: Arc<ChartSet>,
     review_settings: Option<crate::config::SolverSettings>,
     review: Option<Review>,
+    /// The hero's preflop decisions graded against the charts (once the
+    /// hand is over).
+    preflop_grades: Vec<PreflopGrade>,
     rng: StdRng,
     /// Seed of the hero's random numbers (see [`LiveHand::roll`]).
     roll_seed: u64,
@@ -99,6 +103,7 @@ impl LiveHand {
             charts: setup.charts,
             review_settings: setup.review,
             review: None,
+            preflop_grades: Vec::new(),
             rng,
             roll_seed: mix64(setup.id),
         };
@@ -128,6 +133,7 @@ impl LiveHand {
             log: self.log.clone(),
             roll_seed: self.roll_seed,
             review: self.review.as_ref().map(|r| r.with_status(SavedReview::from_status)),
+            preflop_grades: Some(self.preflop_grades.clone()),
         }
     }
 
@@ -139,6 +145,10 @@ impl LiveHand {
         let deck = Deck::shuffled(&mut rng);
         let review = h.review.map(|r| {
             Review::finished(Snapshot { state: h.state.clone(), preflop: h.preflop.clone() }, r.into_status())
+        });
+        let preflop_grades = h.preflop_grades.unwrap_or_else(|| {
+            let hole = h.state.hole.get(h.hero).copied();
+            hole.map_or_else(Vec::new, |hole| preflop_grade::grade(&charts, &h.preflop, h.hero, hole))
         });
         LiveHand {
             id: h.id,
@@ -153,6 +163,7 @@ impl LiveHand {
             charts,
             review_settings: None,
             review,
+            preflop_grades,
             rng,
             roll_seed: h.roll_seed,
         }
@@ -247,6 +258,10 @@ impl LiveHand {
                 self.push_log(None, format!("{street}: {shown}  (pot {})", bb(self.state.pot())));
                 if street == Street::Flop {
                     self.on_flop();
+                }
+                // An all-in runout ends with the last card, not an action.
+                if self.state.phase == Phase::Finished {
+                    self.grade_preflop();
                 }
                 self.after_change();
                 StepResult::Dealt(street)
@@ -374,7 +389,14 @@ impl LiveHand {
         }
     }
 
+    /// Grades the hero's preflop decisions (when the hand is over).
+    fn grade_preflop(&mut self) {
+        self.preflop_grades =
+            preflop_grade::grade(&self.charts, &self.preflop, self.hero, self.state.hole[self.hero]);
+    }
+
     fn on_finish(&mut self) {
+        self.grade_preflop();
         // Deal out remaining board cards only for display when all-in? The
         // engine already ran out the board for all-in hands; nothing to do.
         let st = self.state.settle();
@@ -434,6 +456,12 @@ impl LiveHand {
 
     pub fn review(&self) -> Option<&Review> {
         self.review.as_ref()
+    }
+
+    /// The hero's preflop decisions graded against the charts (empty until
+    /// the hand is over).
+    pub fn preflop_grades(&self) -> &[PreflopGrade] {
+        &self.preflop_grades
     }
 
     pub fn villain_profile(&self) -> Option<&Profile> {

@@ -7,6 +7,7 @@
 //!   and grades every hero decision.
 //! * [`ai`] / [`profiles`] implement the opponent styles.
 //! * [`preflop`] holds the preflop charts and abstract preflop actions.
+//! * [`preflop_grade`] grades the hero's preflop decisions against the charts.
 //! * [`study`] is the solver study mode (browse charts and solutions).
 
 // Index loops are clearer than iterator chains in the numeric code here.
@@ -20,6 +21,7 @@ pub mod fmt;
 pub mod hand;
 pub mod population;
 pub mod preflop;
+pub mod preflop_grade;
 pub mod profiles;
 pub mod review;
 pub mod save;
