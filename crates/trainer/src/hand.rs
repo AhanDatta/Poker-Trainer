@@ -261,7 +261,7 @@ impl LiveHand {
                 }
                 // An all-in runout ends with the last card, not an action.
                 if self.state.phase == Phase::Finished {
-                    self.grade_preflop();
+                    self.on_finish();
                 }
                 self.after_change();
                 StepResult::Dealt(street)
@@ -389,16 +389,12 @@ impl LiveHand {
         }
     }
 
-    /// Grades the hero's preflop decisions (when the hand is over).
-    fn grade_preflop(&mut self) {
+    /// Once the hand is over (after the last action, or the last card of
+    /// an all-in runout): grades the preflop decisions and logs the
+    /// showdown and who wins what.
+    fn on_finish(&mut self) {
         self.preflop_grades =
             preflop_grade::grade(&self.charts, &self.preflop, self.hero, self.state.hole[self.hero]);
-    }
-
-    fn on_finish(&mut self) {
-        self.grade_preflop();
-        // Deal out remaining board cards only for display when all-in? The
-        // engine already ran out the board for all-in hands; nothing to do.
         let st = self.state.settle();
         if st.showdown {
             for p in self.state.players_in_hand() {
