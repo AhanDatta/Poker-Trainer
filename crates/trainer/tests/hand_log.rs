@@ -19,7 +19,7 @@ fn all_in_runouts_log_the_showdown_and_winners() {
         // The hero moves all-in whenever it can.
         while hand.run_until_hero() == StepResult::HeroToAct {
             let acts = hand.hero_actions();
-            let jam = acts.iter().copied().filter(|a| matches!(a, Action::Raise(_))).next_back();
+            let jam = acts.iter().copied().rfind(|a| matches!(a, Action::Raise(_)));
             let call = acts.iter().copied().find(|a| matches!(a, Action::Call | Action::Check));
             hand.hero_act(jam.or(call).unwrap_or(acts[0])).unwrap();
         }
